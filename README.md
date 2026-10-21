@@ -1,0 +1,315 @@
+# Loci — PostgreSQL Vector + Graph MCP Server
+
+PostgreSQL 17 with **pgvector** (vector similarity search), **Apache AGE** (Cypher graph queries) and a **Loci MCP Server** for AI agents.
+
+## Quick Start
+
+```bash
+cp .env.example .env   # add your GROQ_API_KEY
+docker compose up -d
+```
+
+> `GROQ_API_KEY` is required — `docker-compose.yml` aborts without it. The key
+> is only needed for the `/nli` endpoint (contradiction detection).
+
+After that, these services are running:
+| Service | Port | Description |
+|---------|------|-------------|
+| **PostgreSQL** | `5432` | User/DB: `memory`, password: `geheim` |
+| **Inference API** | `8001` | Embeddings (Jina v5 nano) + NLI (Groq) |
+| **Loci MCP** | `8766` | MCP server (Streamable HTTP) for AI agents |
+
+## MCP Server — Client Connection
+
+The Loci MCP server uses the **Streamable HTTP transport** and is reachable at `http://localhost:8766/`.
+
+### Zed
+
+Open `settings.json` (`~/.config/zed/settings.json` or `Cmd+Shift+P` → `zed: open settings file`) and add:
+
+```json
+{
+  "context_servers": {
+    "loci": {
+      "url": "http://localhost:8766"
+    }
+  }
+}
+```
+
+### VS Code (with Cline / Roo Code / Continue)
+
+Add the following to your MCP configuration (`cline_mcp_settings.json` or `mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "loci": {
+      "type": "streamable-http",
+      "url": "http://localhost:8766"
+    }
+  }
+}
+```
+
+> **Note:** Port `8766` is already exposed by `docker-compose.yml`. From another machine, use the host IP instead of `localhost`.
+
+### Claude Code (stdio mode, local development)
+
+```bash
+# Terminal 1: start Postgres + Inference
+docker compose up -d postgres inference
+
+# Terminal 2: start the MCP server in stdio mode
+pip install -r mcp_server/requirements.txt
+python -m mcp_server
+```
+
+Then in the Claude Code MCP config:
+
+```json
+{
+  "mcpServers": {
+    "loci": {
+      "command": "python",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "MEMORY_DATABASE_URL": "postgresql://memory:geheim@localhost:5432/memory",
+        "MEMORY_INFERENCE_URL": "http://localhost:8001"
+      }
+    }
+  }
+}
+```
+
+### Cursor / Windsurf / Copilot
+
+```json
+{
+  "mcpServers": {
+    "loci": {
+      "type": "streamable-http",
+      "url": "http://localhost:8766"
+    }
+  }
+}
+```
+
+---
+
+## MCP Tools (16 Tools + 1 Resource)
+
+### Write
+| Tool | Description |
+|------|-------------|
+| `remember` | Store a fact/decision/learning (auto-embedding, exact + optional fuzzy dedup via `fuzzy_threshold`, `supersede`, optional contradiction check, `scope` global/project) |
+| `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`; optional `check_contradictions`) |
+| `update_memory` | Update content (re-embedding), importance or metadata |
+| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity_name` also removes the graph node and that scope's memories |
+
+### Read / Search
+| Tool | Description |
+|------|-------------|
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`, `graph_boost` |
+| `get_entity` | Entity details (including graph connections) + all linked memories; `include_superseded` |
+| `list_entities` | Browse all entities (`entity_type`, `project`) |
+| `init_context` | Session bootstrap: recent memories, counters, projects, graph entity count, health |
+
+### Graph (Apache AGE)
+| Tool | Description |
+|------|-------------|
+| `relate` | Directed relation via Cypher (auto-creates entities); `project` selects the project graph |
+| `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
+| `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
+| `find_paths` | Shortest paths between two entities (`project`-scoped) |
+
+### Maintenance
+| Tool | Description |
+|------|-------------|
+| `contradictions_report` | Detect conflicting facts for **one entity** (Groq NLI + vector pre-filter); `entity` is required |
+| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`) |
+| `import_memories` | Restore from JSON/JSONL (`data`, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
+| `server_health` | Check Postgres + Inference connectivity |
+
+### Resource
+| Resource | Description |
+|----------|-------------|
+| `memory://stats` | Memory/entity/relation counts + health |
+
+---
+
+## Retrieval
+
+- `recall` searches the project table (if `project` is set) **and** the
+  global `memories` table; global facts remain visible inside a project.
+- FTS is OR-based (`_fts_query`), weighted with `FTS_WEIGHT = 0.6` so a single
+  common word cannot outrank the best semantic hit.
+- `_similarity` = `1 - cosine distance` (0..1), the same scale as `min_similarity`.
+- Embeddings are prompt-aware: queries use `mode="query"`, stored content uses
+  `mode="document"`. After changing the model or prompts, re-embed:
+  `docker compose exec loci-mcp python -m mcp_server.reembed`.
+- `remember(scope="global")` writes to `memories` even inside a project.
+- `graph_boost=true` (only in combination with `entity`) pulls in memories from
+  directly connected graph entities and weights them with `_graph_boost`
+  (30% of the edge weight); RRF remains the basis of the score.
+- `include_superseded=true` shows superseded history, but never deleted rows
+  (`deleted_at` is set) — soft delete stays invisible.
+
+## Memory Types
+
+Allowed values: `fact`, `decision`, `learning`, `preference`, `pattern`,
+`incident`, `runbook`, `context`, `observation`, `convention`, `command`,
+`note`. Other values are rejected (`MEMORY_TYPES` in `server.py`).
+
+## Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MEMORY_DATABASE_URL` | `postgresql://memory:geheim@localhost:5432/memory` | Postgres DSN |
+| `MEMORY_INFERENCE_URL` | `http://localhost:8001` | Inference API |
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
+| `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
+| `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
+| `GROQ_API_KEY` | – | Required for `/nli`; without a key, NLI returns 0.0 everywhere |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` (compose: `openai/gpt-oss-20b`) | NLI model |
+
+## Scopes & Project Names
+
+- Every fact belongs to exactly one scope: the global `memories` table or a
+  project table `mem_<suffix>`.
+- Project names may contain any characters. Plain lowercase identifiers up to
+  40 characters are used verbatim as the suffix; all other names are
+  lowercased, truncated and get a short SHA-1 of the original name appended
+  (`Project Alpha-2` → `project_alpha_2_e6a52393`; `Team` and `team` get
+  different suffixes). This keeps table and index names below the 63-character
+  limit and prevents case variants from colliding.
+- `global` is reserved: `project="global"` means "no project" and never creates
+  a project with that name.
+- The `projects` table maps suffix → original name, so results show the name
+  that was passed in.
+- The graph has one AGE label per scope (`Entity` for global,
+  `Project_<slug>` for a project) plus a `project` property; `entities` has
+  `UNIQUE(name, project)`. Identical entity names therefore do not collide
+  across projects.
+- `project` is accepted by: `get_entity`, `list_entities`, `relate`,
+  `relate_batch`, `find_connections`, `find_paths`, `forget`,
+  `export_memories`, `import_memories`. Without `project` the scope is global
+  (`export`/`init_context`: all scopes).
+
+## Backup & Restore
+
+- `export_memories` (JSON, version `0.2`) contains IDs, `superseded_by`,
+  `deleted_at`, timestamps, `access_count`, the project of each record and the
+  complete graph (entities with scope, relations with weight/scope). JSONL is
+  flat (one record per line, no graph). `include_embeddings=true` includes the
+  vectors, `include_superseded=true` the history; `include_graph=false` omits
+  the graph.
+- `import_memories` restores IDs and timestamps, creates project tables on
+  demand and upserts entities/relations via MERGE (idempotent). Without
+  `project`, each record lands in its export scope; with `project`, all records
+  are written to that project. Re-importing the same file reports existing IDs
+  as `skipped`; `skip_duplicates=false` allows duplicates.
+
+## Cognitive Decay
+
+- Memories age with a half-life of 90 days
+- `importance` (0.0–1.0) and `access_count` (max. 20) slow down decay
+- `include_decay=true` in `recall` weights by recency + frequency
+- Decay contributes at most 30% to the score (`DECAY_WEIGHT = 0.3`), 70% stays relevance
+- `min_decay_score` (0..1) filters on normalized decay (`_decay_norm`)
+
+## Contradiction Detection
+
+With `remember(check_contradictions=true)`, the 15 semantically nearest active
+facts of the same entity (`mem_type='fact'`) are pre-filtered per pgvector —
+separately for the project and global tables — and then checked for a real
+contradiction via Groq NLI (`/nli`). From a score of ≥ 0.7, the old fact is
+automatically superseded.
+
+`contradictions_report(entity=...)` works only on **active** facts of an entity:
+for each fact, the 20 nearest vector neighbors are fetched and only the
+deduplicated pairs are checked via NLI (`confidence > 0.7`).
+
+## Schema
+
+| Table | Purpose |
+|-------|---------|
+| `memories` | Global text content with vector embedding (768d) + FTS + decay |
+| `mem_<suffix>` | Project-specific memories (created dynamically on demand) |
+| `projects` | Registry suffix → original project name |
+| `entities` | Graph nodes (people, concepts, places...) with `project` scope |
+| `relations` | Graph edges between entities (with `project` scope) |
+
+The AGE graph `memory_graph` is created automatically via `create_graph()`.
+
+## Vector Search (pgvector)
+
+```sql
+SELECT id, content, metadata
+FROM memories
+ORDER BY embedding <=> '[0.1, 0.2, ...]'
+LIMIT 5;
+```
+
+## Graph Queries (Apache AGE)
+
+```sql
+SELECT * FROM cypher('memory_graph', $$
+    MATCH (p:Person)-[:KNOWS]->(friend)
+    RETURN p.name, friend.name
+$$) AS (name agtype, friend_name agtype);
+```
+
+## Docker Configuration
+
+- **Postgres**: `postgres:17-bookworm` + pgvector v0.8.1 + Apache AGE 1.7.0
+- **`shm_size: 1g`**: AGE needs more shared memory
+- **Inference**: FastAPI + sentence-transformers (CPU)
+- **Loci MCP**: Python FastMCP server with uvicorn (Streamable HTTP transport)
+
+After changing the embedding model or prompts, rebuild both images and then
+re-embed:
+
+```bash
+docker compose build inference loci-mcp && docker compose up -d
+docker compose exec loci-mcp python -m mcp_server.reembed
+```
+
+On startup, the MCP server runs idempotent migrations
+(`deleted_at` backfill, sentinel migration, dedup of duplicate AGE edges).
+
+## Inference API
+
+```python
+import requests
+
+# Embedding (Jina v5 nano, 239M) → 768d normalized vector
+# mode: "query" (search query) or "document" (stored content, default)
+r = requests.post("http://localhost:8001/embed", json={
+    "texts": ["This is a test", "Another text"],
+    "mode": "document"
+})
+vectors = r.json()["embeddings"]
+
+# NLI / contradiction detection (Groq, requires GROQ_API_KEY)
+r = requests.post("http://localhost:8001/nli", json={
+    "query": "Max lives in Berlin",
+    "documents": ["Max lives in Hamburg"]
+})
+contradiction_scores = r.json()["contradiction_scores"]
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Custom Postgres image with pgvector + AGE |
+| `docker-compose.yml` | Container orchestration |
+| `init.sql` | Schema + extensions + AGE graph |
+| `mcp_server/` | Python MCP server (FastMCP + pgvector + AGE) |
+| `mcp_server/db.py` | Schema, migrations, connection handling |
+| `mcp_server/inference_client.py` | HTTP client for `/embed`, `/nli`, `/health` |
+| `mcp_server/reembed.py` | Re-embed all memories after a model/prompt change |
+| `inference/Dockerfile` | Inference service with sentence-transformers |
+| `inference/app.py` | FastAPI server (`/embed`, `/nli`, `/health`) |
+| `AGENTS.md` | Full tool documentation for AI agents |
