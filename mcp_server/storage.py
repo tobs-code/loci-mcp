@@ -54,11 +54,15 @@ def _supersede(cur, project: str | None, new_id: str, old_id: str) -> None:
 def _deduplicate(cur, content: str, project: str | None,
                  embedding_vec: list[float] | None = None,
                  fuzzy_threshold: float | None = None,
-                 dedupe: str = "exact") -> str | None:
+                 dedupe: str = "exact") -> tuple[str, str, float | None] | None:
     """Return the id of an existing memory that says the same thing.
 
     `dedupe` selects the mode: "exact" (content hash), "semantic" (hash plus
     vector similarity) or "off" (no check at all).
+
+    Returns a tuple (memory id, mode, similarity). The mode tells the caller
+    *why* the memory was seen as a duplicate, and the similarity is the
+    measured cosine distance of a semantic match (None for an exact one).
     """
     if dedupe == "off":
         return None
@@ -72,7 +76,7 @@ def _deduplicate(cur, content: str, project: str | None,
     )
     row = cur.fetchone()
     if row:
-        return row[0]
+        return row[0], "exact", None
 
     if embedding_vec is not None and dedupe == "semantic":
         threshold = fuzzy_threshold if fuzzy_threshold is not None else DEFAULT_DUPLICATE_THRESHOLD
@@ -85,7 +89,7 @@ def _deduplicate(cur, content: str, project: str | None,
         )
         row = cur.fetchone()
         if row and float(row[1]) <= max_dist:
-            return row[0]
+            return row[0], "semantic", round(1.0 - float(row[1]), 4)
 
     return None
 
@@ -108,9 +112,30 @@ def _find_by_content(cur, content: str, project: str | None,
     return row[0] if row else None
 
 
-def _find_last_for_entity(cur, entity: str, project: str | None) -> str | None:
-    """Id of the most recently updated active memory of an entity."""
+def _find_last_for_entity(cur, entity: str, project: str | None,
+                          embedding: list[float] | None = None
+                          ) -> tuple[str, str, float | None] | None:
+    """The most recently updated active memory of an entity.
+
+    With `embedding` the cosine similarity to that memory is returned as
+    well. It is used to decide whether a new fact really replaces the old
+    one or whether it is about a different topic.
+    """
     table = _mem_table(project)
+    if embedding is not None:
+        cur.execute(
+            f"SELECT id, content, embedding <=> %s::vector AS dist "
+            f"FROM {table} WHERE entity = %s "
+            f"AND superseded_by IS NULL AND deleted_at IS NULL "
+            f"ORDER BY updated_at DESC LIMIT 1",
+            (embedding, entity),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        dist = row[2]
+        similarity = None if dist is None else round(1.0 - float(dist), 4)
+        return row[0], row[1], similarity
     cur.execute(
         f"SELECT id FROM {table} WHERE entity = %s "
         f"AND superseded_by IS NULL AND deleted_at IS NULL "
@@ -118,7 +143,7 @@ def _find_last_for_entity(cur, entity: str, project: str | None) -> str | None:
         (entity,),
     )
     row = cur.fetchone()
-    return row[0] if row else None
+    return (row[0], None, None) if row else None
 
 
 def _check_contradictions(cur, content: str, entity: str | None,

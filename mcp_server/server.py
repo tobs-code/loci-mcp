@@ -65,7 +65,8 @@ _TOOLS = (
 for _tool in _TOOLS:
     app.tool()(_tool)
 
-app.resource("memory://stats")(stats_resource)
+app.resource("memory://stats", mime_type="application/json",
+             description="Memory server stats: counts, health.")(stats_resource)
 
 
 def main() -> None:

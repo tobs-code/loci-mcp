@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
+
+def _escape_like(value: str) -> str:
+    """Escape the wildcards of a LIKE/ILIKE pattern."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _normalize_metadata_filter(value: Any) -> dict | None:
     """Accept a metadata filter as object or as JSON string.
 
@@ -104,8 +110,10 @@ def recall(
     min_similarity: Annotated[
         float | None,
         Field(description="Drop vector hits below this cosine similarity "
-                          "(0.0-1.0, default 0.4). Use null to disable the "
-                          "filter.")] = DEFAULT_MIN_SIMILARITY,
+                          "(0.0-1.0, default 0.3). Full-text hits are never "
+                          "dropped by this filter: an exact keyword match "
+                          "survives even when the embedding model scores it "
+                          "low. Use null to disable the filter.")] = DEFAULT_MIN_SIMILARITY,
     fields: Annotated[
         list[str] | None,
         Field(description="Only return these columns, e.g. ['id', 'content']. "
@@ -135,12 +143,20 @@ def recall(
     (requires `entity`, otherwise a warning is returned). Graph hits have no
     similarity: their `_similarity` and `_relevance_score` are null and they
     carry `_graph_boost` instead.
-    `min_similarity` defaults to 0.4; lower it to broaden results, or pass
-    `None` to disable the similarity filter. `_relevance_score` is normalized
-    to 0..1 across retrieval modes: RRF for hybrid, cosine similarity for
-    vector-only, and normalized text rank for the FTS fallback.
-    `_final_score` is the ranking score: relevance plus at most 30% decay and
-    the graph boost.
+    `min_similarity` defaults to 0.3 and only applies to the vector retriever;
+    a full-text hit is kept even when its embedding is a poor match, so an
+    exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
+    handles that word badly. Pass `None` to disable the filter. The response
+    reports `candidates` and `filtered_by_similarity`, and warns when the
+    filter removed everything.
+    `_relevance_score` is normalized to 0..1 and combines both signals: the
+    cosine similarity of the vector hit and the rank of the full-text hit.
+    A memory that both retrievers found scores higher than either signal
+    alone. `_similarity` is the raw cosine similarity (0..1): a natural
+    language question that matches scores ~0.6-0.95, a bare keyword that
+    occurs verbatim in the memory only ~0.3-0.6.
+    `_final_score` is the ranking score in 0..1: relevance blended with decay
+    plus the graph boost.
     Set include_decay=True to blend in recency/frequency (max 30% of the score).
     min_decay_score (0..1) filters on the normalized decay score; a fresh,
     important memory scores ~0.9, an old one ~0.5.
@@ -186,6 +202,7 @@ def recall(
         tables = _retrieval_tables(cur, project)
         if project and not include_global:
             tables = [table for table in tables if table != "memories"]
+        stats: dict[str, Any] = {}
         results = _search_memories(
             cur, query_emb, query if (hybrid or query_emb is None) else None,
             mem_type, entity, limit, project,
@@ -193,6 +210,7 @@ def recall(
             min_similarity=min_similarity,
             hybrid=hybrid, tables=tables,
             updated_after=updated_after, metadata_filter=metadata_filter,
+            stats=stats,
         )
 
         # Graph-enhanced retrieval when enabled
@@ -251,7 +269,33 @@ def recall(
 
     results = results[:limit]
     rows = [project_row(r, fields) for r in results if isinstance(r, dict)]
-    return ok(STATUS_OK, count=len(rows), results=rows, warnings=warnings)
+
+    # An empty result set is ambiguous: the memory may simply not exist, or
+    # a filter may have dropped it. Say which one it was.
+    filtered_out = stats.get("filtered_by_similarity", 0)
+    candidates = stats.get("candidates", 0)
+    if not rows and filtered_out:
+        warnings.append(
+            f"no results: {filtered_out} candidate(s) were below "
+            f"min_similarity={min_similarity}; pass min_similarity=null or a "
+            f"lower value to see them"
+        )
+    elif not rows and candidates:
+        warnings.append(
+            f"no results: {candidates} candidate(s) matched but every one of "
+            f"them was filtered out (min_decay_score, only_superseded or the "
+            f"scope filter)"
+        )
+    elif not rows:
+        warnings.append("no results: nothing in this scope matches the query")
+    payload: dict[str, Any] = {
+        "candidates": candidates,
+        "filtered_by_similarity": filtered_out,
+    }
+    if stats.get("fulltext_only"):
+        payload["fulltext_only"] = stats["fulltext_only"]
+    return ok(STATUS_OK, count=len(rows), results=rows, warnings=warnings,
+              **payload)
 
 
 def list_memories(
@@ -290,13 +334,20 @@ def list_memories(
     order_by: Annotated[
         Literal["updated_at", "created_at", "access_count", "importance"],
         Field(description="Sort order (default: updated_at, newest first).")] = "updated_at",
+    contains: Annotated[
+        str | None,
+        Field(description="Only memories whose content contains this text "
+                          "(case-insensitive substring). Use it to look for a "
+                          "literal string without the semantic ranking of "
+                          "`recall`.")] = None,
 ) -> dict[str, Any]:
     """Browse stored memories without a search query.
 
     Newest first. Project scope also lists global memories, like `recall`.
     Set `fields` to narrow the returned columns. Set `include_global=False`
     to restrict a project browse to project memories. `updated_after` and
-    `metadata_filter` narrow the result set, `order_by` changes the sorting.
+    `metadata_filter` narrow the result set, `order_by` changes the sorting
+    and `contains` filters on a literal substring of the content.
     """
     logger.info("list_memories entity=%s mem_type=%s limit=%s project=%s",
                 entity, mem_type, limit, project)
@@ -346,6 +397,9 @@ def list_memories(
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
+        if contains:
+            conditions.append("content ILIKE %s")
+            params.append(f"%{_escape_like(contains)}%")
         conditions.extend(extra_conditions)
         params.extend(extra_params)
         where = " AND ".join(conditions)
@@ -371,16 +425,27 @@ def list_memories(
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    seen_hashes: set[str] = set()
-    unique: list[dict] = []
-    for row in rows:
-        c_hash = row.get("content_hash") or ""
-        if c_hash and c_hash in seen_hashes:
-            continue
-        if c_hash:
-            seen_hashes.add(c_hash)
-        unique.append(row)
     # The rows come from several tables: sort globally before trimming.
+    unique = list(rows)
+    unique.sort(key=lambda r: (r.get(order_column) is not None,
+                                r.get(order_column)), reverse=True)
+    # Cross-scope dedup: the same content can live in a project and in the
+    # global scope. The project copy wins, like it does in `recall`.
+    by_hash: dict[str, dict] = {}
+    without_hash: list[dict] = []
+    for row in unique:
+        c_hash = row.get("content_hash") or ""
+        if not c_hash:
+            without_hash.append(row)
+            continue
+        current = by_hash.get(c_hash)
+        if current is None:
+            by_hash[c_hash] = row
+            continue
+        if (current.get("_project") == "global"
+                and row.get("_project") != "global"):
+            by_hash[c_hash] = row
+    unique = list(by_hash.values()) + without_hash
     unique.sort(key=lambda r: (r.get(order_column) is not None,
                                 r.get(order_column)), reverse=True)
     unique = unique[:limit]
@@ -590,6 +655,11 @@ def init_context(project: Annotated[
         bool,
         Field(description="True (default) includes global memories; False "
                           "excludes them.")] = True,
+    limit: Annotated[
+        int,
+        Field(description="How many memories to return (default 10). The list "
+                          "always contains the most recently changed "
+                          "memories of the scope.")] = 10,
 ) -> dict[str, Any]:
     """Call at session start. Returns recent + important bootstrap info + health.
 
@@ -600,11 +670,16 @@ def init_context(project: Annotated[
     removes near-duplicates; `detail="full"` returns every column except the
     internal ones. Every memory carries the `project` it belongs to, and the
     list is sorted by the last update.
+
+    The memories are the most recently changed ones of the scope - a freshly
+    stored fact always shows up, even if it was never read before.
     """
     all_projects = project == "*"
     project = None if all_projects else _norm_project(project)
     if detail not in ("slim", "full"):
         return fail(STATUS_ERROR, "detail must be 'slim' or 'full'")
+    if limit < 1:
+        return fail(STATUS_ERROR, "limit must be >= 1")
     conn = get_conn()
     memories = []
     total = 0
@@ -616,8 +691,11 @@ def init_context(project: Annotated[
                   _retrieval_tables(cur, project) if project else ["memories"])
         if (project or all_projects) and not include_global:
             tables = [table for table in tables if table != "memories"]
-        memories = _search_memories(cur, None, None, None, None, 10, project,
-                                    include_decay=True, tables=tables)
+        # recent_first: the bootstrap shows what changed last, not what was
+        # read most often.
+        memories = _search_memories(cur, None, None, None, None, limit, project,
+                                    include_decay=True, tables=tables,
+                                    recent_first=True)
         names = _project_names(cur)
         projects = [names.get(t[len("mem_"):], t[len("mem_"):])
                     for t in tables if t != "memories"]
@@ -641,6 +719,7 @@ def init_context(project: Annotated[
     # The key promises recency: sort the selected memories by their last
     # update instead of by score.
     memories.sort(key=lambda m: m.get("updated_at") or _EPOCH, reverse=True)
+    memories = memories[:limit]
     if detail == "slim":
         memories = [project_bootstrap(m) for m in memories]
     else:

@@ -131,7 +131,11 @@ def export_memories(
         record = {
             "id": r["id"],
             "content": r["content"],
+            # "type" is the historical key, "mem_type" the name every other
+            # tool uses. Both are written so old and new exports stay
+            # readable; imports accept either.
             "type": r["mem_type"],
+            "mem_type": r["mem_type"],
             "entity": r["entity"],
             "project": r["project"],
             "importance": float(r["importance"]) if r.get("importance") is not None else 1.0,
@@ -267,8 +271,9 @@ def import_memories(
             if not emb:
                 emb = embed([content])[0]
             if skip_duplicates and not rec.get("id"):
-                if _deduplicate(cur, content, target, emb,
-                                rec.get("fuzzy_threshold") or fuzzy_threshold):
+                duplicate = _deduplicate(cur, content, target, emb,
+                                         rec.get("fuzzy_threshold") or fuzzy_threshold)
+                if duplicate:
                     skipped += 1
                     continue
             meta = rec.get("metadata", {})

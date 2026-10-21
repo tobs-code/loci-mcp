@@ -39,10 +39,22 @@ DEFAULT_DUPLICATE_THRESHOLD = 0.9
 
 
 # Avoid returning clearly unrelated vector hits unless callers opt out.
-DEFAULT_MIN_SIMILARITY = 0.4
+#
+# Measured with jina-embeddings-v5-text-nano-retrieval: a natural-language
+# question that matches a fact scores 0.62-0.95, a bare keyword that occurs
+# verbatim in the fact only scores 0.30-0.61 (single tokens dilute the query
+# vector). 0.4 therefore cut off roughly every third true keyword hit, so the
+# default sits lower; full-text matches are never filtered by this value.
+DEFAULT_MIN_SIMILARITY = 0.3
 
 
 PROJECT_SCOPE_BOOST = 0.05
+
+
+# `supersede_last` replaces the newest memory of an entity. Only do that when
+# the new fact is actually about the same topic: below this cosine similarity
+# the two facts are unrelated and replacing would destroy the old one.
+SUPERSEDE_SIMILARITY_MIN = 0.5
 
 
 # Dedupe modes for remember/remember_batch.

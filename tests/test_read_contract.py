@@ -225,7 +225,8 @@ def test_init_context_slim_bootstrap_drops_internal_fields():
     assert result["status"] == "ok"
     memory = result["recent_memories"][0]
     assert set(memory) <= {"id", "content", "entity", "mem_type", "importance",
-                            "updated_at", "scope"}
+                            "updated_at", "scope", "project"}
+    assert memory["project"] == "alpha"
 
 
 def test_init_context_removes_near_duplicates():
@@ -260,5 +261,9 @@ def test_init_context_detail_full_keeps_the_internal_fields():
     result = init_context(project="beta", detail="full")
 
     memory = result["recent_memories"][0]
-    assert "content_hash" in memory
     assert "access_count" in memory
+    assert memory["project"] == "beta"
+    # Internal bookkeeping is never exposed, not even in the full detail.
+    assert "content_hash" not in memory
+    assert "embedding" not in memory
+    assert "deleted_at" not in memory

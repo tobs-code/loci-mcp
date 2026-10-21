@@ -8,9 +8,11 @@ from mcp_server.db import get_conn
 from mcp_server.scopes import _ag_str, _project_names, _retrieval_tables, _scope_label
 from mcp_server.scoring import (
     _blend_scores,
+    _clamp01,
     _decay_norm,
     _decay_score,
     _fts_query,
+    _relevance_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,7 @@ def _search_memories_rrf(
     tables: list[str] | None = None,
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict]:
     """
     Reciprocal Rank Fusion over vector + FTS results.
@@ -76,6 +79,12 @@ def _search_memories_rrf(
     Retrieval runs against the project table (if any) and the global table;
     project rows win when both contain the same content. Scores are normalized
     so that decay can reorder results without drowning out relevance.
+
+    `min_similarity` only applies to the vector retriever. A full-text hit is
+    kept even when its embedding is a poor match: that is exactly the case
+    the full-text leg exists for (an identifier, a file name, a foreign word
+    that the embedding model handles badly). The number of candidates that
+    the filter removed is reported in `stats`.
     """
     tables = tables if tables is not None else _retrieval_tables(cur, project)
     if not tables:
@@ -89,6 +98,7 @@ def _search_memories_rrf(
     # (score, id, table) tuples, merged across tables before ranking
     vec_candidates: list[tuple[float, str, str]] = []
     text_candidates: list[tuple[float, str, str]] = []
+    dropped_by_similarity = 0
 
     for table in tables:
         conditions = ["TRUE"]
@@ -115,14 +125,16 @@ def _search_memories_rrf(
                 f"WHERE {where} AND embedding IS NOT NULL"
             )
             vec_params: list[Any] = [query_embedding] + params
-            if max_distance is not None:
-                sql += " AND embedding <=> %s::vector <= %s"
-                vec_params += [query_embedding, max_distance]
+            # The distance filter is applied below, not in SQL: only then the
+            # number of rejected candidates can be reported to the caller.
             sql += " ORDER BY distance ASC LIMIT 50"
             cur.execute(sql, vec_params)
-            vec_candidates.extend(
-                (float(dist), row_id, table) for row_id, dist in cur.fetchall()
-            )
+            for row_id, dist in cur.fetchall():
+                dist = float(dist)
+                if max_distance is not None and dist > max_distance:
+                    dropped_by_similarity += 1
+                    continue
+                vec_candidates.append((dist, row_id, table))
 
         # 2. FTS Search (Top 50 per table), OR-joined terms
         if fts_query:
@@ -133,9 +145,8 @@ def _search_memories_rrf(
                 f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)"
             )
             fts_params: list[Any] = [fts_query, fts_query]
-            if max_distance is not None and query_embedding is not None:
-                sql += " AND embedding IS NOT NULL AND embedding <=> %s::vector <= %s"
-                fts_params += [query_embedding, max_distance]
+            # No similarity filter here: a full-text hit stays a hit even when
+            # the embedding model scores it poorly.
             sql += f" AND {where} ORDER BY rank DESC LIMIT 50"
             cur.execute(sql, fts_params + params)
             text_candidates.extend(
@@ -149,6 +160,7 @@ def _search_memories_rrf(
     vector_results: dict[str, float] = {}
     text_results: dict[str, float] = {}
     similarities: dict[str, float] = {}
+    text_scores: dict[str, float] = {}
     table_of: dict[str, str] = {}
 
     for rank, (distance, row_id, table) in enumerate(vec_candidates[:50], 1):
@@ -159,11 +171,21 @@ def _search_memories_rrf(
         text_results[row_id] = FTS_WEIGHT / (k + rank)
         table_of.setdefault(row_id, table)
 
+    max_text_rank = max((r for r, _, _ in text_candidates[:50]), default=0.0)
+    for rank, (ts_rank, row_id, _table) in enumerate(text_candidates[:50], 1):
+        # Normalized full-text evidence: the best text hit is 1.0, weaker
+        # hits fall off with their text rank.
+        text_scores[row_id] = (ts_rank / max_text_rank) if max_text_rank else 0.0
+
     fused_scores = {
         row_id: vector_results.get(row_id, 0.0) + text_results.get(row_id, 0.0)
         for row_id in set(vector_results) | set(text_results)
     }
     if not fused_scores:
+        if stats is not None:
+            stats.update({"candidates": 0,
+                          "filtered_by_similarity": dropped_by_similarity,
+                          "fulltext_only": 0})
         return []
 
     max_rrf = max(fused_scores.values()) or 1.0
@@ -197,10 +219,19 @@ def _search_memories_rrf(
                 seen_hashes.add(c_hash)
             d["_rrf_score"] = fused_scores.get(row_id, 0.0)
             d["_rrf_norm"] = d["_rrf_score"] / max_rrf
-            d["_relevance_score"] = d["_rrf_norm"]
-            if row_id in similarities:
-                d["_similarity"] = round(similarities[row_id], 4)
-                d["_distance"] = round(1.0 - similarities[row_id], 4)
+            d["_similarity"] = round(similarities[row_id], 4) if row_id in similarities else None
+            d["_distance"] = round(1.0 - d["_similarity"], 4) if d["_similarity"] is not None else None
+            if row_id in text_scores:
+                d["_text_score"] = round(text_scores[row_id], 4)
+            # Relevance combines both signals, so a memory found by the
+            # full-text retriever alone is still ranked above a weak vector
+            # match instead of being flattened into the same RRF band.
+            relevance = _relevance_score(similarities.get(row_id, 0.0),
+                                         text_scores.get(row_id, 0.0))
+            if project and table != "memories":
+                relevance = min(1.0, relevance + PROJECT_SCOPE_BOOST)
+                d["_scope_boost"] = PROJECT_SCOPE_BOOST
+            d["_relevance_score"] = round(relevance, 4)
             if not include_embedding:
                 d.pop("embedding", None)
             if include_decay:
@@ -212,20 +243,29 @@ def _search_memories_rrf(
                     d.get("created_at"), d.get("updated_at"),
                     d.get("access_count", 0), d.get("importance", 1.0),
                 )
-            if project and table != "memories":
-                d["_scope_boost"] = PROJECT_SCOPE_BOOST
             rows.append(d)
+
+    if stats is not None:
+        stats.update({
+            "candidates": len(fused_scores),
+            "filtered_by_similarity": dropped_by_similarity,
+            "fulltext_only": sum(1 for row_id in fused_scores
+                                 if row_id not in similarities),
+        })
 
     # 5. Re-rank
     if include_decay:
         for r in rows:
-            r["_final_score"] = (_blend_scores(r["_rrf_norm"], r["_decay_norm"])
-                                  + r.get("_scope_boost", 0.0))
+            r["_final_score"] = _clamp01(
+                _blend_scores(r["_relevance_score"], r["_decay_norm"])
+            )
         rows.sort(key=lambda x: -x.get("_final_score", 0))
     else:
-        rows.sort(key=lambda x: -x.get("_rrf_score", 0))
+        rows.sort(key=lambda x: (-x.get("_relevance_score", 0.0),
+                                 -x.get("_rrf_score", 0.0)))
 
     return rows[:limit]
+
 
 
 def _search_memories(
@@ -244,18 +284,23 @@ def _search_memories(
     tables: list[str] | None = None,
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
+    recent_first: bool = False,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict]:
     """
     Wrapper for search functions. Uses RRF when hybrid=True, otherwise legacy search.
 
     `tables` overrides the table set (default: project table + global).
+    `recent_first` keeps the "newest first" order of a browse instead of
+    re-ranking by decay score - the session bootstrap needs recency, not the
+    most frequently accessed memories.
     """
     if hybrid and (query_embedding is not None or query_text):
         return _search_memories_rrf(
             cur, query_embedding, query_text, mem_type, entity, limit, project,
             include_decay, include_embedding, include_superseded, min_similarity,
             tables=tables, updated_after=updated_after,
-            metadata_filter=metadata_filter,
+            metadata_filter=metadata_filter, stats=stats,
         )
 
     # Legacy fallback for individual retrievers
@@ -271,7 +316,11 @@ def _search_memories(
 
     rows: list[dict] = []
     seen_hashes: set[str] = set()
+    dropped_by_similarity = 0
     project_names = _project_names(cur)
+    # Fetch more than the caller asked for: the similarity filter is applied
+    # in Python, so the limit must not cut the candidates before filtering.
+    fetch_limit = max(limit, 50)
     for table in tables:
         conditions: list[str] = ["TRUE"]
         params: list[Any] = []
@@ -282,9 +331,6 @@ def _search_memories(
             conditions.append("embedding IS NOT NULL")
             order = "ORDER BY distance ASC"
             params_vec.append(query_embedding)
-            if max_distance is not None:
-                conditions.append("embedding <=> %s::vector <= %s")
-                params_vec.extend([query_embedding, max_distance])
         elif fts_query:
             col = (f"*, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
                    f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS fts_rank")
@@ -318,7 +364,7 @@ def _search_memories(
         cur.execute(
             f"SELECT {col}, created_at, updated_at, access_count, importance "
             f"FROM {table} WHERE {where} {order} LIMIT %s",
-            params_vec + params + [limit],
+            params_vec + params + [fetch_limit],
         )
 
         colnames = [desc[0] for desc in cur.description] if cur.description else []
@@ -330,6 +376,9 @@ def _search_memories(
                 d["_project"] = project_names.get(table[4:], table[4:])
             if "distance" in d and d["distance"] is not None:
                 d["_distance"] = float(d.pop("distance"))
+                if max_distance is not None and d["_distance"] > max_distance:
+                    dropped_by_similarity += 1
+                    continue
                 d["_similarity"] = round(1.0 - d["_distance"], 4)
             else:
                 d.pop("distance", None)
@@ -359,7 +408,8 @@ def _search_memories(
         max_rank = max((r.get("_fts_rank", 0.0) for r in rows), default=0.0)
         for row in rows:
             rank = row.pop("_fts_rank", 0.0)
-            row["_relevance_score"] = rank / max_rank if max_rank else 0.0
+            row["_text_score"] = round(rank / max_rank, 4) if max_rank else 0.0
+            row["_relevance_score"] = row["_text_score"]
         rows.sort(key=lambda x: -x.get("_relevance_score", 0.0))
     else:
         rows.sort(key=lambda x: x.get("updated_at") or _now(), reverse=True)
@@ -367,17 +417,27 @@ def _search_memories(
     if has_vec:
         for row in rows:
             row["_relevance_score"] = row.get("_similarity", 0.0)
+    if stats is not None:
+        stats.update({
+            "candidates": len(rows),
+            "filtered_by_similarity": dropped_by_similarity,
+            "fulltext_only": 0,
+        })
     if include_decay:
         for r in rows:
             relevance = r.get("_relevance_score")
             if relevance is not None:
-                r["_final_score"] = _blend_scores(relevance, r["_decay_norm"])
+                r["_final_score"] = _clamp01(
+                    _blend_scores(relevance, r["_decay_norm"])
+                )
             else:
                 # Nothing relevant to blend with: recency/frequency only.
                 r["_final_score"] = r["_decay_norm"]
-        rows.sort(key=lambda x: -x.get("_final_score", 0))
+        if not recent_first:
+            rows.sort(key=lambda x: -x.get("_final_score", 0))
 
     return rows[:limit]
+
 
 
 def _search_memories_graph_boost(
@@ -473,8 +533,8 @@ def _search_memories_graph_boost(
         conn.close()
 
     # 3. Fuse with existing results
-    # Keep the boost relative to the best RRF score so graph candidates
-    # cannot jump to the top on weight alone.
+    # Keep the boost relative to the best score so graph candidates cannot
+    # jump to the top on weight alone.
     max_rrf = max((r.get("_rrf_score", 0.0) for r in existing_results), default=0.0)
     if max_rrf <= 0:
         max_rrf = 1.0 / 61.0
@@ -489,10 +549,15 @@ def _search_memories_graph_boost(
             r["_graph_boost"] = graph_boost_weight * r["_graph_weight"]
         graph_boost = r.get("_graph_boost", 0.0)
         decay_norm = r.get("_decay_norm", 0.0) if include_decay else 0.0
+        # Graph candidates were not retrieved by relevance: they count as
+        # relevance 0 and are lifted by the boost only.
+        relevance = r.get("_relevance_score") or 0.0
 
-        # Final score: relevance (RRF) + graph boost + at most 30% decay
-        r["_final_score"] = (_blend_scores(rrf_norm, decay_norm) + graph_boost
-                             + r.get("_scope_boost", 0.0))
+        # Final score: relevance (blended with decay) plus the graph boost,
+        # always inside the documented 0..1 range.
+        r["_final_score"] = _clamp01(
+            _blend_scores(relevance, decay_norm) + graph_boost
+        )
 
     # Sort by final score and limit
     all_results.sort(key=lambda x: -x.get("_final_score", 0))

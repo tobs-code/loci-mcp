@@ -96,8 +96,14 @@ def _project_tables(cur) -> list[str]:
 
 
 def _all_mem_tables(cur) -> list[str]:
-    """Global table first, then all project tables."""
-    return ["memories"] + _project_tables(cur)
+    """All project tables first, then the global one.
+
+    The order matters: when the same content exists in a project and in the
+    global scope, the project row wins - in retrieval, in a browse and when
+    a memory id is updated without a project. The global table comes last
+    so that it is the one that is dropped by the cross-scope dedup.
+    """
+    return _project_tables(cur) + ["memories"]
 
 
 def _retrieval_tables(cur, project: str | None) -> list[str]:

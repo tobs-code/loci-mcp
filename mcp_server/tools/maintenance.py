@@ -167,8 +167,8 @@ def stats_resource() -> str:
     return json.dumps({
         "total_memories": total,
         "active_memories": active,
-        "projects": [names.get(t[len("mem_"):], t[len("mem_"):])
-                     for t in tables if t != "memories"],
+        "projects": sorted(names.get(t[len("mem_"):], t[len("mem_"):])
+                           for t in tables if t != "memories"),
         "entities": entities,
         "relations": relations,
         "inference_healthy": _health_check(),

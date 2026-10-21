@@ -21,12 +21,14 @@ PUBLIC_FIELDS = (
     "superseded_by",
     "created_at",
     "updated_at",
+    "project",
 )
 
 # Scoring annotations added by the search layer.
 SCORE_FIELDS = (
     "_similarity",
     "_distance",
+    "_text_score",
     "_rrf_score",
     "_rrf_norm",
     "_relevance_score",
@@ -38,7 +40,7 @@ SCORE_FIELDS = (
     "_graph_weight",
 )
 
-SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS + ("project", "_project"))
+SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS + ("_project",))
 
 
 def validate_fields(fields: list[str] | None) -> str | None:
@@ -54,6 +56,7 @@ INTERNAL_FIELDS = (
     "content_hash",
     "embedding",
     "deleted_at",
+    "_project",
 )
 
 # Even slimmer view for the session bootstrap.
@@ -73,7 +76,8 @@ def project(row: dict, fields: list[str] | None = None) -> dict:
 
     With `fields` given, only those keys are returned (missing keys are
     skipped). Without it, the public fields plus score annotations are
-    returned; internal fields are dropped.
+    returned; internal fields are dropped. The scope of a memory is always
+    reported as `project` (the project name, or "global").
     """
     if fields is not None:
         projected = {}
@@ -87,8 +91,13 @@ def project(row: dict, fields: list[str] | None = None) -> dict:
             elif field in row:
                 projected[field] = row[field]
         return projected
-    keep = PUBLIC_FIELDS + SCORE_FIELDS
-    return {f: row[f] for f in keep if f in row}
+    out = {f: row[f] for f in PUBLIC_FIELDS if f in row}
+    if "project" not in out:
+        value = row.get("_project") or row.get("scope")
+        if value is not None:
+            out["project"] = value
+    out.update({f: row[f] for f in SCORE_FIELDS if f in row})
+    return out
 
 
 def project_bootstrap(row: dict) -> dict:
@@ -111,9 +120,15 @@ def project_full(row: dict) -> dict:
     """Full column view for `detail="full"`, minus internal bookkeeping.
 
     Internal fields (content hash, embedding, deletion marker) are never
-    exposed, not even in the full bootstrap.
+    exposed, not even in the full bootstrap. The scope is reported as
+    `project`, like everywhere else.
     """
-    return {k: v for k, v in row.items() if k not in INTERNAL_FIELDS}
+    out = {k: v for k, v in row.items() if k not in INTERNAL_FIELDS}
+    if "project" not in out:
+        scope = row.get("_project") or row.get("scope")
+        if scope is not None:
+            out["project"] = scope
+    return out
 
 
 def _stem(word: str) -> str:
