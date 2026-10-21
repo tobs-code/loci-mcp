@@ -91,6 +91,19 @@ def test_project_browse_and_context_can_exclude_global_hits():
                for hit in context["recent_memories"])
 
 
+def test_project_entity_lookup_can_exclude_global_hits():
+    remember("Entity scope: project deployment owner", entity="ScopeOwner",
+             project="entity-scope")
+    remember("Entity scope: global deployment owner", entity="ScopeOwner",
+             scope="global")
+
+    result = get_entity(entity="ScopeOwner", project="entity-scope",
+                        include_global=False)
+
+    assert result["ok"] is True
+    assert all(memory["scope"] == "project" for memory in result["memories"])
+
+
 def test_recall_warns_when_graph_boost_has_no_entity():
     remember("Read contract: graph boost without entity")
 
@@ -150,8 +163,14 @@ def test_relation_context_is_searchable_but_hidden_from_memory_browse():
     assert relation["context_memory"]
     assert any(r["id"] == relation["context_memory"]
                for r in recall("Met in Berlin")["results"])
-    assert not any(r["id"] == relation["context_memory"]
-                   for r in list_memories(limit=20)["results"])
+    assert any(r["id"] == relation["context_memory"]
+               for r in list_memories(limit=20)["results"])
+
+
+def test_read_tools_reject_unknown_fields():
+    assert recall("unknown field", fields=["bogus"])["ok"] is False
+    assert list_memories(fields=["bogus"])["ok"] is False
+    assert get_entity(entity="Nina", fields=["bogus"])["ok"] is False
 
 
 def test_list_entities_answers_with_the_envelope():
@@ -193,6 +212,19 @@ def test_init_context_removes_near_duplicates():
     pipeline = [m for m in result["recent_memories"]
                 if "deploy pipeline" in m["content"].lower()]
     assert len(pipeline) == 1
+
+
+def test_init_context_defaults_to_global_and_can_select_all_projects():
+    remember("Bootstrap scope: project-only marker", project="bootstrap-scope")
+
+    default_context = init_context()
+    all_context = init_context(project="*")
+
+    assert all(m.get("scope") == "global"
+               for m in default_context["recent_memories"])
+    assert any(m.get("scope") == "project" and
+               "project-only marker" in m["content"]
+               for m in all_context["recent_memories"])
 
 
 def test_init_context_detail_full_keeps_the_internal_fields():

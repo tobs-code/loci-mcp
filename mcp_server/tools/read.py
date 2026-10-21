@@ -9,6 +9,7 @@ from mcp_server.inference_client import embed
 from mcp_server.projection import (
     dedupe_near_duplicates,
     project_bootstrap,
+    validate_fields,
 )
 from mcp_server.projection import project as project_row
 from mcp_server.scopes import (
@@ -64,6 +65,9 @@ def recall(
         return fail(STATUS_ERROR, "query must not be empty")
     if min_similarity is not None and not 0.0 <= min_similarity <= 1.0:
         return fail(STATUS_ERROR, "min_similarity must be between 0.0 and 1.0")
+    fields_error = validate_fields(fields)
+    if fields_error:
+        return fail(STATUS_ERROR, fields_error)
     if min_decay_score is not None and not 0.0 <= min_decay_score <= 1.0:
         return fail(STATUS_ERROR, "min_decay_score must be between 0.0 and 1.0")
     if limit < 1:
@@ -157,6 +161,9 @@ def list_memories(
     project = _norm_project(project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
+    fields_error = validate_fields(fields)
+    if fields_error:
+        return fail(STATUS_ERROR, fields_error)
     conn = get_conn()
     rows: list[dict] = []
     try:
@@ -188,8 +195,6 @@ def list_memories(
             table_rows = cur.fetchall()
             for row in table_rows:
                 item = dict(zip(columns, row))
-                if (item.get("metadata") or {}).get("relation_context"):
-                    continue
                 if table == "memories":
                     item["_project"] = "global"
                 else:
@@ -218,24 +223,33 @@ def list_memories(
 def get_entity(name: str | None = None, project: str | None = None,
                include_superseded: bool = False,
                entity: str | None = None,
-               fields: list[str] | None = None) -> dict[str, Any]:
+               fields: list[str] | None = None,
+               include_global: bool = True) -> dict[str, Any]:
     """Get everything known about an entity, including all linked memories.
 
     The entity can be passed as `entity` or `name`.
     Set fields=["id", "content"] to receive only the named memory columns.
+    Set include_global=False to restrict a project lookup to project memories.
     """
     target = entity or name
     logger.info("get_entity name=%s", target)
     project = _norm_project(project)
     if not target:
         return fail(STATUS_ERROR, "entity is required")
+    fields_error = validate_fields(fields)
+    if fields_error:
+        return fail(STATUS_ERROR, fields_error)
     conn = get_conn()
     memories = []
     entity_data = None
     try:
         cur = conn.cursor()
+        tables = _retrieval_tables(cur, project) if project else None
+        if project and not include_global:
+            tables = [table for table in tables if table != "memories"]
         memories = _search_memories(cur, None, None, None, target, 100, project,
-                                    include_superseded=include_superseded)
+                                    include_superseded=include_superseded,
+                                    tables=tables)
         scope = _scope_key(project)
         cur.execute(
             "SELECT id, name, type, project FROM entities WHERE name = %s AND project = %s",
@@ -346,12 +360,13 @@ def init_context(project: str | None = None, detail: str = "slim",
     """Call at session start. Returns recent + important bootstrap info + health.
 
     Pass `project` to bootstrap for one project; global memories are included
-    by default. Set `include_global=False` to exclude them. Without a project
-    all project tables are summarized.
+    by default. Set `include_global=False` to exclude them. Without a project,
+    only global memories are summarized; pass `project="*"` for all projects.
     `detail="slim"` (default) returns only the fields a session needs and
     removes near-duplicates; `detail="full"` returns every column.
     """
-    project = _norm_project(project)
+    all_projects = project == "*"
+    project = None if all_projects else _norm_project(project)
     if detail not in ("slim", "full"):
         return fail(STATUS_ERROR, "detail must be 'slim' or 'full'")
     conn = get_conn()
@@ -361,9 +376,9 @@ def init_context(project: str | None = None, detail: str = "slim",
     projects: list[str] = []
     try:
         cur = conn.cursor()
-        tables = (_retrieval_tables(cur, project) if project
-                  else _all_mem_tables(cur))
-        if project and not include_global:
+        tables = (_all_mem_tables(cur) if all_projects else
+                  _retrieval_tables(cur, project) if project else ["memories"])
+        if (project or all_projects) and not include_global:
             tables = [table for table in tables if table != "memories"]
         memories = _search_memories(cur, None, None, None, None, 10, project,
                                     include_decay=True, tables=tables)

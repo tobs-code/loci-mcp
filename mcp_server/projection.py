@@ -38,6 +38,17 @@ SCORE_FIELDS = (
     "_graph_weight",
 )
 
+SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS + ("project",))
+
+
+def validate_fields(fields: list[str] | None) -> str | None:
+    if fields is None:
+        return None
+    invalid = sorted(set(fields) - SELECTABLE_FIELDS)
+    if invalid:
+        return f"unknown field(s): {', '.join(invalid)}"
+    return None
+
 # Fields that are never shown unless explicitly requested.
 INTERNAL_FIELDS = (
     "content_hash",
