@@ -2,28 +2,13 @@ from mcp.server.fastmcp import FastMCP
 
 app = FastMCP(
     name="loci",
-    instructions="""Persistent memory server powered by PostgreSQL + pgvector + Apache AGE.
+    instructions="""Persistent memory tools for agents.
 
-Use `remember` to store facts, decisions, and observations about entities.
-Use `recall` to search semantically, by keyword, or via graph traversal.
-Use `relate` to connect entities in the knowledge graph.
-
-Project-scoped reads include global memories by default. Pass
-`include_global=false` when strict project isolation is required.
-Collection tools use `results` as their canonical list field. Export payloads
-are returned in `data`.
-
-=== WHEN TO REMEMBER ===
-- User preferences and corrections
-- Architectural decisions, conventions, commands
-- Facts about people, projects, tools, concepts
-- Recurring patterns worth retaining across sessions
-
-=== WHEN TO RECALL ===
-- At session start to load relevant context
-- When you need information from a previous session
-- When the user references something discussed before
-- Use `include_decay=true` to prioritize recent / frequently accessed facts
+Use `init_context` at session start, `remember` to store durable facts, and
+`recall` to search. Use graph tools to connect and traverse entities.
+Read-scope defaults differ by tool; check each tool's description and pass
+`include_global=false` when a project-only read is required. Collection tools
+return items in `results`; export and import payloads use `data`.
 """,
     streamable_http_path="/",
     json_response=True,

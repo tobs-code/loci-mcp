@@ -33,7 +33,7 @@ DEFAULT_DUPLICATE_THRESHOLD = 0.9
 
 
 # Avoid returning clearly unrelated vector hits unless callers opt out.
-DEFAULT_MIN_SIMILARITY = 0.3
+DEFAULT_MIN_SIMILARITY = 0.4
 
 
 PROJECT_SCOPE_BOOST = 0.05

@@ -111,8 +111,11 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   `_rrf_score` keeps the raw fusion value.
 - `_similarity` is `1 - cosine distance`, i.e. 0..1 on the same scale as
   `min_similarity`. Exact matches are typically 0.75-0.9, unrelated facts
-  below ~0.3. `recall` defaults to `min_similarity=0.3`; pass `null` to opt
+  below ~0.3. `recall` defaults to `min_similarity=0.4`; pass `null` to opt
   out.
+- `_relevance_score` is normalized to 0..1: RRF for hybrid search, cosine
+  similarity for vector-only search, and text rank for the FTS fallback.
+  RRF-specific annotations appear in hybrid results and when graph boosting is enabled.
 - `hybrid=false` bypasses RRF and uses a single retriever (vector when an
   embedding exists, otherwise FTS) — `hybrid=true` (default) is recommended.
 - `graph_boost=true` (requires `entity`) traverses one hop in the scope graph,

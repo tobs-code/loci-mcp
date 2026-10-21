@@ -235,6 +235,11 @@ def _search_memories(
             if max_distance is not None:
                 conditions.append("embedding <=> %s::vector <= %s")
                 params_vec.extend([query_embedding, max_distance])
+        elif fts_query:
+            col = ("*, ts_rank(to_tsvector('german', content), "
+                   "websearch_to_tsquery('german', %s)) AS fts_rank")
+            params_vec.append(fts_query)
+            order = "ORDER BY fts_rank DESC"
         else:
             col = "*"
             order = "ORDER BY updated_at DESC"
@@ -275,6 +280,8 @@ def _search_memories(
                 d["_similarity"] = round(1.0 - d["_distance"], 4)
             else:
                 d.pop("distance", None)
+            if "fts_rank" in d:
+                d["_fts_rank"] = float(d.pop("fts_rank") or 0.0)
             c_hash = d.get("content_hash") or ""
             if c_hash and c_hash in seen_hashes:
                 continue
@@ -295,13 +302,23 @@ def _search_memories(
 
     if has_vec:
         rows.sort(key=lambda x: x.get("_distance", 1.0))
+    elif fts_query:
+        max_rank = max((r.get("_fts_rank", 0.0) for r in rows), default=0.0)
+        for row in rows:
+            rank = row.pop("_fts_rank", 0.0)
+            row["_relevance_score"] = rank / max_rank if max_rank else 0.0
+        rows.sort(key=lambda x: -x.get("_relevance_score", 0.0))
     else:
         rows.sort(key=lambda x: x.get("updated_at") or _now(), reverse=True)
 
+    if has_vec:
+        for row in rows:
+            row["_relevance_score"] = row.get("_similarity", 0.0)
     if include_decay:
         for r in rows:
-            if has_vec and "_similarity" in r:
-                r["_final_score"] = _blend_scores(r["_similarity"], r["_decay_norm"])
+            relevance = r.get("_relevance_score")
+            if relevance is not None:
+                r["_final_score"] = _blend_scores(relevance, r["_decay_norm"])
             else:
                 # Nothing relevant to blend with: recency/frequency only.
                 r["_final_score"] = r["_decay_norm"]

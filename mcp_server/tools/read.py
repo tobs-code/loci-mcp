@@ -50,7 +50,11 @@ def recall(
     Project searches also see global memories; global searches see only global ones.
     Set graph_boost=True to include related entities in search via graph traversal
     (requires `entity`, otherwise a warning is returned).
-    Set min_similarity (0..1) to drop semantically weak matches.
+    `min_similarity` defaults to 0.4; lower it to broaden results, or pass
+    `None` to disable the similarity filter. `_relevance_score` is normalized
+    to 0..1 across retrieval modes: RRF for hybrid, cosine similarity for
+    vector-only, and normalized text rank for the FTS fallback. RRF-specific
+    fields appear in hybrid results and when graph boosting is enabled.
     Set include_decay=True to blend in recency/frequency (max 30% of the score).
     min_decay_score (0..1) filters on the normalized decay score.
     Set only_superseded=True to return only invalidated facts.
@@ -86,7 +90,7 @@ def recall(
         if project and not include_global:
             tables = [table for table in tables if table != "memories"]
         results = _search_memories(
-            cur, query_emb, query if hybrid else None,
+            cur, query_emb, query if (hybrid or query_emb is None) else None,
             mem_type, entity, limit, project,
             include_decay, include_superseded=include_superseded,
             min_similarity=min_similarity,
@@ -228,6 +232,7 @@ def get_entity(name: str | None = None, project: str | None = None,
     """Get everything known about an entity, including all linked memories.
 
     The entity can be passed as `entity` or `name`.
+    Memory-only entities have no graph node; `details.type` is `memory-only`.
     Set fields=["id", "content"] to receive only the named memory columns.
     Set include_global=False to restrict a project lookup to project memories.
     """
@@ -315,7 +320,7 @@ def list_entities(entity_type: str | None = None, limit: int = 50,
     exist on memories. With `project`, that project and global scope are
     listed by default; set `include_global=False` for strict project
     isolation. Without `project` every scope is listed. Each row carries its
-    `project`.
+    `project`; `graph_node` is false for memory-only entities.
     """
     logger.info("list_entities entity_type=%s limit=%s project=%s",
                 entity_type, limit, project)
@@ -375,7 +380,7 @@ def list_entities(entity_type: str | None = None, limit: int = 50,
     return ok(STATUS_OK, count=len(rows), results=rows)
 
 
-def init_context(project: str | None = None, detail: str = "slim",
+def init_context(project: str | None = None, detail: Literal["slim", "full"] = "slim",
                  include_global: bool = True) -> dict[str, Any]:
     """Call at session start. Returns recent + important bootstrap info + health.
 

@@ -1,6 +1,8 @@
 import json
 import logging
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from mcp_server.config import (
     DEDUPE_MODES,
@@ -45,23 +47,31 @@ from mcp_server.storage import (
 logger = logging.getLogger(__name__)
 
 
-class BatchFact(TypedDict):
-    content: str
-    mem_type: NotRequired[Literal[
-        "fact", "decision", "learning", "preference", "pattern",
-        "incident", "runbook", "context", "observation", "convention",
-        "command", "note",
-    ]]
-    entity: NotRequired[str | None]
-    importance: NotRequired[float]
-    metadata: NotRequired[dict[str, Any] | None]
-    scope: NotRequired[Literal["global", "project"] | None]
-    project: NotRequired[str | None]
-    supersede: NotRequired[str | None]
-    supersede_content: NotRequired[str | None]
-    supersede_last: NotRequired[bool]
-    fuzzy_threshold: NotRequired[float | None]
-    dedupe: NotRequired[Literal["exact", "semantic", "off"] | None]
+class BatchFact(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    content: Any = Field(json_schema_extra={"type": "string"})
+    mem_type: Any = Field(default="fact", json_schema_extra={
+        "type": "string",
+        "enum": ["fact", "decision", "learning", "preference", "pattern",
+                 "incident", "runbook", "context", "observation", "convention",
+                 "command", "note"],
+    })
+    entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
+    importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]})
+    metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]})
+    scope: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"], "enum": ["global", "project", None],
+    })
+    project: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
+    supersede: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
+    supersede_content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
+    supersede_last: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]})
+    fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]})
+    dedupe: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"], "enum": ["exact", "semantic", "off", None],
+    })
+
 
 def remember(
     content: str,
@@ -225,8 +235,10 @@ def remember_batch(
 ) -> dict[str, Any]:
     """Store multiple facts at once. Each dict needs 'content'.
 
-    Optional keys: mem_type, entity, importance, metadata, scope, project,
-    supersede (memory id), fuzzy_threshold.
+    Optional keys: mem_type (one of the memory types), entity, importance,
+    metadata, scope ("project" or "global"), project, supersede (memory id
+    or content), supersede_last, fuzzy_threshold, and dedupe ("exact",
+    "semantic", or "off").
     Set skip_duplicates=False to allow storing identical content multiple times.
     Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
     Per-fact 'fuzzy_threshold' overrides the top-level value.
@@ -253,6 +265,9 @@ def remember_batch(
         return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
     if not isinstance(facts, list) or not facts:
         return fail(STATUS_ERROR, "facts must be a non-empty list")
+
+    facts = [fact.model_dump(exclude_unset=True) if isinstance(fact, BatchFact) else fact
+             for fact in facts]
 
 
     # Validate everything before embedding so one malformed fact cannot abort
