@@ -1,6 +1,8 @@
 import json
 import logging
+from typing import Any
 
+from mcp_server.config import DEFAULT_DUPLICATE_THRESHOLD
 from mcp_server.inference_client import nli
 from mcp_server.scopes import _mem_table, _retrieval_tables
 from mcp_server.scoring import _content_hash, _gen_id, _now
@@ -51,7 +53,16 @@ def _supersede(cur, project: str | None, new_id: str, old_id: str) -> None:
 
 def _deduplicate(cur, content: str, project: str | None,
                  embedding_vec: list[float] | None = None,
-                 fuzzy_threshold: float | None = None) -> str | None:
+                 fuzzy_threshold: float | None = None,
+                 dedupe: str = "exact") -> str | None:
+    """Return the id of an existing memory that says the same thing.
+
+    `dedupe` selects the mode: "exact" (content hash), "semantic" (hash plus
+    vector similarity) or "off" (no check at all).
+    """
+    if dedupe == "off":
+        return None
+
     c_hash = _content_hash(content)
     table = _mem_table(project)
     cur.execute(
@@ -63,8 +74,9 @@ def _deduplicate(cur, content: str, project: str | None,
     if row:
         return row[0]
 
-    if embedding_vec is not None and fuzzy_threshold is not None and fuzzy_threshold > 0:
-        max_dist = 1.0 - fuzzy_threshold
+    if embedding_vec is not None and dedupe == "semantic":
+        threshold = fuzzy_threshold if fuzzy_threshold is not None else DEFAULT_DUPLICATE_THRESHOLD
+        max_dist = 1.0 - threshold
         cur.execute(
             f"SELECT id, embedding <=> %s::vector AS dist "
             f"FROM {table} WHERE superseded_by IS NULL AND deleted_at IS NULL AND embedding IS NOT NULL "
@@ -76,6 +88,37 @@ def _deduplicate(cur, content: str, project: str | None,
             return row[0]
 
     return None
+
+
+def _find_by_content(cur, content: str, project: str | None,
+                     entity: str | None = None) -> str | None:
+    """Id of the active memory with exactly this content (optionally of an
+    entity)."""
+    table = _mem_table(project)
+    c_hash = _content_hash((content or "").strip())
+    params: list[Any] = [c_hash]
+    sql = (f"SELECT id FROM {table} WHERE content_hash = %s "
+           f"AND superseded_by IS NULL AND deleted_at IS NULL")
+    if entity:
+        sql += " AND entity = %s"
+        params.append(entity)
+    sql += " ORDER BY updated_at DESC LIMIT 1"
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _find_last_for_entity(cur, entity: str, project: str | None) -> str | None:
+    """Id of the most recently updated active memory of an entity."""
+    table = _mem_table(project)
+    cur.execute(
+        f"SELECT id FROM {table} WHERE entity = %s "
+        f"AND superseded_by IS NULL AND deleted_at IS NULL "
+        f"ORDER BY updated_at DESC LIMIT 1",
+        (entity,),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 def _check_contradictions(cur, content: str, entity: str | None,

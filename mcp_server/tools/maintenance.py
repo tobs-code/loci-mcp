@@ -1,7 +1,9 @@
 import json
 import logging
+from typing import Any
 
 from mcp_server.db import get_conn
+from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.inference_client import health as _inference_health, nli
 from mcp_server.scopes import (
     _all_mem_tables,
@@ -26,6 +28,19 @@ def contradictions_report(entity: str | None = None,
     project = _norm_project(project)
     if not entity:
         return [{"error": "entity parameter is required. contradictions_report works on one entity at a time."}]
+def contradictions_report(entity: str | None = None,
+                         project: str | None = None,
+                         limit: int = 20) -> dict[str, Any]:
+    """Find potentially conflicting facts stored for the same entity.
+
+    Uses vector similarity to find candidate pairs, then NLI to confirm.
+    Returns pairs with confidence scores in [0, 1] (higher = more likely contradictory).
+    """
+    logger.info("contradictions_report entity=%s limit=%s", entity, limit)
+    project = _norm_project(project)
+    if not entity:
+        return fail(STATUS_ERROR, "entity parameter is required. "
+                                   "contradictions_report works on one entity at a time.")
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -35,7 +50,7 @@ def contradictions_report(entity: str | None = None,
                                   include_embedding=True, include_superseded=False)
         if len(facts) < 2:
             conn.commit()
-            return []
+            return ok(STATUS_OK, count=0, results=[])
 
         tables = _retrieval_tables(cur, project)
         neighbors_per_fact = 20
@@ -70,7 +85,7 @@ def contradictions_report(entity: str | None = None,
         conn.commit()
     except Exception:
         conn.rollback()
-        return [{"error": "query failed"}]
+        return fail(STATUS_ERROR, "query failed")
     finally:
         conn.close()
 
@@ -86,10 +101,11 @@ def contradictions_report(entity: str | None = None,
                 "confidence": round(scores[0], 3),
             })
 
-    return contradictions[:limit]
+    contradictions = contradictions[:limit]
+    return ok(STATUS_OK, count=len(contradictions), results=contradictions)
 
 
-def server_health() -> dict:
+def server_health() -> dict[str, Any]:
     """Check if all services (Postgres, Inference) are healthy."""
     logger.info("server_health")
     pg_ok = False
@@ -102,7 +118,7 @@ def server_health() -> dict:
         conn.close()
     except Exception:
         pass
-    return {"postgres": pg_ok, "inference": _health_check()}
+    return ok(STATUS_OK, postgres=pg_ok, inference=_health_check())
 
 
 def stats_resource() -> str:

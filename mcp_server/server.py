@@ -17,14 +17,26 @@ from mcp_server.config import (
     VALID_SCOPES,
 )
 from mcp_server.db import ensure_schema, get_conn
-from mcp_server.graph import find_connections, find_paths, relate, relate_batch
+from mcp_server.graph import (
+    find_connections,
+    find_paths,
+    relate,
+    relate_batch,
+    unrelate,
+)
 from mcp_server.tools.maintenance import (
     contradictions_report,
     server_health,
     stats_resource,
 )
 from mcp_server.tools.memory import forget, remember, remember_batch, update_memory
-from mcp_server.tools.read import get_entity, init_context, list_entities, recall
+from mcp_server.tools.read import (
+    get_entity,
+    init_context,
+    list_entities,
+    list_memories,
+    recall,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +46,13 @@ _TOOLS = (
     update_memory,
     forget,
     recall,
+    list_memories,
     get_entity,
     list_entities,
     init_context,
     relate,
     relate_batch,
+    unrelate,
     find_connections,
     find_paths,
     contradictions_report,

@@ -12,12 +12,11 @@ from mcp_server.server import (
 
 
 def test_remember_stores_a_fact_that_recall_finds():
-    memory_id = remember("The sky is blue", entity="Sky", mem_type="fact")
+    memory_id = remember("The sky is blue", entity="Sky", mem_type="fact")["id"]
 
-    assert isinstance(memory_id, str)
     assert len(memory_id) == 16
 
-    results = recall("sky blue", limit=5)
+    results = recall("sky blue", limit=5)["results"]
 
     assert any(r["id"] == memory_id for r in results)
     hit = next(r for r in results if r["id"] == memory_id)
@@ -27,20 +26,31 @@ def test_remember_stores_a_fact_that_recall_finds():
 
 
 def test_remember_rejects_duplicates_and_invalid_input():
-    memory_id = remember("A uniquely stored fact")
+    memory_id = remember("A uniquely stored fact")["id"]
 
-    assert remember("A uniquely stored fact") == f"DUPLICATE: {memory_id}"
-    assert "Invalid mem_type" in remember("x", mem_type="bogus")
-    assert remember("   ") == "ERROR: content must not be empty"
-    assert "importance must be between" in remember("x", importance=2)
+    duplicate = remember("A uniquely stored fact")
+    assert duplicate["status"] == "duplicate"
+    assert duplicate["id"] == memory_id
+
+    invalid_type = remember("x", mem_type="bogus")
+    assert invalid_type["ok"] is False
+    assert "Invalid mem_type" in invalid_type["error"]
+
+    empty = remember("   ")
+    assert empty["ok"] is False
+    assert empty["error"] == "content must not be empty"
+
+    bad_importance = remember("x", importance=2)
+    assert bad_importance["ok"] is False
+    assert "importance must be between" in bad_importance["error"]
 
 
 def test_recall_sees_global_facts_inside_a_project_and_keeps_scopes_isolated():
-    global_id = remember("Berlin is the capital of Germany")
-    project_id = remember("Berlin has many museums", project="alpha")
+    global_id = remember("Berlin is the capital of Germany")["id"]
+    project_id = remember("Berlin has many museums", project="alpha")["id"]
 
-    in_project = recall("Berlin", project="alpha", limit=10)
-    in_global = recall("Berlin", limit=10)
+    in_project = recall("Berlin", project="alpha", limit=10)["results"]
+    in_global = recall("Berlin", limit=10)["results"]
 
     project_ids = {r["id"] for r in in_project}
     global_ids = {r["id"] for r in in_global}
@@ -50,26 +60,27 @@ def test_recall_sees_global_facts_inside_a_project_and_keeps_scopes_isolated():
 
 
 def test_remember_can_write_global_from_inside_a_project():
-    memory_id = remember("A global preference", project="alpha", scope="global")
+    memory_id = remember("A global preference", project="alpha", scope="global")["id"]
 
-    assert any(r["id"] == memory_id for r in recall("preference"))
+    assert any(r["id"] == memory_id for r in recall("preference")["results"])
 
 
 def test_remember_batch_reports_per_fact_status():
-    results = remember_batch([
+    result = remember_batch([
         {"content": "Batch fact one"},
         {"content": ""},
         {"content": "Batch note", "mem_type": "note"},
         {"content": "Batch fact one"},
     ])
 
+    results = result["results"]
     assert [r["status"] for r in results] == ["stored", "error", "stored", "duplicate"]
     assert results[1]["error"] == "content is required"
     assert results[3]["id"] == results[0]["id"]
 
 
 def test_update_memory_changes_content_importance_and_metadata():
-    memory_id = remember("Original text")
+    memory_id = remember("Original text")["id"]
 
     result = update_memory(
         memory_id,
@@ -78,17 +89,21 @@ def test_update_memory_changes_content_importance_and_metadata():
         metadata={"source": "test"},
     )
 
-    assert result == memory_id
-    hits = recall("mountains", limit=5)
+    assert result["ok"] is True
+    assert result["id"] == memory_id
+    hits = recall("mountains", limit=5)["results"]
     hit = next(r for r in hits if r["id"] == memory_id)
     assert hit["content"] == "Updated text about mountains"
     assert hit["importance"] == 0.5
     assert hit["metadata"] == {"source": "test"}
-    assert update_memory("does-not-exist", importance=0.2) == "NOT FOUND: does-not-exist"
+
+    missing = update_memory("does-not-exist", importance=0.2)
+    assert missing["ok"] is False
+    assert missing["error"] == "NOT FOUND: does-not-exist"
 
 
 def test_get_entity_returns_memories_even_without_a_graph_node():
-    memory_id = remember("Carol prefers espresso", entity="Carol")
+    memory_id = remember("Carol prefers espresso", entity="Carol")["id"]
 
     result = get_entity("Carol")
 
@@ -100,7 +115,7 @@ def test_get_entity_returns_memories_even_without_a_graph_node():
 def test_list_entities_includes_memory_only_entities():
     remember("Eve reviews pull requests", entity="Eve", project="alpha")
 
-    rows = list_entities(project="alpha")
+    rows = list_entities(project="alpha")["results"]
 
     assert any(r["name"] == "Eve" and r["graph_node"] is False for r in rows)
 

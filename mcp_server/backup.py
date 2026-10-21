@@ -1,8 +1,11 @@
 import json
 import logging
 from datetime import datetime
+from typing import Any
+
 
 from mcp_server.db import get_conn
+from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.graph import _ensure_graph_entity, _relate_edges
 from mcp_server.inference_client import embed
 from mcp_server.scopes import (
@@ -80,17 +83,22 @@ def export_memories(
     include_embeddings: bool = False,
     include_superseded: bool = False,
     include_graph: bool = True,
-) -> str:
+) -> dict[str, Any]:
     """Export memories (and optionally the graph) as JSON or JSONL.
 
     Without `project` every scope is exported and each record carries its
     `project`. IDs, `superseded_by` and timestamps are preserved, so imports
     can restore the exact state. The graph is only included in JSON exports.
+
+    The payload is returned in "data" and can be passed to `import_memories`
+    unchanged.
     """
     logger.info("export_memories format=%s project=%s graph=%s", format, project, include_graph)
     project = _norm_project(project)
     if format not in ("json", "jsonl"):
-        return json.dumps({"error": f"unsupported format {format!r}; use 'json' or 'jsonl'"})
+        return fail(STATUS_ERROR,
+                    f"unsupported format {format!r}; use 'json' or 'jsonl'",
+                    count=0, data=None)
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -100,7 +108,7 @@ def export_memories(
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return json.dumps({"error": str(e)})
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
 
@@ -128,12 +136,15 @@ def export_memories(
         records.append(record)
 
     if format == "jsonl":
-        return "\n".join(json.dumps(r) for r in records)
+        data = "\n".join(json.dumps(r) for r in records)
+        return ok(STATUS_OK, format=format, count=len(records), data=data,
+                  records=records)
     payload = {"type": "memory_export", "version": "0.2",
                "records": records, "count": len(records)}
     if graph is not None:
         payload["graph"] = graph
-    return json.dumps(payload, indent=2)
+    return ok(STATUS_OK, format=format, count=len(records), data=payload,
+              records=records)
 
 
 def _parse_dt(value) -> datetime | None:
@@ -148,14 +159,16 @@ def _parse_dt(value) -> datetime | None:
 
 
 def import_memories(
-    data: str,
+    data: str | dict,
     project: str | None = None,
     format: str = "json",
     skip_duplicates: bool = True,
     fuzzy_threshold: float | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Import memories (and graph, for JSON exports).
 
+    `data` accepts the payload of `export_memories` either as an object or as
+    its JSON string.
     Records keep their `id`, timestamps and `superseded_by`, so a re-import is
     idempotent and restores the exact state. Without `project`, each record is
     restored into the scope it was exported from; with `project`, everything
@@ -165,26 +178,31 @@ def import_memories(
                 format, skip_duplicates, fuzzy_threshold)
     project = _norm_project(project)
     if format not in ("json", "jsonl"):
-        return {"error": f"unsupported format {format!r}; use 'json' or 'jsonl'",
-                "imported": 0, "skipped": 0}
+        return fail(STATUS_ERROR,
+                    f"unsupported format {format!r}; use 'json' or 'jsonl'",
+                    imported=0, skipped=0)
     graph: dict | None = None
     try:
-        if format == "jsonl":
-            records = [json.loads(line) for line in data.strip().split("\n")
-                       if line.strip()]
+        if isinstance(data, dict):
+            parsed = data
+        elif format == "jsonl":
+            parsed = [json.loads(line) for line in str(data).strip().split("\n")
+                      if line.strip()]
         else:
             parsed = json.loads(data)
-            if isinstance(parsed, dict) and "records" in parsed:
-                records = parsed["records"]
-                graph = parsed.get("graph")
-            elif isinstance(parsed, list):
-                records = parsed
-            else:
-                return {"error": "unsupported format", "imported": 0, "skipped": 0}
+        if isinstance(parsed, dict) and "records" in parsed:
+            records = parsed["records"]
+            graph = parsed.get("graph")
+        elif isinstance(parsed, list):
+            records = parsed
+        else:
+            return fail(STATUS_ERROR, "unsupported format",
+                        imported=0, skipped=0)
     except (json.JSONDecodeError, AttributeError) as e:
-        return {"error": f"invalid {format} data: {e}", "imported": 0, "skipped": 0}
+        return fail(STATUS_ERROR, f"invalid {format} data: {e}",
+                    imported=0, skipped=0)
     if not isinstance(records, list):
-        return {"error": "'records' must be a list", "imported": 0, "skipped": 0}
+        return fail(STATUS_ERROR, "'records' must be a list", imported=0, skipped=0)
 
     conn = get_conn()
     imported = 0
@@ -278,7 +296,7 @@ def import_memories(
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return {"error": str(e), "imported": imported, "skipped": skipped}
+        return fail(STATUS_ERROR, str(e), imported=imported, skipped=skipped)
     finally:
         conn.close()
 
@@ -288,4 +306,4 @@ def import_memories(
         result["graph_relations"] = graph_relations
     if errors:
         result["errors"] = errors[:5]
-    return result
+    return ok(STATUS_OK, **result)

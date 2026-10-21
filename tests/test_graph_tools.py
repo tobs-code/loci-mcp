@@ -10,12 +10,15 @@ from mcp_server.server import (
 
 
 def test_relate_creates_and_updates_an_edge():
-    assert relate("A", "B", "KNOWS", weight=0.5) == "Created KNOWS from A -> B (w=0.5)"
-    assert relate("A", "B", "KNOWS", weight=0.9) == "Updated KNOWS from A -> B (w=0.9)"
+    created = relate("A", "B", "KNOWS", weight=0.5)
+    assert created["status"] == "created"
+    updated = relate("A", "B", "KNOWS", weight=0.9)
+    assert updated["status"] == "updated"
+    assert updated["weight"] == 0.9
 
     connections = find_connections("A")
-    assert len(connections) == 1
-    assert connections[0] == {
+    assert len(connections["results"]) == 1
+    assert connections["results"][0] == {
         "entity": "B",
         "relation": "KNOWS",
         "weight": 0.9,
@@ -26,17 +29,17 @@ def test_relate_creates_and_updates_an_edge():
 
 
 def test_relate_rejects_missing_or_unsafe_relation_types():
-    assert relate("A", "B", "") == "ERROR: relation_type is required"
-    assert relate("A", "B", "BAD TYPE").startswith("ERROR:")
+    assert relate("A", "B", "")["ok"] is False
+    assert relate("A", "B", "BAD TYPE")["ok"] is False
 
 
 def test_relate_stores_an_optional_context_memory():
     result = relate("A", "B", "KNOWS", context="They met in Paris")
 
-    assert result.startswith("Created KNOWS from A -> B")
-    memory_id = result.split("context: ")[1]
+    assert result["status"] == "created"
+    memory_id = result["context_memory"]
     hits = recall("Paris", limit=5)
-    hit = next(r for r in hits if r["id"] == memory_id)
+    hit = next(r for r in hits["results"] if r["id"] == memory_id)
     assert hit["entity"] == "A_KNOWS_B"
     assert hit["metadata"]["relation_type"] == "KNOWS"
 
@@ -63,12 +66,12 @@ def test_find_connections_filters_by_direction_and_relation_type():
     incoming = find_connections("A", direction="incoming")
     knows = find_connections("A", relation_type="KNOWS")
 
-    assert [r["entity"] for r in outgoing] == ["C", "B"]
-    assert [r["entity"] for r in incoming] == ["D"]
-    assert {r["entity"] for r in knows} == {"B", "D"}
-    assert find_connections("A", direction="sideways") == [{
-        "error": "direction must be 'outgoing', 'incoming' or 'both'"
-    }]
+    assert [r["entity"] for r in outgoing["results"]] == ["C", "B"]
+    assert [r["entity"] for r in incoming["results"]] == ["D"]
+    assert {r["entity"] for r in knows["results"]} == {"B", "D"}
+    invalid = find_connections("A", direction="sideways")
+    assert invalid["ok"] is False
+    assert "direction" in invalid["error"]
 
 
 def test_find_paths_returns_shortest_paths_and_respects_max_hops():
@@ -86,19 +89,19 @@ def test_find_paths_returns_shortest_paths_and_respects_max_hops():
 
 
 def test_relate_batch_keeps_projects_isolated_and_is_idempotent():
-    results = relate_batch([
+    result = relate_batch([
         {"from_entity": "A", "to_entity": "B", "relation_type": "KNOWS"},
         {"from_entity": "A", "to_entity": "C", "relation_type": "KNOWS",
          "project": "alpha", "weight": 0.5},
     ])
 
-    assert [r["status"] for r in results] == ["created", "created"]
-    assert [r["entity"] for r in find_connections("A")] == ["B"]
-    assert [r["entity"] for r in find_connections("A", project="alpha")] == ["C"]
+    assert [r["status"] for r in result["results"]] == ["created", "created"]
+    assert [r["entity"] for r in find_connections("A")["results"]] == ["B"]
+    assert [r["entity"] for r in find_connections("A", project="alpha")["results"]] == ["C"]
 
     again = relate_batch([
         {"from_entity": "A", "to_entity": "B", "relation_type": "KNOWS",
          "weight": 0.7},
     ])
-    assert again[0]["status"] == "updated"
-    assert find_connections("A")[0]["weight"] == 0.7
+    assert again["results"][0]["status"] == "updated"
+    assert find_connections("A")["results"][0]["weight"] == 0.7

@@ -3,7 +3,13 @@ import logging
 from typing import Any
 
 from mcp_server.db import get_conn
+from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
+from mcp_server.projection import (
+    dedupe_near_duplicates,
+    project_bootstrap,
+)
+from mcp_server.projection import project as project_row
 from mcp_server.scopes import (
     _ag_str,
     _all_mem_tables,
@@ -14,7 +20,7 @@ from mcp_server.scopes import (
     _scope_key,
     _scope_label,
 )
-from mcp_server.scoring import _decay_norm, _now
+from mcp_server.scoring import _decay_norm
 from mcp_server.search import _search_memories, _search_memories_graph_boost
 from mcp_server.storage import _log_access
 from mcp_server.tools.maintenance import _health_check
@@ -33,26 +39,36 @@ def recall(
     include_superseded: bool = False,
     graph_boost: bool = False,  # Neu: Graph-Enhanced Retrieval
     min_similarity: float | None = None,  # 0..1, filtert semantisch schwache Treffer
-) -> list[dict]:
+    fields: list[str] | None = None,
+    only_superseded: bool = False,
+) -> dict[str, Any]:
     """Search memories using hybrid vector + fulltext search (RRF fusion).
 
     Project searches also see global memories; global searches see only global ones.
-    Set graph_boost=True to include related entities in search via graph traversal.
+    Set graph_boost=True to include related entities in search via graph traversal
+    (requires `entity`, otherwise a warning is returned).
     Set min_similarity (0..1) to drop semantically weak matches.
     Set include_decay=True to blend in recency/frequency (max 30% of the score).
     min_decay_score (0..1) filters on the normalized decay score.
+    Set only_superseded=True to return only invalidated facts.
+    Set fields=["id", "content"] to receive only the named columns.
     """
     logger.info("recall query='%s' entity=%s hybrid=%s include_decay=%s graph_boost=%s min_similarity=%s",
                 query[:80], entity, hybrid, include_decay, graph_boost, min_similarity)
     project = _norm_project(project)
+    warnings: list[str] = []
     if not query or not query.strip():
-        return [{"error": "query must not be empty"}]
+        return fail(STATUS_ERROR, "query must not be empty")
     if min_similarity is not None and not 0.0 <= min_similarity <= 1.0:
-        return [{"error": "min_similarity must be between 0.0 and 1.0"}]
+        return fail(STATUS_ERROR, "min_similarity must be between 0.0 and 1.0")
     if min_decay_score is not None and not 0.0 <= min_decay_score <= 1.0:
-        return [{"error": "min_decay_score must be between 0.0 and 1.0"}]
+        return fail(STATUS_ERROR, "min_decay_score must be between 0.0 and 1.0")
     if limit < 1:
-        return [{"error": "limit must be >= 1"}]
+        return fail(STATUS_ERROR, "limit must be >= 1")
+    if graph_boost and not entity:
+        warnings.append("graph_boost requires an entity; no graph boost was applied")
+    if only_superseded:
+        include_superseded = True
     query_emb = embed([query], mode="query")[0]
     conn = get_conn()
     try:
@@ -84,7 +100,7 @@ def recall(
     except Exception as e:
         conn.rollback()
         logger.exception("recall failed")
-        return [{"error": str(e)}]
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
 
@@ -104,25 +120,105 @@ def recall(
             if norm >= min_decay_score:
                 filtered.append(r)
         results = filtered
-    return results[:limit]
+
+    if only_superseded:
+        results = [r for r in results
+                   if isinstance(r, dict) and r.get("superseded_by")]
+
+    results = results[:limit]
+    rows = [project_row(r, fields) for r in results if isinstance(r, dict)]
+    return ok(STATUS_OK, count=len(rows), results=rows, warnings=warnings)
 
 
-def get_entity(name: str, project: str | None = None,
-               include_superseded: bool = False) -> dict:
-    """Get everything known about an entity, including all linked memories."""
-    logger.info("get_entity name=%s", name)
+def list_memories(
+    entity: str | None = None,
+    mem_type: str | None = None,
+    limit: int = 20,
+    project: str | None = None,
+    include_superseded: bool = False,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Browse stored memories without a search query.
+
+    Newest first. Project scope also lists global memories, like `recall`.
+    Set `fields` to narrow the returned columns.
+    """
+    logger.info("list_memories entity=%s mem_type=%s limit=%s project=%s",
+                entity, mem_type, limit, project)
     project = _norm_project(project)
+    if limit < 1:
+        return fail(STATUS_ERROR, "limit must be >= 1")
+    conn = get_conn()
+    rows: list[dict] = []
+    try:
+        cur = conn.cursor()
+        tables = (_retrieval_tables(cur, project) if project
+                  else _all_mem_tables(cur))
+        conditions: list[str] = []
+        params: list[Any] = []
+        if include_superseded:
+            conditions.append("deleted_at IS NULL")
+        else:
+            conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+        if entity:
+            conditions.append("entity = %s")
+            params.append(entity)
+        if mem_type:
+            conditions.append("mem_type = %s")
+            params.append(mem_type)
+        where = " AND ".join(conditions)
+        for table in tables:
+            cur.execute(
+                f"SELECT * FROM {table} WHERE {where} ORDER BY updated_at DESC LIMIT %s",
+                params + [limit],
+            )
+            for row in cur.fetchall():
+                rows.append(dict(zip([d[0] for d in cur.description], row)))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+    seen_hashes: set[str] = set()
+    unique: list[dict] = []
+    for row in rows:
+        c_hash = row.get("content_hash") or ""
+        if c_hash and c_hash in seen_hashes:
+            continue
+        if c_hash:
+            seen_hashes.add(c_hash)
+        unique.append(row)
+    unique = unique[:limit]
+    return ok(STATUS_OK, count=len(unique),
+              results=[project_row(r, fields) for r in unique])
+
+
+def get_entity(name: str | None = None, project: str | None = None,
+               include_superseded: bool = False,
+               entity: str | None = None,
+               fields: list[str] | None = None) -> dict[str, Any]:
+    """Get everything known about an entity, including all linked memories.
+
+    The entity can be passed as `entity` or `name`.
+    Set fields=["id", "content"] to receive only the named memory columns.
+    """
+    target = entity or name
+    logger.info("get_entity name=%s", target)
+    project = _norm_project(project)
+    if not target:
+        return fail(STATUS_ERROR, "entity is required")
     conn = get_conn()
     memories = []
     entity_data = None
     try:
         cur = conn.cursor()
-        memories = _search_memories(cur, None, None, None, name, 100, project,
+        memories = _search_memories(cur, None, None, None, target, 100, project,
                                     include_superseded=include_superseded)
         scope = _scope_key(project)
         cur.execute(
             "SELECT id, name, type, project FROM entities WHERE name = %s AND project = %s",
-            (name, scope),
+            (target, scope),
         )
         row = cur.fetchone()
         if row:
@@ -131,7 +227,7 @@ def get_entity(name: str, project: str | None = None,
             # also query AGE for graph neighbors (same scope label)
             label = _scope_label(project)
             cur.execute("SET search_path TO ag_catalog, public")
-            name_json = json.dumps(name)
+            name_json = json.dumps(target)
             cur.execute(
                 f"SELECT * FROM cypher('memory_graph', $$ "
                 f"MATCH (a:{label} {{name: {name_json}}})-[r]-(b) "
@@ -141,21 +237,22 @@ def get_entity(name: str, project: str | None = None,
             entity_data["connections"] = [
                 {"entity": _ag_str(r[0]), "relation": _ag_str(r[1]),
                  "weight": float(str(r[2])),
-                 "direction": "outgoing" if _ag_str(r[3]) == name else "incoming"}
+                 "direction": "outgoing" if _ag_str(r[3]) == target else "incoming"}
                 for r in cur.fetchall()
             ]
         conn.commit()
     except Exception as e:
         conn.rollback()
         logger.exception("get_entity failed")
-        return {"entity": name, "details": None, "memories": [], "error": str(e)}
+        return fail(STATUS_ERROR, str(e), entity=target)
     finally:
         conn.close()
-    return {"entity": name, "details": entity_data, "memories": memories}
+    return ok(STATUS_OK, entity=target, details=entity_data,
+              memories=[project_row(m, fields) for m in memories])
 
 
 def list_entities(entity_type: str | None = None, limit: int = 50,
-                  project: str | None = None) -> list[dict]:
+                  project: str | None = None) -> dict[str, Any]:
     """Browse entities.
 
     Returns graph entities (created via `relate`) plus entity names that only
@@ -202,19 +299,24 @@ def list_entities(entity_type: str | None = None, limit: int = 50,
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return [{"error": str(e)}]
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    return rows[:limit]
+    rows = rows[:limit]
+    return ok(STATUS_OK, count=len(rows), results=rows)
 
 
-def init_context(project: str | None = None) -> dict:
+def init_context(project: str | None = None, detail: str = "slim") -> dict[str, Any]:
     """Call at session start. Returns recent + important bootstrap info + health.
 
     Pass `project` to bootstrap for one project; global memories are always
     included. Without a project all project tables are summarized.
+    `detail="slim"` (default) returns only the fields a session needs and
+    removes near-duplicates; `detail="full"` returns every column.
     """
     project = _norm_project(project)
+    if detail not in ("slim", "full"):
+        return fail(STATUS_ERROR, "detail must be 'slim' or 'full'")
     conn = get_conn()
     memories = []
     total = 0
@@ -243,12 +345,16 @@ def init_context(project: str | None = None) -> dict:
         conn.rollback()
     finally:
         conn.close()
-    return {
-        "session_start": _now().isoformat(),
-        "total_memories": total,
-        "active_memories": active,
-        "projects": sorted(projects),
-        "recent_memories": memories,
-        "graph_entities_count": _count_entities(),
-        "inference_healthy": _health_check(),
-    }
+    if detail == "slim":
+        memories = dedupe_near_duplicates(memories)
+        memories = [project_bootstrap(m) for m in memories]
+    return ok(
+        STATUS_OK,
+        total_memories=total,
+        active_memories=active,
+        projects=sorted(projects),
+        count=len(memories),
+        recent_memories=memories,
+        graph_entities_count=_count_entities(),
+        inference_healthy=_health_check(),
+    )

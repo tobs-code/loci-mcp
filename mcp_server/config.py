@@ -28,6 +28,14 @@ RRF_K = 60
 FTS_WEIGHT = 0.6
 
 
+# Similarity threshold used by the "semantic" dedupe mode.
+DEFAULT_DUPLICATE_THRESHOLD = 0.9
+
+
+# Dedupe modes for remember/remember_batch.
+DEDUPE_MODES = {"exact", "semantic", "off"}
+
+
 CACHE_ACCESS_BOOST_DAYS = 7
 
 

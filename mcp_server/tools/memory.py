@@ -1,8 +1,26 @@
 import json
 import logging
+from typing import Any
 
-from mcp_server.config import MEMORY_TYPES, SENTINEL_FORGOTTEN, VALID_SCOPES
+from mcp_server.config import (
+    DEDUPE_MODES,
+    MEMORY_TYPES,
+    SENTINEL_FORGOTTEN,
+    VALID_SCOPES,
+)
 from mcp_server.db import get_conn
+from mcp_server.envelope import (
+    STATUS_DELETED,
+    STATUS_DUPLICATE,
+    STATUS_ERROR,
+    STATUS_NOT_FOUND,
+    STATUS_PARTIAL,
+    STATUS_SOFT_FORGOTTEN,
+    STATUS_STORED,
+    STATUS_UPDATED,
+    fail,
+    ok,
+)
 from mcp_server.inference_client import embed
 from mcp_server.scopes import (
     _all_mem_tables,
@@ -17,6 +35,8 @@ from mcp_server.scoring import _content_hash
 from mcp_server.storage import (
     _check_contradictions,
     _deduplicate,
+    _find_by_content,
+    _find_last_for_entity,
     _store_memory,
     _supersede,
 )
@@ -28,45 +48,58 @@ def remember(
     mem_type: str = "fact",
     entity: str | None = None,
     importance: float = 1.0,
-    metadata: dict | None = None,
+    metadata: dict[str, Any] | None = None,
     scope: str | None = None,
     project: str | None = None,
     supersede: str | None = None,
     check_contradictions: bool = False,
     fuzzy_threshold: float | None = None,
-) -> str:
+    dedupe: str = "exact",
+    supersede_content: str | None = None,
+    supersede_last: bool = False,
+) -> dict[str, Any]:
     """Store a memory (fact, decision, learning, preference, ...).
 
     Automatically embedded for vector search. Attach to an entity for graph connectivity.
     If `check_contradictions` is true, returns warnings for conflicting existing facts.
-    Use `supersede` to replace an existing memory by ID.
-    Set fuzzy_threshold (0.0-1.0) to detect semantically similar content as duplicate.
+    Use `supersede` to replace an existing memory by ID, `supersede_content` to
+    replace the fact with the same wording, or `supersede_last` to replace the
+    newest fact of the same entity.
+    `dedupe` selects how duplicates are detected: "exact" (default, content
+    hash), "semantic" (also vector similarity, see `fuzzy_threshold`) or "off".
     `scope` defaults to "project" when a project is given, else "global".
     scope="global" stores in the shared table even when a project is given.
+
+    Returns the standard envelope: {"ok", "status", "id", "error", "warnings"}.
     """
-    logger.info("remember entity=%s mem_type=%s importance=%s check_contradictions=%s fuzzy=%s scope=%s",
-                entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope)
+    logger.info("remember entity=%s mem_type=%s importance=%s check_contradictions=%s fuzzy=%s scope=%s dedupe=%s",
+                entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope, dedupe)
     project = _norm_project(project)
     if mem_type not in MEMORY_TYPES:
-        return f"Invalid mem_type. Choose from: {', '.join(sorted(MEMORY_TYPES))}"
+        return fail(STATUS_ERROR,
+                    f"Invalid mem_type. Choose from: {', '.join(sorted(MEMORY_TYPES))}")
     if scope is not None and scope not in VALID_SCOPES:
-        return f"Invalid scope. Choose from: {', '.join(sorted(VALID_SCOPES))}"
+        return fail(STATUS_ERROR,
+                    f"Invalid scope. Choose from: {', '.join(sorted(VALID_SCOPES))}")
+    if dedupe not in DEDUPE_MODES:
+        return fail(STATUS_ERROR,
+                    f"Invalid dedupe. Choose from: {', '.join(sorted(DEDUPE_MODES))}")
     content = (content or "").strip()
     if not content:
-        return "ERROR: content must not be empty"
+        return fail(STATUS_ERROR, "content must not be empty")
     try:
         importance = float(importance)
     except (TypeError, ValueError):
-        return "ERROR: importance must be a number between 0.0 and 1.0"
+        return fail(STATUS_ERROR, "importance must be a number between 0.0 and 1.0")
     if not 0.0 <= importance <= 1.0:
-        return "ERROR: importance must be between 0.0 and 1.0"
+        return fail(STATUS_ERROR, "importance must be between 0.0 and 1.0")
     if fuzzy_threshold is not None and not 0.0 <= fuzzy_threshold <= 1.0:
-        return "ERROR: fuzzy_threshold must be between 0.0 and 1.0"
+        return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
     if metadata is not None and not isinstance(metadata, dict):
-        return "ERROR: metadata must be an object"
+        return fail(STATUS_ERROR, "metadata must be an object")
     effective_scope = scope or ("project" if project else "global")
     if effective_scope == "project" and not project:
-        return "project required when scope='project'"
+        return fail(STATUS_ERROR, "project required when scope='project'")
     store_project = project if effective_scope == "project" else None
 
     meta = metadata or {}
@@ -77,9 +110,11 @@ def remember(
         if store_project:
             _ensure_project_table(cur, store_project)
 
-        existing = _deduplicate(cur, content, store_project, emb, fuzzy_threshold)
+        existing = _deduplicate(cur, content, store_project, emb, fuzzy_threshold,
+                                dedupe=dedupe)
         if existing:
-            return f"DUPLICATE: {existing}"
+            return ok(STATUS_DUPLICATE, id=existing,
+                      warnings=["memory already exists; nothing stored"])
 
         contradictions = []
         if check_contradictions and entity:
@@ -87,38 +122,73 @@ def remember(
                 cur, content, entity, store_project, emb
             )
 
+        # Resolve the replaced memories before storing: "supersede_last" must
+        # see the state before this fact exists.
+        superseded: list[str] = []
+        try:
+            superseded = _supersede_targets(cur, store_project, entity,
+                                            supersede, supersede_content,
+                                            supersede_last)
+        except ValueError as e:
+            conn.rollback()
+            return fail(STATUS_ERROR, str(e))
+
         mem_id = _store_memory(cur, content, emb, mem_type, entity,
                                importance, meta, store_project, None,
                                scope=effective_scope)
 
-        if supersede:
-            _supersede(cur, store_project, mem_id, supersede)
+        for old_id in superseded:
+            _supersede(cur, store_project, mem_id, old_id)
 
-        auto_superseded: list[str] = []
-        if contradictions:
-            for c in contradictions:
-                eid = c["existing_id"]
+        for c in contradictions:
+            eid = c["existing_id"]
+            if eid not in superseded:
                 _supersede(cur, store_project, mem_id, eid)
-                auto_superseded.append(eid)
+                superseded.append(eid)
 
         conn.commit()
 
+        warnings: list[str] = []
+        if check_contradictions and entity and contradictions:
+            warnings.append(
+                f"superseded {len(contradictions)} contradicting memory/factories"
+            )
+        elif check_contradictions and not entity:
+            warnings.append("contradiction check skipped: entity required")
+        if superseded and not check_contradictions:
+            warnings.append(f"superseded {len(superseded)} memory/factories")
+        payload: dict[str, Any] = {"superseded": superseded}
         if check_contradictions:
-            if auto_superseded:
-                result = f"{mem_id} CONTRADICTIONS_CHECKED: {json.dumps({'found': True, 'superseded': contradictions})}"
-            elif not entity:
-                result = f'{mem_id} CONTRADICTIONS_CHECKED: {{"found": false, "skipped": "entity required"}}'
-            else:
-                result = f'{mem_id} CONTRADICTIONS_CHECKED: {{"found": false}}'
-        else:
-            result = mem_id
-        return result
+            payload["contradictions"] = {"found": bool(contradictions),
+                                         "superseded": contradictions}
+        return ok(STATUS_STORED, id=mem_id, warnings=warnings, **payload)
     except Exception as e:
         conn.rollback()
         logger.exception("remember failed")
-        return f"ERROR: {e}"
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
+
+
+def _supersede_targets(cur, store_project: str | None, entity: str | None,
+                       supersede: str | None, supersede_content: str | None,
+                       supersede_last: bool) -> list[str]:
+    """Resolve which existing memories a new fact replaces."""
+    targets: list[str] = []
+    if supersede:
+        targets.append(supersede)
+    if supersede_content:
+        found = _find_by_content(cur, supersede_content, store_project, entity)
+        if found:
+            targets.append(found)
+    if supersede_last:
+        if not entity:
+            raise ValueError("supersede_last requires an entity")
+        found = _find_last_for_entity(cur, entity, store_project)
+        if found:
+            targets.append(found)
+    # Keep order, drop duplicates.
+    return list(dict.fromkeys(targets))
 
 
 def remember_batch(
@@ -128,7 +198,8 @@ def remember_batch(
     fuzzy_threshold: float | None = None,
     check_contradictions: bool = False,
     scope: str | None = None,
-) -> list[dict]:
+    dedupe: str = "exact",
+) -> dict[str, Any]:
     """Store multiple facts at once. Each dict needs 'content'.
 
     Optional keys: mem_type, entity, importance, metadata, scope, project,
@@ -136,22 +207,30 @@ def remember_batch(
     Set skip_duplicates=False to allow storing identical content multiple times.
     Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
     Per-fact 'fuzzy_threshold' overrides the top-level value.
+    `dedupe` selects how duplicates are detected: "exact" (default, content
+    hash), "semantic" (also vector similarity) or "off".
     `scope` sets the default scope for all facts; per-fact 'scope' wins.
     Set check_contradictions=True to NLI-check each fact against existing
     facts of the same entity and auto-supersede contradictions.
     Invalid facts are reported individually; the remaining facts are stored.
     """
-    logger.info("remember_batch count=%s skip_duplicates=%s fuzzy=%s check_contradictions=%s scope=%s",
+    logger.info("remember_batch count=%s skip_duplicates=%s fuzzy=%s check_contradictions=%s scope=%s dedupe=%s",
                 len(facts) if isinstance(facts, list) else -1, skip_duplicates,
-                fuzzy_threshold, check_contradictions, scope)
+                fuzzy_threshold, check_contradictions, scope, dedupe)
     project = _norm_project(project)
     if scope is not None and scope not in VALID_SCOPES:
-        return [{"error": f"invalid scope {scope!r}; choose from "
-                          f"{', '.join(sorted(VALID_SCOPES))}"}]
+        return fail(STATUS_ERROR,
+                    f"invalid scope {scope!r}; choose from "
+                    f"{', '.join(sorted(VALID_SCOPES))}")
+    if dedupe not in DEDUPE_MODES:
+        return fail(STATUS_ERROR,
+                    f"invalid dedupe {dedupe!r}; choose from "
+                    f"{', '.join(sorted(DEDUPE_MODES))}")
     if fuzzy_threshold is not None and not 0.0 <= fuzzy_threshold <= 1.0:
-        return [{"error": "fuzzy_threshold must be between 0.0 and 1.0"}]
+        return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
     if not isinstance(facts, list) or not facts:
-        return [{"error": "facts must be a non-empty list"}]
+        return fail(STATUS_ERROR, "facts must be a non-empty list")
+
 
     # Validate everything before embedding so one malformed fact cannot abort
     # the batch with a KeyError.
@@ -207,8 +286,11 @@ def remember_batch(
             "scope": fscope,
             "entity": fact.get("entity"),
             "fuzzy_threshold": ft,
+            "dedupe": fact.get("dedupe"),
             "metadata": meta,
             "supersede": fact.get("supersede"),
+            "supersede_content": fact.get("supersede_content"),
+            "supersede_last": bool(fact.get("supersede_last")),
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -219,7 +301,7 @@ def remember_batch(
             vectors = embed([spec["content"] for _, spec in valid])
         except Exception as e:
             logger.exception("remember_batch embedding failed")
-            return [{"error": f"embedding failed: {e}"}]
+            return fail(STATUS_ERROR, f"embedding failed: {e}")
         embeddings = {i: vec for (i, _), vec in zip(valid, vectors)}
 
     conn = get_conn()
@@ -242,8 +324,10 @@ def remember_batch(
                     ensured.add(store_project)
 
                 if skip_duplicates:
+                    fact_dedupe = spec.get("dedupe") or dedupe
                     existing = _deduplicate(cur, spec["content"], store_project,
-                                            embeddings[i], spec["fuzzy_threshold"])
+                                            embeddings[i], spec["fuzzy_threshold"],
+                                            dedupe=fact_dedupe)
                     if existing:
                         cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                         results.append({"id": existing, "content": spec["content"],
@@ -257,17 +341,24 @@ def remember_batch(
                         embeddings[i],
                     )
 
+                # Resolve replaced memories before this fact is stored.
+                superseded: list[str] = _supersede_targets(
+                    cur, store_project, spec["entity"], spec["supersede"],
+                    spec["supersede_content"], spec["supersede_last"])
+
                 mid = _store_memory(
                     cur, spec["content"], embeddings[i], spec["mem_type"],
                     spec["entity"], spec["importance"], spec["metadata"],
                     store_project, scope=spec["scope"],
                 )
 
-                if spec["supersede"]:
-                    _supersede(cur, store_project, mid, spec["supersede"])
+                for old_id in superseded:
+                    _supersede(cur, store_project, mid, old_id)
 
                 auto_superseded = []
                 for c in contradictions:
+                    if c["existing_id"] in superseded:
+                        continue
                     _supersede(cur, store_project, mid, c["existing_id"])
                     auto_superseded.append(c)
                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -277,7 +368,8 @@ def remember_batch(
                                 "status": "error", "error": str(exc)})
                 continue
 
-            entry = {"id": mid, "content": spec["content"], "status": "stored"}
+            entry = {"id": mid, "content": spec["content"], "status": "stored",
+                     "superseded": superseded}
             if check_contradictions:
                 entry["contradictions"] = {
                     "found": bool(auto_superseded),
@@ -290,10 +382,16 @@ def remember_batch(
     except Exception as e:
         conn.rollback()
         logger.exception("remember_batch failed")
-        return [{"error": str(e)}]
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    return results
+    failed = [r for r in results if r.get("status") == "error"]
+    if failed and len(failed) == len(results):
+        return fail(STATUS_ERROR, "no fact could be stored",
+                    count=len(results), results=results)
+    status = STATUS_PARTIAL if failed else "ok"
+    warnings = [f"{len(failed)} fact(s) failed"] if failed else []
+    return ok(status, count=len(results), results=results, warnings=warnings)
 
 
 def update_memory(
@@ -302,7 +400,7 @@ def update_memory(
     importance: float | None = None,
     metadata: dict | None = None,
     project: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Update an existing memory's content, importance, or metadata.
 
     Without `project`, the memory is looked up in every table.
@@ -316,7 +414,7 @@ def update_memory(
     if content is not None:
         content = (content or "").strip()
         if not content:
-            return "ERROR: content must not be empty"
+            return fail(STATUS_ERROR, "content must not be empty")
         emb = embed([content])[0]
         sets.append("content = %s")
         params.append(content)
@@ -328,19 +426,19 @@ def update_memory(
         try:
             importance = float(importance)
         except (TypeError, ValueError):
-            return "ERROR: importance must be a number between 0.0 and 1.0"
+            return fail(STATUS_ERROR, "importance must be a number between 0.0 and 1.0")
         if not 0.0 <= importance <= 1.0:
-            return "ERROR: importance must be between 0.0 and 1.0"
+            return fail(STATUS_ERROR, "importance must be between 0.0 and 1.0")
         sets.append("importance = %s")
         params.append(importance)
     if metadata is not None:
         if not isinstance(metadata, dict):
-            return "ERROR: metadata must be an object"
+            return fail(STATUS_ERROR, "metadata must be an object")
         sets.append("metadata = %s::jsonb")
         params.append(json.dumps(metadata))
 
     if not sets:
-        return "Nothing to update"
+        return fail(STATUS_ERROR, "nothing to update", id=memory_id)
     # Updated memories must also age like new ones for decay scoring.
     sets.append("updated_at = NOW()")
 
@@ -360,13 +458,13 @@ def update_memory(
                 break
         conn.commit()
         if not updated:
-            return f"NOT FOUND: {memory_id}"
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
     except Exception as e:
         conn.rollback()
-        return f"ERROR: {e}"
+        return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
         conn.close()
-    return memory_id
+    return ok(STATUS_UPDATED, id=memory_id)
 
 
 def forget(
@@ -374,25 +472,28 @@ def forget(
     entity_name: str | None = None,
     project: str | None = None,
     soft: bool = True,
-) -> str:
+    entity: str | None = None,
+) -> dict[str, Any]:
     """Remove a fact by memory_id or delete an entity and all its memories.
 
+    The entity can be passed as `entity` or `entity_name`.
     When soft=True (default), marks as superseded instead of hard delete.
     Without `project`, the id/entity is looked up in every table; deleting an
     entity also removes its memories from all scopes and its graph node.
     """
+    entity_name = entity or entity_name
     logger.info("forget memory_id=%s entity_name=%s soft=%s", memory_id, entity_name, soft)
     project = _norm_project(project)
     if not memory_id and not entity_name:
-        return "ERROR: memory_id or entity_name is required"
+        return fail(STATUS_ERROR, "memory_id or entity_name is required")
     conn = get_conn()
-    affected = 0
+    counts = {"memories": 0, "entities": 0, "relations": 0}
     try:
         cur = conn.cursor()
         if memory_id:
             tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
             if project and not _table_exists(cur, tables[0]):
-                return f"NOT FOUND: {memory_id}"
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
             for table in tables:
                 if soft:
                     cur.execute(
@@ -402,13 +503,26 @@ def forget(
                     )
                 else:
                     cur.execute(f"DELETE FROM {table} WHERE id = %s", (memory_id,))
-                affected += cur.rowcount
-            if not affected:
+                counts["memories"] += cur.rowcount
+            if not counts["memories"]:
                 conn.rollback()
-                return f"NOT FOUND: {memory_id}"
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
         if entity_name:
             cur.execute("SET search_path TO ag_catalog, public")
             en_json = json.dumps(entity_name)
+            scope = _scope_key(project)
+            cur.execute(
+                "SELECT id FROM entities WHERE name = %s AND project = %s",
+                (entity_name, scope),
+            )
+            entity_ids = [r[0] for r in cur.fetchall()]
+            if entity_ids:
+                cur.execute(
+                    "SELECT COUNT(*) FROM relations "
+                    "WHERE source_id = ANY(%s) OR target_id = ANY(%s)",
+                    (entity_ids, entity_ids),
+                )
+                counts["relations"] = cur.rowcount
             if project:
                 label = _scope_label(project)
                 cur.execute(
@@ -417,16 +531,15 @@ def forget(
                 )
                 cur.execute(
                     "DELETE FROM entities WHERE name = %s AND project = %s",
-                    (entity_name, _scope_key(project)),
+                    (entity_name, scope),
                 )
-                affected += cur.rowcount
             else:
                 cur.execute(
                     f"SELECT * FROM cypher('memory_graph', $$ "
                     f"MATCH (n {{name: {en_json}}}) DETACH DELETE n $$) AS (r agtype)",
                 )
                 cur.execute("DELETE FROM entities WHERE name = %s", (entity_name,))
-                affected += cur.rowcount
+            counts["entities"] = cur.rowcount
             # Only the selected scope's memories: forgetting an entity in one
             # project must not wipe the global facts of the same entity.
             tables = (_all_mem_tables(cur) if not project
@@ -440,16 +553,17 @@ def forget(
                                (SENTINEL_FORGOTTEN, entity_name))
                 else:
                     cur.execute(f"DELETE FROM {tbl} WHERE entity = %s", (entity_name,))
-                affected += cur.rowcount
-            if not affected:
+                counts["memories"] += cur.rowcount
+            if not (counts["memories"] or counts["entities"] or counts["relations"]):
                 conn.rollback()
-                return f"NOT FOUND: {entity_name}"
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {entity_name}")
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return f"ERROR: {e}"
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    action = "Soft-forgotten" if soft else "Deleted"
+    status = STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED
     target = memory_id or entity_name
-    return f"{action} {target} ({affected} memories)"
+    return ok(status, id=memory_id, entity=entity_name, counts=counts,
+              message=f"{'Soft-forgotten' if soft else 'Deleted'} {target}")

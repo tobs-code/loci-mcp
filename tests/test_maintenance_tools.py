@@ -12,14 +12,14 @@ from mcp_server.server import (
 )
 
 
-def _export_fixture() -> str:
+def _export_fixture() -> dict:
     remember("Export me", project="alpha", entity="Alpha")
     relate("Alpha", "Beta", "KNOWS", project="alpha", weight=0.7)
     return export_memories()
 
 
 def test_export_json_contains_records_and_graph():
-    payload = json.loads(_export_fixture())
+    payload = _export_fixture()["data"]
 
     assert payload["type"] == "memory_export"
     assert payload["version"] == "0.2"
@@ -32,9 +32,9 @@ def test_export_json_contains_records_and_graph():
 
 def test_export_jsonl_is_flat_and_has_no_graph():
     _export_fixture()
-    data = export_memories(format="jsonl")
+    exported = export_memories(format="jsonl")
 
-    lines = [line for line in data.splitlines() if line.strip()]
+    lines = [line for line in exported["data"].splitlines() if line.strip()]
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["content"] == "Export me"
@@ -42,19 +42,23 @@ def test_export_jsonl_is_flat_and_has_no_graph():
 
 
 def test_import_restores_records_and_graph_into_a_new_project():
-    payload = _export_fixture()
+    payload = _export_fixture()["data"]
 
     result = import_memories(payload, project="restored")
 
-    assert result == {"imported": 1, "skipped": 0,
-                      "graph_entities": 2, "graph_relations": 1}
+    assert result["ok"] is True
+    assert result["imported"] == 1
+    assert result["skipped"] == 0
+    assert result["graph_entities"] == 2
+    assert result["graph_relations"] == 1
     hits = recall("Export me", project="restored")
-    assert hits[0]["content"] == "Export me"
-    assert [r["entity"] for r in find_connections("Alpha", project="restored")] == ["Beta"]
+    assert hits["results"][0]["content"] == "Export me"
+    assert [r["entity"] for r in
+            find_connections("Alpha", project="restored")["results"]] == ["Beta"]
 
 
 def test_reimport_is_idempotent():
-    payload = _export_fixture()
+    payload = _export_fixture()["data"]
     import_memories(payload, project="restored")
 
     again = import_memories(payload, project="restored")
@@ -65,17 +69,23 @@ def test_reimport_is_idempotent():
 
 def test_import_jsonl_round_trip():
     _export_fixture()
-    data = export_memories(format="jsonl")
+    data = export_memories(format="jsonl")["data"]
 
     result = import_memories(data, project="from-jsonl", format="jsonl")
 
-    assert result == {"imported": 1, "skipped": 0}
-    assert recall("Export me", project="from-jsonl")[0]["content"] == "Export me"
+    assert result["imported"] == 1
+    assert result["skipped"] == 0
+    hits = recall("Export me", project="from-jsonl")
+    assert hits["results"][0]["content"] == "Export me"
 
 
 def test_export_and_import_reject_unknown_formats():
-    assert "unsupported format" in export_memories(format="xml")
+    exported = export_memories(format="xml")
+    assert exported["ok"] is False
+    assert "unsupported format" in exported["error"]
+
     result = import_memories("{}", format="xml")
+    assert result["ok"] is False
     assert result["imported"] == 0
     assert "unsupported format" in result["error"]
 
@@ -83,6 +93,7 @@ def test_export_and_import_reject_unknown_formats():
 def test_import_rejects_invalid_json():
     result = import_memories("{not json")
 
+    assert result["ok"] is False
     assert result["imported"] == 0
     assert "invalid json data" in result["error"]
 
@@ -90,7 +101,10 @@ def test_import_rejects_invalid_json():
 def test_server_health_and_stats_resource():
     remember("Stats fact", project="alpha")
 
-    assert server_health() == {"postgres": True, "inference": True}
+    health = server_health()
+    assert health["ok"] is True
+    assert health["postgres"] is True
+    assert health["inference"] is True
 
     stats = json.loads(stats_resource())
     assert stats["total_memories"] == 1

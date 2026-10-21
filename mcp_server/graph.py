@@ -1,7 +1,16 @@
 import json
 import logging
+from typing import Any
 
 from mcp_server.db import get_conn
+from mcp_server.envelope import (
+    STATUS_DELETED,
+    STATUS_ERROR,
+    STATUS_NOT_FOUND,
+    STATUS_OK,
+    fail,
+    ok,
+)
 from mcp_server.inference_client import embed
 from mcp_server.scopes import (
     _ag_str,
@@ -145,15 +154,14 @@ def relate(
     context: str | None = None,
     project: str | None = None,
     weight: float = 1.0,
-) -> str:
+) -> dict[str, Any]:
     """Create a directed relation between two entities in the AGE graph."""
     logger.info("relate %s ->[%s]-> %s weight=%s", from_entity, relation_type, to_entity, weight)
     project = _norm_project(project)
     if not relation_type:
-        return "ERROR: relation_type is required"
+        return fail(STATUS_ERROR, "relation_type is required")
 
     conn = get_conn()
-    mem_id = None
     try:
         cur = conn.cursor()
         if context and project:
@@ -169,23 +177,24 @@ def relate(
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return f"ERROR: {e}"
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
 
     edge = results[0]
-    action = "Updated" if edge["status"] == "updated" else "Created"
-    mem_id = edge["context_memory"]
-    parts = [f"{action} {relation_type} from {from_entity} -> {to_entity}" + (f" (w={weight})" if weight != 1.0 else "")]
-    if mem_id:
-        parts.append(f"context: {mem_id}")
-    return " | ".join(parts)
+    return ok(edge["status"], **{
+        "from_entity": edge["from_entity"],
+        "to_entity": edge["to_entity"],
+        "relation_type": edge["relation_type"],
+        "weight": edge["weight"],
+        "context_memory": edge["context_memory"],
+    })
 
 
 def relate_batch(
     edges: list[dict],
     project: str | None = None,
-) -> list[dict]:
+) -> dict[str, Any]:
     """Create or update multiple directed relations in one transaction.
 
     Each edge needs: from_entity, to_entity, relation_type.
@@ -197,7 +206,7 @@ def relate_batch(
     logger.info("relate_batch count=%s project=%s", len(edges or []), project)
     project = _norm_project(project)
     if not edges:
-        return []
+        return ok(STATUS_OK, count=0, results=[])
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -221,32 +230,95 @@ def relate_batch(
     except Exception as e:
         conn.rollback()
         logger.exception("relate_batch failed")
-        return [{"error": str(e)}]
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    return results
+    return ok(STATUS_OK, count=len(results), results=results)
+
+
+def unrelate(
+    from_entity: str,
+    to_entity: str,
+    relation_type: str,
+    project: str | None = None,
+) -> dict[str, Any]:
+    """Delete a single directed relation between two entities."""
+    logger.info("unrelate %s -[%s]-> %s project=%s",
+                from_entity, relation_type, to_entity, project)
+    project = _norm_project(project)
+    if not relation_type:
+        return fail(STATUS_ERROR, "relation_type is required")
+    try:
+        _safe_ident(relation_type, "relation_type")
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+
+    label = _scope_label(project)
+    scope = _scope_key(project)
+    from_json = json.dumps(from_entity)
+    to_json = json.dumps(to_entity)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SET search_path TO ag_catalog, public")
+        cur.execute(
+            f"SELECT * FROM cypher('memory_graph', $$ "
+            f"MATCH (a:{label} {{name: {from_json}}})-[r:{relation_type}]->"
+            f"(b:{label} {{name: {to_json}}}) "
+            f"DELETE r RETURN 1 $$) AS (x agtype)"
+        )
+        deleted = bool(cur.fetchall())
+        if deleted:
+            cur.execute(
+                "DELETE FROM relations "
+                "WHERE relation_type = %s "
+                "AND source_id = (SELECT id FROM entities WHERE name = %s AND project = %s) "
+                "AND target_id = (SELECT id FROM entities WHERE name = %s AND project = %s)",
+                (relation_type, from_entity, scope, to_entity, scope),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+
+    if not deleted:
+        return fail(STATUS_NOT_FOUND,
+                    f"no {relation_type} edge from {from_entity} to {to_entity}")
+    return ok(STATUS_DELETED, from_entity=from_entity, to_entity=to_entity,
+              relation_type=relation_type)
 
 
 def find_connections(
-    entity_name: str,
+    entity_name: str | None = None,
     direction: str = "both",
     relation_type: str | None = None,
     limit: int = 20,
     project: str | None = None,
-) -> list[dict]:
+    entity: str | None = None,
+) -> dict[str, Any]:
     """Traverse the graph from an entity to find connected entities.
 
+    The start entity can be passed as `entity` or `entity_name`.
     `direction` is "outgoing", "incoming" or "both"; each result reports its
     own direction. `project` selects that project's graph; without it the
     global graph is traversed.
     """
+    entity_name = entity or entity_name
     logger.info("find_connections entity=%s direction=%s relation_type=%s limit=%s project=%s",
                 entity_name, direction, relation_type, limit, project)
     project = _norm_project(project)
+    if not entity_name:
+        return fail(STATUS_ERROR, "entity is required")
     if direction not in ("outgoing", "incoming", "both"):
-        return [{"error": "direction must be 'outgoing', 'incoming' or 'both'"}]
+        return fail(STATUS_ERROR,
+                    "direction must be 'outgoing', 'incoming' or 'both'")
     if relation_type:
-        _safe_ident(relation_type, "relation_type")
+        try:
+            _safe_ident(relation_type, "relation_type")
+        except ValueError as e:
+            return fail(STATUS_ERROR, str(e))
     label = _scope_label(project)
     rtype_cypher = f":{relation_type}" if relation_type else ""
     name_json = json.dumps(entity_name)
@@ -289,14 +361,14 @@ def find_connections(
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return [{"error": str(e)}]
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    return results
+    return ok(STATUS_OK, count=len(results), results=results)
 
 
 def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
-               project: str | None = None) -> dict:
+               project: str | None = None) -> dict[str, Any]:
     """Find paths between two entities in the graph.
 
     `project` selects that project's graph; without it the global graph is used.
@@ -323,7 +395,7 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return {"paths": [], "error": str(e)}
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
     paths = []
@@ -360,4 +432,4 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
             })
         paths.append({"nodes": nodes, "relations": relations,
                       "hops": len(nodes) - 1})
-    return {"paths": paths, "count": len(paths)}
+    return ok(STATUS_OK, count=len(paths), results=paths, paths=paths)

@@ -22,15 +22,39 @@ backed by PostgreSQL + pgvector (vector search) + Apache AGE (graph/Cypher).
                                     └──────────────┘
 ```
 
-## MCP Tools (16 total)
+## Response Envelope
+
+**Every tool answers with the same envelope** — an agent never has to guess the
+shape:
+
+```json
+{"ok": true, "status": "stored", "id": "6dd84bf5092a4850",
+ "error": null, "warnings": []}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `ok` | `false` when the call failed, `true` otherwise |
+| `status` | `stored`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok` |
+| `id` | Id of the affected memory (`null` for collections and for failures) |
+| `error` | Error message, `null` on success |
+| `warnings` | Non-fatal notes (skipped checks, superseded facts) |
+
+Tools that return a collection add `count` and `results`. Tools with extra
+payload add their own keys (e.g. `counts` for `forget`, `superseded` for
+`remember`, `recent_memories` for `init_context`).
+
+Failed calls never raise: they return `ok: false` with `error` set.
+
+## MCP Tools (18 total)
 
 ### Write
 | Tool | Description |
 |------|-------------|
-| `remember` | Store a fact/decision/learning with auto-embedding, exact + optional fuzzy dedup (`fuzzy_threshold`), supersede, optional contradiction check |
-| `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`, optional `check_contradictions` |
+| `remember` | Store a fact/decision/learning with auto-embedding, dedup mode (`dedupe`), supersede variants (`supersede`, `supersede_content`, `supersede_last`), optional contradiction check |
+| `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, `dedupe`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`, optional `check_contradictions` |
 | `update_memory` | Update content, importance, or metadata (re-embeds on content change) |
-| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity_name` also removes the graph node and that scope's memories |
+| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `counts` reports memories/entities/relations separately |
 
 Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 `pattern`, `incident`, `runbook`, `context`, `observation`, `convention`,
@@ -39,16 +63,18 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak matches; optional cognitive decay weighting; `include_superseded` to show invalidated facts; `graph_boost` (with `entity`) to include connected entities; logs `access_count` |
-| `get_entity` | Get entity details + all linked memories + graph connections; `include_superseded` to include superseded facts |
+| `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `entity`) to include connected entities; `fields` to narrow columns; logs `access_count` |
+| `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `fields` |
+| `get_entity` | Get entity details + all linked memories + graph connections; `include_superseded`; `fields` |
 | `list_entities` | Browse all entities (global and project tables) |
-| `init_context` | Bootstrap: recent memories across all tables + projects + entity count + health |
+| `init_context` | Bootstrap: recent memories across all tables + projects + entity count + health; `detail="slim"` (default, deduped) or `"full"` |
 
 ### Graph (Apache AGE)
 | Tool | Description |
 |------|-------------|
 | `relate` | Create directed relation between entities (Cypher); auto-creates entities; `project` selects the project graph |
 | `relate_batch` | Create/update many relations in one transaction; per-edge `weight`/`context`/`project`; idempotent (MERGE) |
+| `unrelate` | Delete a single directed relation |
 | `find_connections` | Traverse graph from entity (outgoing/incoming/both); results carry `direction` |
 | `find_paths` | Find shortest paths between two entities (`project`-scoped) |
 
@@ -56,8 +82,8 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 | Tool | Description |
 |------|-------------|
 | `contradictions_report` | Detect conflicting facts per entity (LLM NLI + vector neighbor pre-filter) |
-| `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved |
-| `import_memories` | Restore JSON/JSONL; explicit ids make re-import idempotent; graph is restored from JSON exports |
+| `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved; payload in `data` |
+| `import_memories` | Restore JSON/JSONL (`data` accepts object or string); explicit ids make re-import idempotent; graph is restored from JSON exports |
 | `server_health` | Check Postgres + Inference connectivity |
 
 ## MCP Resources
@@ -93,11 +119,15 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   top-level `scope` (per-fact `scope` wins); invalid facts are reported in
   their result entry without aborting the rest of the batch.
 - `update_memory`/`forget` locate a `memory_id` in every table when `project`
-  is omitted. `forget(entity_name=...)` removes the entity's memories from all
+  is omitted. `forget(entity=...)` removes the entity's memories from all
   scopes and deletes its graph node; with `project` it touches only that
   scope's memories and node. Unknown ids/entities return `NOT FOUND`.
 - `include_superseded=true` exposes superseded history but never rows that were
   forgotten (`deleted_at` is set), so soft deletion stays invisible.
+  `only_superseded=true` in `recall` returns the invalidated facts only.
+- Results are projected: by default a row shows the public fields plus the
+  score annotations, never `content_hash`, `deleted_at` or the embedding.
+  `fields=["id", "content"]` returns exactly the named columns.
 
 ## Cognitive Decay
 
@@ -173,10 +203,10 @@ With `include_superseded=true` in `recall` or `get_entity`, superseded facts can
   `Project_<suffix>` for a project) plus a `project` property; the SQL mirror
   `entities` has `UNIQUE(name, project)`. Two projects can use the same entity
   name without collisions, and global facts stay visible inside a project.
-- `get_entity`, `list_entities`, `relate`, `relate_batch`,
-  `find_connections`, `find_paths`, `forget`, `export_memories` and
+- `get_entity`, `list_entities`, `list_memories`, `relate`, `relate_batch`,
+  `unrelate`, `find_connections`, `find_paths`, `forget`, `export_memories` and
   `import_memories` accept `project`; omitting it means global scope (for
-  `export`/`init_context`: all scopes). `forget(entity_name=..., project=...)`
+  `export`/`init_context`: all scopes). `forget(entity=..., project=...)`
   deletes only that scope's node and memories; without `project` it removes
   every scope.
 
@@ -187,7 +217,7 @@ With `include_superseded=true` in `recall` or `get_entity`, superseded facts can
   for JSON — the full graph (entities with scope plus relations with weight and
   scope). JSONL is flat: one record per line, no graph. `include_embeddings=true`
   exports the vectors, `include_superseded=true` the history,
-  `include_graph=false` omits the graph.
+  `include_graph=false` omits the graph. The payload is returned in `data`.
 - `import_memories` restores ids and timestamps, recreates per-project tables
   on demand and upserts entities/relations with MERGE (idempotent). Without
   `project` every record keeps its export scope; with `project` all records go
@@ -222,23 +252,31 @@ Without a usable LLM configuration `/nli` returns `0.0` for every pair;
 
 | Tool | Key Parameters | Notes |
 |------|---------------|-------|
-| `get_entity` | `name` (not `entity_name`) | Entity name to fetch details for |
+| `get_entity` | `entity` (`name` kept as alias) | Entity name to fetch details for |
 | `relate` | `from_entity`, `to_entity` (not `from`, `to`) | Source and target entity names |
 | `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent) |
-| `recall` | `min_similarity` (0..1), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `graph_boost` | Drops semantically weak / stale hits; `graph_boost` requires `entity` |
-| `remember` | `scope: "project" \| "global"`, `fuzzy_threshold` (0..1), `supersede` | `global` stores in `memories` even when `project` is set |
-| `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, ...}]` | Savepoints; invalid facts are reported individually |
-| `find_connections` | `entity_name` (not `name`) | Entity to traverse from |
-| `contradictions_report` | `entity` (not `entity_name`) | Required; checks one entity at a time |
-| `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Graph is only included in JSON exports |
-| `import_memories` | `data` (not `json_data`), `project`, `format`, `skip_duplicates`, `fuzzy_threshold` | Without `project` records keep their export scope |
+| `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
+| `recall` | `min_similarity` (0..1), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `fields` | Drops semantically weak / stale hits; `graph_boost` requires `entity` |
+| `list_memories` | `entity`, `mem_type`, `project`, `limit`, `fields` | Browse without a query |
+| `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set |
+| `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts are reported individually |
+| `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from |
+| `contradictions_report` | `entity` | Required; checks one entity at a time |
+| `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project` | `counts` splits memories/entities/relations |
+| `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Payload is returned in `data`; graph is only included in JSON exports |
+| `import_memories` | `data` (object or string), `project`, `format`, `skip_duplicates`, `fuzzy_threshold` | Without `project` records keep their export scope |
+
+Dedupe modes: `exact` (default, content hash), `semantic` (also vector
+similarity, threshold `fuzzy_threshold`, default 0.9), `off` (store everything).
 
 ## When to use which tool
 
 - **Session start** → `init_context`
 - **Store user fact** → `remember` with `mem_type="preference"`, attach `entity`
 - **Search past context** → `recall` with `hybrid=true`, `include_decay=true`
+- **Browse without semantics** → `list_memories` / `list_entities`
 - **Connect concepts** → `relate` (auto-creates AGE nodes + edges); many at once → `relate_batch`
+- **Undo a relation** → `unrelate`
 - **Explore relationships** → `find_connections` or `find_paths`
 - **Check for stale/wrong facts** → `contradictions_report`
 - **Remove stale data** → `forget` with `soft=true`

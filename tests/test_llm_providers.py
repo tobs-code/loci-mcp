@@ -136,6 +136,16 @@ def test_none_disables_nli():
     assert config.configured is False
 
 
+def test_classify_returns_zero_without_a_request_when_disabled(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("disabled provider must not send a request")
+
+    monkeypatch.setattr("inference.llm.requests.post", fail)
+    config = load_config({"LLM_PROVIDER": "none"})
+
+    assert classify(config, "A", "B") == 0.0
+
+
 def test_build_request_for_openai_style():
     config = load_config({"LLM_PROVIDER": "openai", "LLM_API_KEY": "sk-test"})
 

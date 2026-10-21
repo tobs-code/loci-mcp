@@ -99,29 +99,46 @@ Then in the Claude Code MCP config:
 
 ---
 
-## MCP Tools (16 Tools + 1 Resource)
+## MCP Tools (18 Tools + 1 Resource)
+
+### Response Envelope
+
+Every tool answers with the same shape, so an agent never has to guess:
+
+```json
+{"ok": true, "status": "stored", "id": "6dd84bf5092a4850",
+ "error": null, "warnings": []}
+```
+
+`ok` is `false` on failure, `status` is one of `stored`, `duplicate`,
+`updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok`,
+`id` is the affected memory id (`null` for collections), `error` carries the
+message, `warnings` collects non-fatal notes. Collection tools add `count` and
+`results`; failed calls never raise.
 
 ### Write
 | Tool | Description |
 |------|-------------|
-| `remember` | Store a fact/decision/learning (auto-embedding, exact + optional fuzzy dedup via `fuzzy_threshold`, `supersede`, optional contradiction check, `scope` global/project) |
-| `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`; optional `check_contradictions`) |
+| `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, optional contradiction check, `scope` global/project) |
+| `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance or metadata |
-| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity_name` also removes the graph node and that scope's memories |
+| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
 
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`, `graph_boost` |
-| `get_entity` | Entity details (including graph connections) + all linked memories; `include_superseded` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `graph_boost`, `fields` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `fields` |
+| `get_entity` | Entity details (including graph connections) + all linked memories; `include_superseded`, `fields` |
 | `list_entities` | Browse all entities (`entity_type`, `project`) |
-| `init_context` | Session bootstrap: recent memories, counters, projects, graph entity count, health |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed), counters, projects, graph entity count, health; `detail="slim"\|"full"` |
 
 ### Graph (Apache AGE)
 | Tool | Description |
 |------|-------------|
 | `relate` | Directed relation via Cypher (auto-creates entities); `project` selects the project graph |
 | `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
+| `unrelate` | Delete a single directed relation |
 | `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
 | `find_paths` | Shortest paths between two entities (`project`-scoped) |
 
@@ -129,8 +146,8 @@ Then in the Claude Code MCP config:
 | Tool | Description |
 |------|-------------|
 | `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required |
-| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`) |
-| `import_memories` | Restore from JSON/JSONL (`data`, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
+| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data` |
+| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
 | `server_health` | Check Postgres + Inference connectivity |
 
 ### Resource
@@ -368,6 +385,8 @@ python -m pytest
 | `mcp_server/server.py` | Public facade: registers the tools and starts the transports |
 | `mcp_server/app.py` | FastMCP instance and server instructions |
 | `mcp_server/config.py` | Memory types, scopes and scoring constants |
+| `mcp_server/envelope.py` | Uniform response envelope shared by all tools |
+| `mcp_server/projection.py` | Row projection (`fields`) and near-duplicate detection |
 | `mcp_server/db.py` | Schema, migrations, connection handling |
 | `mcp_server/scopes.py` | Project slugs, scope labels and per-project tables |
 | `mcp_server/scoring.py` | Decay, RRF helpers and ID/content hashing |
