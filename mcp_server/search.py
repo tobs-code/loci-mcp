@@ -1,8 +1,9 @@
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
-from mcp_server.config import FTS_WEIGHT, PROJECT_SCOPE_BOOST, RRF_K
+from mcp_server.config import FTS_LANGUAGE, FTS_WEIGHT, PROJECT_SCOPE_BOOST, RRF_K
 from mcp_server.db import get_conn
 from mcp_server.scopes import _ag_str, _project_names, _retrieval_tables, _scope_label
 from mcp_server.scoring import (
@@ -13,6 +14,44 @@ from mcp_server.scoring import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _extra_conditions(
+    updated_after: str | None = None,
+    metadata_filter: dict | None = None,
+) -> tuple[list[str], list[Any]]:
+    """Build the optional filter conditions shared by all retrieval paths."""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if updated_after:
+        stamp = _parse_timestamp(updated_after)
+        if stamp is None:
+            raise ValueError(
+                f"invalid updated_after {updated_after!r}: use an ISO date "
+                f"like 2026-10-01 or 2026-10-01T12:00:00Z"
+            )
+        conditions.append("updated_at >= %s")
+        params.append(stamp)
+    if metadata_filter:
+        conditions.append("metadata @> %s::jsonb")
+        params.append(json.dumps(metadata_filter))
+    return conditions, params
+
+
+def _parse_timestamp(value: str):
+    """Parse an ISO-8601 date/datetime into a timezone-aware datetime."""
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
 
 def _search_memories_rrf(
     cur,
@@ -28,6 +67,8 @@ def _search_memories_rrf(
     min_similarity: float | None = None,
     k: int = RRF_K,
     tables: list[str] | None = None,
+    updated_after: str | None = None,
+    metadata_filter: dict | None = None,
 ) -> list[dict]:
     """
     Reciprocal Rank Fusion over vector + FTS results.
@@ -42,6 +83,8 @@ def _search_memories_rrf(
 
     max_distance = None if min_similarity is None else 1.0 - min_similarity
     fts_query = _fts_query(query_text)
+    extra_conditions, extra_params = _extra_conditions(updated_after,
+                                                        metadata_filter)
 
     # (score, id, table) tuples, merged across tables before ranking
     vec_candidates: list[tuple[float, str, str]] = []
@@ -61,6 +104,8 @@ def _search_memories_rrf(
         if entity:
             conditions.append("entity = %s")
             params.append(entity)
+        conditions.extend(extra_conditions)
+        params.extend(extra_params)
         where = " AND ".join(conditions)
 
         # 1. Vector Search (Top 50 per table)
@@ -82,10 +127,10 @@ def _search_memories_rrf(
         # 2. FTS Search (Top 50 per table), OR-joined terms
         if fts_query:
             sql = (
-                f"SELECT id, ts_rank(to_tsvector('german', content), "
-                f"websearch_to_tsquery('german', %s)) AS rank FROM {table} "
-                f"WHERE to_tsvector('german', content) @@ "
-                f"websearch_to_tsquery('german', %s)"
+                f"SELECT id, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
+                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS rank FROM {table} "
+                f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
+                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)"
             )
             fts_params: list[Any] = [fts_query, fts_query]
             if max_distance is not None and query_embedding is not None:
@@ -197,6 +242,8 @@ def _search_memories(
     min_similarity: float | None = None,
     hybrid: bool = True,  # Default: RRF aktivieren
     tables: list[str] | None = None,
+    updated_after: str | None = None,
+    metadata_filter: dict | None = None,
 ) -> list[dict]:
     """
     Wrapper for search functions. Uses RRF when hybrid=True, otherwise legacy search.
@@ -207,7 +254,8 @@ def _search_memories(
         return _search_memories_rrf(
             cur, query_embedding, query_text, mem_type, entity, limit, project,
             include_decay, include_embedding, include_superseded, min_similarity,
-            tables=tables,
+            tables=tables, updated_after=updated_after,
+            metadata_filter=metadata_filter,
         )
 
     # Legacy fallback for individual retrievers
@@ -218,6 +266,8 @@ def _search_memories(
     max_distance = None if min_similarity is None else 1.0 - min_similarity
     has_vec = query_embedding is not None
     fts_query = _fts_query(query_text)
+    extra_conditions, extra_params = _extra_conditions(updated_after,
+                                                        metadata_filter)
 
     rows: list[dict] = []
     seen_hashes: set[str] = set()
@@ -236,8 +286,8 @@ def _search_memories(
                 conditions.append("embedding <=> %s::vector <= %s")
                 params_vec.extend([query_embedding, max_distance])
         elif fts_query:
-            col = ("*, ts_rank(to_tsvector('german', content), "
-                   "websearch_to_tsquery('german', %s)) AS fts_rank")
+            col = (f"*, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
+                   f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS fts_rank")
             params_vec.append(fts_query)
             order = "ORDER BY fts_rank DESC"
         else:
@@ -246,7 +296,8 @@ def _search_memories(
 
         if fts_query:
             conditions.append(
-                "to_tsvector('german', content) @@ websearch_to_tsquery('german', %s)"
+                f"to_tsvector('{FTS_LANGUAGE}', content) @@ "
+                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)"
             )
             params.append(fts_query)
         if mem_type:
@@ -255,6 +306,8 @@ def _search_memories(
         if entity:
             conditions.append("entity = %s")
             params.append(entity)
+        conditions.extend(extra_conditions)
+        params.extend(extra_params)
 
         if include_superseded:
             conditions.append("deleted_at IS NULL")
@@ -335,6 +388,8 @@ def _search_memories_graph_boost(
     include_decay: bool = False,
     graph_boost_weight: float = 0.3,  # 30% boost for graph candidates
     include_global: bool = True,
+    updated_after: str | None = None,
+    metadata_filter: dict | None = None,
 ) -> list[dict]:
     """
     Augments search results with memories from connected entities via the graph.
@@ -369,14 +424,18 @@ def _search_memories_graph_boost(
         ]
 
         # 2. Fetch memories of connected entities
+        extra_conditions, extra_params = _extra_conditions(updated_after,
+                                                            metadata_filter)
         existing_ids = {r["id"] for r in existing_results}
         for entity_name, weight in graph_entities:
             for table in tables:
                 cur.execute(
                     f"SELECT * FROM {table} "
-                    f"WHERE entity = %s AND superseded_by IS NULL AND deleted_at IS NULL "
-                    f"LIMIT 5",
-                    (entity_name,)
+                    f"WHERE entity = %s AND superseded_by IS NULL AND deleted_at IS NULL"
+                    + ("" if not extra_conditions
+                       else " AND " + " AND ".join(extra_conditions))
+                    + " LIMIT 5",
+                    [entity_name] + extra_params,
                 )
                 for row in cur.fetchall():
                     d = dict(zip([desc[0] for desc in cur.description], row))
@@ -385,6 +444,14 @@ def _search_memories_graph_boost(
                         continue
                     d["_graph_weight"] = weight
                     d["_graph_source"] = entity_name
+                    # Graph candidates are not retrieved by relevance: they have
+                    # no similarity and no RRF contribution. Mark them as such
+                    # instead of leaving the score fields undefined.
+                    d["_similarity"] = None
+                    d["_distance"] = None
+                    d["_relevance_score"] = None
+                    d["_rrf_score"] = 0.0
+                    d["_rrf_norm"] = 0.0
                     if include_decay:
                         d["_decay_score"] = _decay_score(
                             d.get("created_at"), d.get("updated_at"),
@@ -405,9 +472,6 @@ def _search_memories_graph_boost(
     finally:
         conn.close()
 
-    if not graph_results:
-        return existing_results
-
     # 3. Fuse with existing results
     # Keep the boost relative to the best RRF score so graph candidates
     # cannot jump to the top on weight alone.
@@ -427,8 +491,9 @@ def _search_memories_graph_boost(
         decay_norm = r.get("_decay_norm", 0.0) if include_decay else 0.0
 
         # Final score: relevance (RRF) + graph boost + at most 30% decay
-        r["_final_score"] = _blend_scores(rrf_norm, decay_norm) + graph_boost
+        r["_final_score"] = (_blend_scores(rrf_norm, decay_norm) + graph_boost
+                             + r.get("_scope_boost", 0.0))
 
     # Sort by final score and limit
     all_results.sort(key=lambda x: -x.get("_final_score", 0))
-    return all_results[:limit * 2]
+    return all_results[:limit]

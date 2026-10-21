@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,45 +48,91 @@ logger = logging.getLogger(__name__)
 
 
 class BatchFact(BaseModel):
+    """One fact of a batch. Only `content` is required."""
+
     model_config = ConfigDict(extra="allow")
 
-    content: Any = Field(json_schema_extra={"type": "string"})
+    content: Any = Field(json_schema_extra={"type": "string"},
+                          description="The fact to store (required, non-empty).")
     mem_type: Any = Field(default="fact", json_schema_extra={
         "type": "string",
         "enum": ["fact", "decision", "learning", "preference", "pattern",
                  "incident", "runbook", "context", "observation", "convention",
                  "command", "note"],
-    })
-    entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
-    importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]})
-    metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]})
+    }, description="Kind of memory (default: fact).")
+    entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                         description="Entity this memory belongs to; links it in the graph.")
+    importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
+                            description="Importance in 0.0-1.0 (default 1.0); scales decay weighting.")
+    metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]},
+                          description="Free-form JSON object stored with the memory.")
     scope: Any = Field(default=None, json_schema_extra={
         "type": ["string", "null"], "enum": ["global", "project", None],
-    })
-    project: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
-    supersede: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
-    supersede_content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]})
-    supersede_last: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]})
-    fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]})
+    }, description="Where to store: 'project' (needs a project) or 'global'.")
+    project: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                         description="Overrides the batch project for this fact.")
+    supersede: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                           description="Memory id this fact replaces.")
+    supersede_content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                                   description="Exact content of the memory this fact replaces.")
+    supersede_last: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]},
+                                description="Replace the newest memory of the same entity.")
+    fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
+                                 description="Similarity threshold 0.0-1.0 for semantic dedup.")
     dedupe: Any = Field(default=None, json_schema_extra={
         "type": ["string", "null"], "enum": ["exact", "semantic", "off", None],
-    })
+    }, description="Duplicate detection: 'exact' (content hash), 'semantic' (vector similarity) or 'off'.")
 
 
 def remember(
-    content: str,
-    mem_type: Literal["fact", "decision", "learning", "preference", "pattern", "incident", "runbook", "context", "observation", "convention", "command", "note"] = "fact",
-    entity: str | None = None,
-    importance: float = 1.0,
-    metadata: dict[str, Any] | None = None,
-    scope: Literal["global", "project"] | None = None,
-    project: str | None = None,
-    supersede: str | None = None,
-    check_contradictions: bool = False,
-    fuzzy_threshold: float | None = None,
-    dedupe: Literal["exact", "semantic", "off"] = "exact",
-    supersede_content: str | None = None,
-    supersede_last: bool = False,
+    content: Annotated[str, Field(description="The fact to remember (non-empty).")],
+    mem_type: Annotated[
+        Literal["fact", "decision", "learning", "preference", "pattern", "incident",
+                "runbook", "context", "observation", "convention", "command", "note"],
+        Field(description="Kind of memory (default: fact).")] = "fact",
+    entity: Annotated[
+        str | None,
+        Field(description="Entity this memory belongs to; connects it in the graph "
+                          "and enables graph_boost / find_connections.")] = None,
+    importance: Annotated[
+        float,
+        Field(description="Importance in 0.0-1.0 (default 1.0). Scales the decay "
+                          "weight, so low-importance memories fade faster.")] = 1.0,
+    metadata: Annotated[
+        dict[str, Any] | None,
+        Field(description="Free-form JSON object stored with the memory.")] = None,
+    scope: Annotated[
+        Literal["global", "project"] | None,
+        Field(description="Where to store the memory: 'project' (requires a "
+                          "project) or 'global' (shared table). Defaults to "
+                          "'project' when a project is given, else 'global'.")] = None,
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. 'global' is reserved and means the "
+                          "shared scope.")] = None,
+    supersede: Annotated[
+        str | None,
+        Field(description="Memory id that this fact replaces; the old memory is "
+                          "marked as superseded.")] = None,
+    check_contradictions: Annotated[
+        bool,
+        Field(description="Check the new fact against existing facts of the same "
+                          "entity (NLI) and auto-supersede contradictions. Needs "
+                          "an entity and a configured LLM provider.")] = False,
+    fuzzy_threshold: Annotated[
+        float | None,
+        Field(description="Similarity threshold 0.0-1.0 for semantic dedup "
+                          "(default 0.9). Only used by dedupe='semantic'.")] = None,
+    dedupe: Annotated[
+        Literal["exact", "semantic", "off"],
+        Field(description="Duplicate detection: 'exact' (content hash, default), "
+                          "'semantic' (also vector similarity) or 'off'.")] = "exact",
+    supersede_content: Annotated[
+        str | None,
+        Field(description="Exact content of the memory this fact replaces.")] = None,
+    supersede_last: Annotated[
+        bool,
+        Field(description="Replace the newest memory of the same entity.")] = False,
 ) -> dict[str, Any]:
     """Store a memory (fact, decision, learning, preference, ...).
 
@@ -225,13 +271,34 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
 
 
 def remember_batch(
-    facts: list[BatchFact],
-    project: str | None = None,
-    skip_duplicates: bool = True,
-    fuzzy_threshold: float | None = None,
-    check_contradictions: bool = False,
-    scope: Literal["global", "project"] | None = None,
-    dedupe: Literal["exact", "semantic", "off"] = "exact",
+    facts: Annotated[
+        list[BatchFact],
+        Field(description="Facts to store. Each dict needs 'content'; invalid "
+                          "entries are reported individually and the rest is "
+                          "still stored.")],
+    project: Annotated[
+        str | None,
+        Field(description="Default project scope for all facts (per-fact "
+                          "project wins).")]= None,
+    skip_duplicates: Annotated[
+        bool,
+        Field(description="Skip facts that already exist instead of storing "
+                          "them again.")] = True,
+    fuzzy_threshold: Annotated[
+        float | None,
+        Field(description="Similarity threshold 0.0-1.0 for semantic dedup "
+                          "across all facts.")] = None,
+    check_contradictions: Annotated[
+        bool,
+        Field(description="NLI-check every fact against existing facts of the "
+                          "same entity and auto-supersede contradictions.")] = False,
+    scope: Annotated[
+        Literal["global", "project"] | None,
+        Field(description="Default scope for all facts (per-fact scope wins).")]= None,
+    dedupe: Annotated[
+        Literal["exact", "semantic", "off"],
+        Field(description="Duplicate detection: 'exact' (default), 'semantic' or "
+                          "'off'.")] = "exact",
 ) -> dict[str, Any]:
     """Store multiple facts at once. Each dict needs 'content'.
 
@@ -433,13 +500,32 @@ def remember_batch(
 
 
 def update_memory(
-    memory_id: str,
-    content: str | None = None,
-    importance: float | None = None,
-    metadata: dict | None = None,
-    project: str | None = None,
+    memory_id: Annotated[
+        str,
+        Field(description="Id of the memory to update.")],
+    content: Annotated[
+        str | None,
+        Field(description="New content; re-embeds the memory.")] = None,
+    importance: Annotated[
+        float | None,
+        Field(description="New importance in 0.0-1.0.")] = None,
+    metadata: Annotated[
+        dict | None,
+        Field(description="Replacement metadata object.")] = None,
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. Without it the id is looked up in "
+                          "every scope.")] = None,
+    entity: Annotated[
+        str | None,
+        Field(description="New entity the memory belongs to.")] = None,
+    mem_type: Annotated[
+        str | None,
+        Field(description="New memory type (fact, decision, learning, "
+                          "preference, pattern, incident, runbook, context, "
+                          "observation, convention, command, note).")] = None,
 ) -> dict[str, Any]:
-    """Update an existing memory's content, importance, or metadata.
+    """Update an existing memory's content, importance, metadata, entity or type.
 
     Without `project`, the memory is looked up in every table.
     """
@@ -474,6 +560,19 @@ def update_memory(
             return fail(STATUS_ERROR, "metadata must be an object")
         sets.append("metadata = %s::jsonb")
         params.append(json.dumps(metadata))
+    if entity is not None:
+        entity = (entity or "").strip()
+        if not entity:
+            return fail(STATUS_ERROR, "entity must not be empty")
+        sets.append("entity = %s")
+        params.append(entity)
+    if mem_type is not None:
+        if mem_type not in MEMORY_TYPES:
+            return fail(STATUS_ERROR,
+                        f"Invalid mem_type. Choose from: "
+                        f"{', '.join(sorted(MEMORY_TYPES))}")
+        sets.append("mem_type = %s")
+        params.append(mem_type)
 
     if not sets:
         return fail(STATUS_ERROR, "nothing to update", id=memory_id)
@@ -507,11 +606,25 @@ def update_memory(
 
 
 def forget(
-    memory_id: str | None = None,
-    entity_name: str | None = None,
-    project: str | None = None,
-    soft: bool = True,
-    entity: str | None = None,
+    memory_id: Annotated[
+        str | None,
+        Field(description="Id of a single memory to remove.")] = None,
+    entity_name: Annotated[
+        str | None,
+        Field(description="Entity whose memories (and graph node) are removed. "
+                          "Alias: `entity`.")] = None,
+    project: Annotated[
+        str | None,
+        Field(description="Scope to act in. Without it the id/entity is looked "
+                          "up in every scope.")] = None,
+    soft: Annotated[
+        bool,
+        Field(description="True (default) hides the memory; False deletes it "
+                          "permanently.")] = True,
+    entity: Annotated[
+        str | None,
+        Field(description="Entity whose memories (and graph node) are removed. "
+                          "Alias: `entity_name`.")] = None,
 ) -> dict[str, Any]:
     """Remove a fact by memory_id or delete an entity and all its memories.
 

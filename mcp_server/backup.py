@@ -1,8 +1,9 @@
 import json
 import logging
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
+from pydantic import Field
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
@@ -78,11 +79,24 @@ def _export_graph(cur, project: str | None) -> dict:
 
 
 def export_memories(
-    format: Literal["json", "jsonl"] = "json",
-    project: str | None = None,
-    include_embeddings: bool = False,
-    include_superseded: bool = False,
-    include_graph: bool = True,
+    format: Annotated[
+        Literal["json", "jsonl"],
+        Field(description="'json' (default) returns an object with records and "
+                          "the graph; 'jsonl' returns one record per line "
+                          "(no graph).")]= "json",
+    project: Annotated[
+        str | None,
+        Field(description="Scope to export. Without it every scope is exported "
+                          "and each record carries its project.")] = None,
+    include_embeddings: Annotated[
+        bool,
+        Field(description="Include the vector of every memory (large).")] = False,
+    include_superseded: Annotated[
+        bool,
+        Field(description="Include superseded (invalidated) memories.")] = False,
+    include_graph: Annotated[
+        bool,
+        Field(description="Include entities and relations (JSON exports only).")] = True,
 ) -> dict[str, Any]:
     """Export memories (and optionally the graph) as JSON or JSONL.
 
@@ -159,11 +173,27 @@ def _parse_dt(value) -> datetime | None:
 
 
 def import_memories(
-    data: str | dict,
-    project: str | None = None,
-    format: Literal["json", "jsonl"] = "json",
-    skip_duplicates: bool = True,
-    fuzzy_threshold: float | None = None,
+    data: Annotated[
+        str | dict,
+        Field(description="Payload of `export_memories`, either as the object "
+                          "or as its JSON string. JSONL payloads are one "
+                          "record per line.")],
+    project: Annotated[
+        str | None,
+        Field(description="Target scope for all records. Without it every "
+                          "record is restored into the scope it was exported "
+                          "from.")] = None,
+    format: Annotated[
+        Literal["json", "jsonl"],
+        Field(description="Format of `data` (default: json).")] = "json",
+    skip_duplicates: Annotated[
+        bool,
+        Field(description="Skip records whose id already exists instead of "
+                          "inserting them again.")] = True,
+    fuzzy_threshold: Annotated[
+        float | None,
+        Field(description="Similarity threshold 0.0-1.0 for semantic dedup of "
+                          "records without an id.")] = None,
 ) -> dict[str, Any]:
     """Import memories (and graph, for JSON exports).
 

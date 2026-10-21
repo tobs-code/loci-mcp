@@ -115,12 +115,25 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   out.
 - `_relevance_score` is normalized to 0..1: RRF for hybrid search, cosine
   similarity for vector-only search, and text rank for the FTS fallback.
-  RRF-specific annotations appear in hybrid results and when graph boosting is enabled.
+  It is `null` for graph-only hits, which were not retrieved by relevance.
+- `_final_score` is the ranking score: relevance blended with decay plus the
+  graph boost. `_distance` is the raw cosine distance to the query.
+- Graph hits carry `_graph_boost` (0.3 × edge weight), `_graph_source` (the
+  connected entity) and `_graph_weight` (the edge weight).
 - `hybrid=false` bypasses RRF and uses a single retriever (vector when an
   embedding exists, otherwise FTS) — `hybrid=true` (default) is recommended.
 - `graph_boost=true` (requires `entity`) traverses one hop in the scope graph,
   loads up to 5 memories per connected entity and adds
   `_graph_boost = 0.3 * edge weight` on top of the blended RRF/decay score.
+  If only graph hits come back, a warning says so. Edge weights are limited
+  to 0.0-1.0, so a single edge cannot dominate the ranking.
+- `recall`/`list_memories` accept `updated_after` (ISO date) and
+  `metadata_filter` (key/value pairs the metadata must contain);
+  `list_memories` additionally accepts `order_by`
+  (`updated_at`, `created_at`, `access_count`, `importance`).
+- The full-text retriever uses the English dictionary (`FTS_LANGUAGE` in
+  `config.py`). Index and query side always use the same dictionary; a
+  changed dictionary is migrated at startup.
 - Embeddings are prompt-aware: queries are sent with `mode="query"`, stored
   content with `mode="document"` (Jina retrieval prefixes). Mixing the two
   makes scores incomparable, so re-embed after changing the model or prompts:
@@ -148,8 +161,12 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 - Set `include_decay=true` in `recall` to weight results by recency + frequency
 - Decay contributes at most 30% of the final score (`DECAY_WEIGHT = 0.3`);
   the remaining 70% is relevance, so recency cannot drown out semantics
-- `min_decay_score` (0..1) filters on normalized decay (`_decay_norm`);
-  `_decay_score` keeps the raw value
+- `min_decay_score` (0..1) filters on the normalized decay (`_decay_norm`):
+  `importance × recency` plus at most 10% access-frequency bonus. A brand-new
+  memory with `importance=1.0` scores ~0.9, a 90-day-old one ~0.5, so
+  `min_decay_score=0.9` keeps fresh, important facts. The filter runs before
+  the access counters of the current query are counted.
+- `_decay_score` keeps the raw value (uncapped, can exceed 1.0)
 
 ## Contradiction Detection
 
@@ -270,20 +287,24 @@ it explicitly.
 | Tool | Key Parameters | Notes |
 |------|---------------|-------|
 | `get_entity` | `entity` (`name` kept as alias) | Entity name to fetch details for |
-| `relate` | `from_entity`, `to_entity` (not `from`, `to`) | Source and target entity names |
+| `relate` | `from_entity`, `to_entity` (not `from`, `to`), `weight` (0..1) | Source and target entity names; `weight` is the edge strength |
 | `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent) |
 | `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
-| `recall` | `min_similarity` (0..1), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `fields` | Drops semantically weak / stale hits; `graph_boost` requires `entity` |
-| `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `fields` | Browse without a query |
-| `list_entities` | `entity_type`, `project`, `include_global`, `limit` | Without `project`, lists all scopes |
-| `init_context` | `project`, `include_global`, `detail` | `project="*"` includes all projects |
+| `recall` | `min_similarity` (0..1), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `fields`, `updated_after`, `metadata_filter` | Drops semantically weak / stale hits; `graph_boost` requires `entity` |
+| `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `fields`, `updated_after`, `metadata_filter`, `order_by` | Browse without a query |
+| `list_entities` | `entity_type`, `project`, `include_global`, `limit` | Without `project`, lists all scopes; memory-only rows carry `type="memory-only"` |
+| `init_context` | `project`, `include_global`, `detail` | `project="*"` includes all projects; every memory reports its `project` |
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set |
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts are reported individually |
-| `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from |
+| `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded |
+| `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
 | `contradictions_report` | `entity` | Required; checks one entity at a time |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project` | `counts` splits memories/entities/relations |
 | `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Payload is returned in `data`; graph is only included in JSON exports |
 | `import_memories` | `data` (object or string), `project`, `format`, `skip_duplicates`, `fuzzy_threshold` | Without `project` records keep their export scope |
+
+Every tool parameter carries a description in the JSON schema; the table
+above only lists the ones that are easy to get wrong.
 
 Dedupe modes: `exact` (default, content hash), `semantic` (also vector
 similarity, threshold `fuzzy_threshold`, default 0.9), `off` (store everything).

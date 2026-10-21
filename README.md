@@ -127,11 +127,11 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`, `fields` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`, `fields`, `updated_after`, `metadata_filter` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by` |
 | `get_entity` | Entity details (including graph connections) + all linked memories; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`) |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`); memory-only entities carry `type="memory-only"` |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
 
 ### Graph (Apache AGE)
 | Tool | Description |
@@ -149,6 +149,37 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data` |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
 | `server_health` | Check Postgres + Inference connectivity |
+
+### Typical Workflows
+
+Use `init_context` at session start. With a project set, it loads that project
+and global context; follow it with targeted `recall` when you need a specific
+past decision:
+
+```text
+init_context(project="api")
+recall(query="deployment rollback procedure", project="api", include_decay=true)
+```
+
+Store a fact with an entity when it should be discoverable by both search and
+entity lookup. Add graph relations when you need explicit traversable links:
+
+```text
+remember(content="The API runs on Postgres", entity="API", project="api")
+relate(from_entity="API", to_entity="Postgres", relation_type="USES", project="api")
+find_connections(entity="API", project="api")
+```
+
+Use the returned memory `id` to update or forget that exact record. For backup,
+pass the JSON export's `data` payload directly into import; re-import is
+idempotent by default:
+
+```text
+update_memory(memory_id="<id>", content="Updated fact", project="api")
+forget(memory_id="<id>", project="api", soft=true)
+export_memories(format="json", project="api")
+import_memories(data=<export data>, format="json")
+```
 
 ### Resource
 | Resource | Description |
@@ -171,12 +202,18 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
   Project hits receive a small scope tie-breaker. Set `include_global=false`
   for a project-only search.
 - FTS is OR-based (`_fts_query`), weighted with `FTS_WEIGHT = 0.6` so a single
-  common word cannot outrank the best semantic hit.
+  common word cannot outrank the best semantic hit. The retriever uses the
+  English dictionary (`FTS_LANGUAGE`); index and query side always match.
 - `_similarity` = `1 - cosine distance` (0..1), the same scale as `min_similarity`.
   `recall` defaults to `min_similarity=0.4`; pass `null` to opt out.
 - `_relevance_score` is normalized to 0..1: RRF in hybrid mode, cosine
   similarity in vector-only mode, and text rank when FTS is the fallback.
-  RRF-specific fields appear in hybrid results and when graph boosting is enabled.
+  It is `null` for graph-only hits.
+- `_final_score` is the ranking score (relevance + decay + graph boost);
+  `_graph_boost`, `_graph_source` and `_graph_weight` describe graph hits.
+- Edge weights are limited to 0.0-1.0, so one edge cannot dominate a ranking.
+- `updated_after` (ISO date) and `metadata_filter` (key/value pairs) narrow
+  `recall` and `list_memories`; `list_memories` can also sort with `order_by`.
 - Embeddings are prompt-aware: queries use `mode="query"`, stored content uses
   `mode="document"`. After changing the model or prompts, re-embed:
   `docker compose exec loci-mcp python -m mcp_server.reembed`.
@@ -186,6 +223,7 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
   (30% of the edge weight); RRF remains the basis of the score.
 - `include_superseded=true` shows superseded history, but never deleted rows
   (`deleted_at` is set) — soft delete stays invisible.
+- Every tool parameter is documented in its JSON schema description.
 
 ## Memory Types
 
@@ -294,7 +332,10 @@ contradiction detection; `/nli` then returns `0.0` for every pair.
 - `importance` (0.0–1.0) and `access_count` (max. 20) slow down decay
 - `include_decay=true` in `recall` weights by recency + frequency
 - Decay contributes at most 30% to the score (`DECAY_WEIGHT = 0.3`), 70% stays relevance
-- `min_decay_score` (0..1) filters on normalized decay (`_decay_norm`)
+- `min_decay_score` (0..1) filters on normalized decay (`_decay_norm`):
+  `importance × recency` plus at most 10% access-frequency bonus. A brand-new
+  memory with `importance=1.0` scores ~0.9, a 90-day-old one ~0.5 — so
+  `min_decay_score=0.9` keeps fresh, important facts.
 
 ## Contradiction Detection
 

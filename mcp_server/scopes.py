@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 
-from mcp_server.config import _IDENT_RE
+from mcp_server.config import FTS_LANGUAGE, _IDENT_RE
 from mcp_server.db import get_conn
 
 def _safe_ident(value: str, kind: str = "identifier") -> str:
@@ -116,6 +116,65 @@ def _retrieval_tables(cur, project: str | None) -> list[str]:
     return tables
 
 
+def _ensure_fts_index(cur, table: str, index_name: str) -> None:
+    """Make sure the full-text index of `table` uses the configured dictionary.
+
+    An index built with a different dictionary cannot be used by the query
+    side, so it is dropped and rebuilt.
+    """
+    cur.execute(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' "
+        "AND tablename = %s AND indexdef LIKE '%%to_tsvector%%'",
+        (table,),
+    )
+    for name, indexdef in cur.fetchall():
+        if f"to_tsvector('{FTS_LANGUAGE}'" not in indexdef:
+            cur.execute(f'DROP INDEX IF EXISTS "{name}"')
+    cur.execute(
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = %s "
+        "AND indexdef LIKE '%%to_tsvector%%'",
+        (table,),
+    )
+    if not cur.fetchone():
+        cur.execute(
+            f"CREATE INDEX {index_name} ON {table} USING GIN "
+            f"(to_tsvector('{FTS_LANGUAGE}', content))"
+        )
+
+
+def _migrate_fts_indexes() -> int:
+    """Rebuild full-text indexes that use a different dictionary.
+
+    Returns the number of rebuilt indexes.
+    """
+    conn = get_conn()
+    rebuilt = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name LIKE 'mem\\_%'"
+        )
+        for (table,) in cur.fetchall():
+            cur.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' "
+                "AND tablename = %s AND indexdef LIKE '%%to_tsvector%%'",
+                (table,),
+            )
+            stale = [d for (d,) in cur.fetchall()
+                     if f"to_tsvector('{FTS_LANGUAGE}'" not in d]
+            if not stale:
+                continue
+            safe = table[len("mem_"):]
+            idx_digest = hashlib.sha1(safe.encode()).hexdigest()[:10]
+            _ensure_fts_index(cur, table, f"idx_{idx_digest}_tsv")
+            rebuilt += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return rebuilt
+
+
 def _ensure_project_table(cur, project: str) -> None:
     project = _norm_project(project)
     if not project:
@@ -178,16 +237,7 @@ def _ensure_project_table(cur, project: str) -> None:
     )
     if not cur.fetchone():
         cur.execute(f"CREATE INDEX {hash_idx} ON mem_{safe}(content_hash)")
-    cur.execute(
-        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = %s "
-        "AND indexdef LIKE '%%to_tsvector%%'",
-        (f"mem_{safe}",),
-    )
-    if not cur.fetchone():
-        cur.execute(
-            f"CREATE INDEX {tsv_idx} "
-            f"ON mem_{safe} USING GIN (to_tsvector('german', content))"
-        )
+    _ensure_fts_index(cur, f"mem_{safe}", tsv_idx)
     cur.execute(
         "DELETE FROM projects WHERE name = %s AND suffix <> %s",
         (project, safe),

@@ -92,8 +92,28 @@ def project(row: dict, fields: list[str] | None = None) -> dict:
 
 
 def project_bootstrap(row: dict) -> dict:
-    """Reduce a row to the fields a session bootstrap needs."""
-    return {f: row[f] for f in BOOTSTRAP_FIELDS if f in row}
+    """Reduce a row to the fields a session bootstrap needs.
+
+    The scope of a memory is exposed as `project` (the project name, or
+    "global") so an agent can tell where a memory comes from even when it
+    bootstraps several projects at once.
+    """
+    out = {f: row[f] for f in BOOTSTRAP_FIELDS if f in row}
+    scope = row.get("_project")
+    if scope is None:
+        scope = row.get("scope")
+    if scope is not None:
+        out["project"] = scope
+    return out
+
+
+def project_full(row: dict) -> dict:
+    """Full column view for `detail="full"`, minus internal bookkeeping.
+
+    Internal fields (content hash, embedding, deletion marker) are never
+    exposed, not even in the full bootstrap.
+    """
+    return {k: v for k, v in row.items() if k not in INTERNAL_FIELDS}
 
 
 def _stem(word: str) -> str:

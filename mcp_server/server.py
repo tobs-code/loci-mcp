@@ -24,6 +24,7 @@ from mcp_server.graph import (
     relate_batch,
     unrelate,
 )
+from mcp_server.scopes import _migrate_fts_indexes
 from mcp_server.tools.maintenance import (
     contradictions_report,
     server_health,
@@ -79,6 +80,15 @@ def main() -> None:
         logger.info("Schema OK")
     except Exception as e:
         logger.warning("Schema may already exist: %s", e)
+
+    # Full-text indexes must use the configured dictionary; rebuild stale ones.
+    try:
+        rebuilt = _migrate_fts_indexes()
+        if rebuilt:
+            logger.info("Rebuilt %s full-text index(es) for the current dictionary",
+                        rebuilt)
+    except Exception as e:
+        logger.warning("Full-text index migration skipped: %s", e)
 
     try:
         conn = get_conn()

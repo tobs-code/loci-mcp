@@ -25,21 +25,39 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
 
-def _decay_score(created_at: datetime, updated_at: datetime | None,
-                 access_count: int, importance: float) -> float:
-    """Raw recency/frequency score in [0, DECAY_RAW_MAX]."""
+def _recency_factor(created_at: datetime, updated_at: datetime | None) -> float:
+    """Recency factor in (0, 1]: 1.0 for a fresh memory, 0.5 after one
+    half-life, halving with every further half-life."""
     ref = updated_at or created_at
     age_days = (_now() - ref).total_seconds() / 86400
-    decay = 0.5 ** (age_days / DECAY_HALF_LIFE_DAYS)
+    return 0.5 ** (max(0.0, age_days) / DECAY_HALF_LIFE_DAYS)
+
+
+def _decay_score(created_at: datetime, updated_at: datetime | None,
+                 access_count: int, importance: float) -> float:
+    """Raw recency/frequency score in [0, DECAY_RAW_MAX].
+
+    Unbounded above DECAY_RAW_MAX is possible (importance 1.0 with a fully
+    used access budget), so the raw value is only meaningful together with
+    `_decay_norm`.
+    """
+    recency = _recency_factor(created_at, updated_at)
     access_boost = 1.0 + min(access_count, DECAY_ACCESS_CAP) * 1.5 / DECAY_ACCESS_CAP
-    return importance * decay * access_boost
+    return importance * recency * access_boost
 
 
 def _decay_norm(created_at: datetime, updated_at: datetime | None,
                 access_count: int, importance: float) -> float:
-    """Normalized decay score in [0, 1], comparable to a normalized RRF score."""
-    raw = _decay_score(created_at, updated_at, access_count, importance)
-    return max(0.0, min(1.0, raw / DECAY_RAW_MAX))
+    """Normalized decay score in [0, 1], comparable to a normalized RRF score.
+
+    The score is `importance × recency` with a small access-frequency bonus
+    (at most 10%). A brand-new memory with importance 1.0 therefore scores
+    0.90, and `min_decay_score=0.9` keeps fresh, important facts instead of
+    excluding them. Frequency only separates memories of similar age.
+    """
+    recency = _recency_factor(created_at, updated_at)
+    access_ratio = min(max(access_count, 0), DECAY_ACCESS_CAP) / DECAY_ACCESS_CAP
+    return max(0.0, min(1.0, importance * recency * (0.9 + 0.1 * access_ratio)))
 
 
 def _blend_scores(rrf_norm: float, decay_norm: float) -> float:

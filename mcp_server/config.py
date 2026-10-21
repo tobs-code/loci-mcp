@@ -28,6 +28,12 @@ RRF_K = 60
 FTS_WEIGHT = 0.6
 
 
+# Text search configuration for the full-text retriever. The dictionary has to
+# match the language of the stored content: stemming and stop words differ per
+# language, so a mismatched dictionary silently degrades recall quality.
+FTS_LANGUAGE = "english"
+
+
 # Similarity threshold used by the "semantic" dedupe mode.
 DEFAULT_DUPLICATE_THRESHOLD = 0.9
 

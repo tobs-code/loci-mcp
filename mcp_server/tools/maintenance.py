@@ -1,6 +1,8 @@
 import json
 import logging
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
@@ -16,9 +18,18 @@ from mcp_server.search import _search_memories
 
 logger = logging.getLogger(__name__)
 
-def contradictions_report(entity: str | None = None,
-                         project: str | None = None,
-                         limit: int = 20) -> dict[str, Any]:
+def contradictions_report(entity: Annotated[
+        str | None,
+        Field(description="Entity to check. Required: the report works on one "
+                          "entity at a time.")] = None,
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. Without it only global memories are "
+                          "checked.")] = None,
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of candidate pairs to report "
+                          "(default 20).")] = 20) -> dict[str, Any]:
     """Find potentially conflicting facts stored for the same entity.
 
     Uses vector similarity to find candidate pairs, then NLI to confirm.
