@@ -122,6 +122,7 @@ def test_export_answers_with_the_envelope_and_round_trips_through_import():
     assert exported["ok"] is True
     assert exported["format"] == "json"
     assert exported["count"] == 1
+    assert "records" not in exported
     assert exported["data"]["records"][0]["content"] == "Export contract fact"
 
     imported = import_memories(exported["data"], project="restored")

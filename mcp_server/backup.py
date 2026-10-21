@@ -138,14 +138,13 @@ def export_memories(
     if format == "jsonl":
         data = "\n".join(json.dumps(r) for r in records)
         return ok(STATUS_OK, format=format, count=len(records), data=data,
-                  data_format="jsonl", graph_included=False, records=records)
+                  data_format="jsonl", graph_included=False)
     payload = {"type": "memory_export", "version": "0.2",
                "records": records, "count": len(records)}
     if graph is not None:
         payload["graph"] = graph
     return ok(STATUS_OK, format=format, count=len(records), data=payload,
-              data_format="json", graph_included=graph is not None,
-              records=records)
+              data_format="json", graph_included=graph is not None)
 
 
 def _parse_dt(value) -> datetime | None:

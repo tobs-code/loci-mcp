@@ -42,9 +42,8 @@ shape:
 
 Tools that return a collection add `count` and `results`. Tools with extra
 payload add their own keys (e.g. `counts` for `forget`, `superseded` for
-`remember`, `recent_memories` for `init_context`). Some tools also return
-legacy aliases; agents should prefer canonical fields (`results` for
-collections and `data` for export payloads).
+`remember`, `recent_memories` for `init_context`). Export payloads are in
+`data`; collection results are in `results`.
 
 Failed calls never raise: they return `ok: false` with `error` set.
 

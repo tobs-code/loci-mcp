@@ -19,7 +19,9 @@ def _export_fixture() -> dict:
 
 
 def test_export_json_contains_records_and_graph():
-    payload = _export_fixture()["data"]
+    exported = _export_fixture()
+    assert "records" not in exported
+    payload = exported["data"]
 
     assert payload["type"] == "memory_export"
     assert payload["version"] == "0.2"
@@ -33,6 +35,7 @@ def test_export_json_contains_records_and_graph():
 def test_export_jsonl_is_flat_and_has_no_graph():
     _export_fixture()
     exported = export_memories(format="jsonl")
+    assert "records" not in exported
 
     lines = [line for line in exported["data"].splitlines() if line.strip()]
     assert len(lines) == 1

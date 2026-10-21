@@ -101,7 +101,8 @@ def test_find_paths_returns_shortest_paths_and_respects_max_hops():
 
     result = find_paths("A", "C")
     assert result["count"] == 1
-    path = result["paths"][0]
+    assert "paths" not in result
+    path = result["results"][0]
     assert [n["name"] for n in path["nodes"]] == ["A", "B", "C"]
     assert path["hops"] == 2
 
