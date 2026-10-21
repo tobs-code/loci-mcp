@@ -1,11 +1,13 @@
 from mcp_server.server import (
     find_connections,
     find_paths,
+    forget,
     get_entity,
     relate,
     relate_batch,
     recall,
     remember,
+    unrelate,
 )
 
 
@@ -42,6 +44,27 @@ def test_relate_stores_an_optional_context_memory():
     hit = next(r for r in hits["results"] if r["id"] == memory_id)
     assert hit["entity"] == "A_KNOWS_B"
     assert hit["metadata"]["relation_type"] == "KNOWS"
+
+
+def test_unrelate_removes_the_relation_context_memory():
+    relation = relate("ContextA", "ContextB", "KNOWS", context="Met in Berlin")
+    context_id = relation["context_memory"]
+
+    assert unrelate("ContextA", "ContextB", "KNOWS")["status"] == "deleted"
+    result = recall("Met in Berlin", include_superseded=True, min_similarity=0.0)
+
+    assert all(memory["id"] != context_id for memory in result["results"])
+
+
+def test_forget_entity_removes_relation_context_memories():
+    relation = relate("ForgetA", "ForgetB", "KNOWS", context="Temporary link")
+    context_id = relation["context_memory"]
+
+    result = forget(entity="ForgetA", soft=False)
+
+    assert result["status"] == "deleted"
+    memories = recall("Temporary link", include_superseded=True, min_similarity=0.0)
+    assert all(memory["id"] != context_id for memory in memories["results"])
 
 
 def test_get_entity_exposes_graph_connections():

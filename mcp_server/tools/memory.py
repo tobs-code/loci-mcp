@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired, TypedDict
 
 from mcp_server.config import (
     DEDUPE_MODES,
@@ -43,6 +43,25 @@ from mcp_server.storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class BatchFact(TypedDict):
+    content: str
+    mem_type: NotRequired[Literal[
+        "fact", "decision", "learning", "preference", "pattern",
+        "incident", "runbook", "context", "observation", "convention",
+        "command", "note",
+    ]]
+    entity: NotRequired[str | None]
+    importance: NotRequired[float]
+    metadata: NotRequired[dict[str, Any] | None]
+    scope: NotRequired[Literal["global", "project"] | None]
+    project: NotRequired[str | None]
+    supersede: NotRequired[str | None]
+    supersede_content: NotRequired[str | None]
+    supersede_last: NotRequired[bool]
+    fuzzy_threshold: NotRequired[float | None]
+    dedupe: NotRequired[Literal["exact", "semantic", "off"] | None]
 
 def remember(
     content: str,
@@ -196,7 +215,7 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
 
 
 def remember_batch(
-    facts: list[dict],
+    facts: list[BatchFact],
     project: str | None = None,
     skip_duplicates: bool = True,
     fuzzy_threshold: float | None = None,
@@ -560,6 +579,22 @@ def forget(
                                (SENTINEL_FORGOTTEN, entity_name))
                 else:
                     cur.execute(f"DELETE FROM {tbl} WHERE entity = %s", (entity_name,))
+                counts["memories"] += cur.rowcount
+                relation_context_filter = (
+                    "metadata->>'relation_context' = 'true' "
+                    "AND (metadata->>'from' = %s OR metadata->>'to' = %s)"
+                )
+                if soft:
+                    cur.execute(
+                        f"UPDATE {tbl} SET superseded_by = %s, deleted_at = NOW() "
+                        f"WHERE deleted_at IS NULL AND {relation_context_filter}",
+                        (SENTINEL_FORGOTTEN, entity_name, entity_name),
+                    )
+                else:
+                    cur.execute(
+                        f"DELETE FROM {tbl} WHERE {relation_context_filter}",
+                        (entity_name, entity_name),
+                    )
                 counts["memories"] += cur.rowcount
             if not (counts["memories"] or counts["entities"] or counts["relations"]):
                 conn.rollback()

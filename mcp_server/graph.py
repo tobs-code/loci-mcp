@@ -1,8 +1,9 @@
 import json
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired, TypedDict
 
 from mcp_server.db import get_conn
+from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.envelope import (
     STATUS_DELETED,
     STATUS_ERROR,
@@ -20,10 +21,43 @@ from mcp_server.scopes import (
     _safe_ident,
     _scope_key,
     _scope_label,
+    _table_exists,
 )
 from mcp_server.storage import _store_memory, _supersede
 
 logger = logging.getLogger(__name__)
+
+
+class RelationEdge(TypedDict):
+    from_entity: str
+    to_entity: str
+    relation_type: str
+    weight: NotRequired[float]
+    context: NotRequired[str | None]
+    project: NotRequired[str | None]
+
+
+def _forget_relation_context(
+    cur,
+    project: str | None,
+    from_entity: str,
+    to_entity: str,
+    relation_type: str,
+) -> int:
+    """Hide the active context memory attached to a deleted edge."""
+    table = _mem_table(project)
+    if not _table_exists(cur, table):
+        return 0
+    cur.execute(
+        f"UPDATE {table} SET superseded_by = %s, deleted_at = NOW() "
+        "WHERE deleted_at IS NULL "
+        "AND metadata->>'relation_context' = 'true' "
+        "AND metadata->>'from' = %s "
+        "AND metadata->>'to' = %s "
+        "AND metadata->>'relation_type' = %s",
+        (SENTINEL_FORGOTTEN, from_entity, to_entity, relation_type),
+    )
+    return cur.rowcount
 
 def _ensure_graph_entity(cur, name: str, project: str | None,
                          ent_type: str | None = None) -> None:
@@ -193,7 +227,7 @@ def relate(
 
 
 def relate_batch(
-    edges: list[dict],
+    edges: list[RelationEdge],
     project: str | None = None,
 ) -> dict[str, Any]:
     """Create or update multiple directed relations in one transaction.
@@ -276,6 +310,9 @@ def unrelate(
                 "AND source_id = (SELECT id FROM entities WHERE name = %s AND project = %s) "
                 "AND target_id = (SELECT id FROM entities WHERE name = %s AND project = %s)",
                 (relation_type, from_entity, scope, to_entity, scope),
+            )
+            _forget_relation_context(
+                cur, project, from_entity, to_entity, relation_type,
             )
         conn.commit()
     except Exception as e:
