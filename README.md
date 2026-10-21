@@ -110,7 +110,7 @@ Every tool answers with the same shape, so an agent never has to guess:
  "error": null, "warnings": []}
 ```
 
-`ok` is `false` on failure, `status` is one of `stored`, `duplicate`,
+`ok` is `false` on failure, `status` is one of `stored`, `created`, `duplicate`,
 `updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok`,
 `id` is the affected memory id (`null` for collections), `error` carries the
 message, `warnings` collects non-fatal notes. Collection tools add `count` and
