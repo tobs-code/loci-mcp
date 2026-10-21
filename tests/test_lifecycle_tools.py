@@ -3,6 +3,7 @@ from mcp_server.server import (
     forget,
     recall,
     remember,
+    update_memory,
 )
 
 
@@ -61,6 +62,24 @@ def test_supersede_hides_the_old_fact_from_normal_recall():
     history = recall("server port", include_superseded=True, limit=10)["results"]
     old = next(r for r in history if r["id"] == old_id)
     assert old["superseded_by"] == new_id
+
+
+def test_update_rejects_superseded_and_forgotten_memories():
+    old_id = remember("The old deployment uses blue green")["id"]
+    new_id = remember("The new deployment uses canary", supersede=old_id)["id"]
+
+    superseded = update_memory(old_id, content="Should not be editable")
+    assert superseded["ok"] is False
+    assert superseded["status"] == "not_found"
+
+    forgotten_id = remember("A deployment fact to forget")["id"]
+    forget(forgotten_id)
+    forgotten = update_memory(forgotten_id, importance=0.1)
+    assert forgotten["ok"] is False
+    assert forgotten["status"] == "not_found"
+
+    active = update_memory(new_id, importance=0.5)
+    assert active["ok"] is True
 
 
 def test_remember_check_contradictions_auto_supersedes_the_old_fact():

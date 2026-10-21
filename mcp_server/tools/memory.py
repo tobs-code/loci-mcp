@@ -454,7 +454,8 @@ def update_memory(
         updated = 0
         for table in tables:
             cur.execute(
-                f"UPDATE {table} SET {', '.join(sets)} WHERE id = %s",
+                f"UPDATE {table} SET {', '.join(sets)} "
+                "WHERE id = %s AND superseded_by IS NULL AND deleted_at IS NULL",
                 params + [memory_id],
             )
             if cur.rowcount:
