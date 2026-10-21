@@ -409,6 +409,17 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
         conn.close()
     paths = []
     seen_paths: set[tuple] = set()
+    conn = get_conn()
+    entity_ids: dict[str, int] = {}
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name, id FROM entities WHERE project = %s",
+            (_scope_key(project),),
+        )
+        entity_ids = {name: entity_id for name, entity_id in cur.fetchall()}
+    finally:
+        conn.close()
     for r in rows:
         nodes_str = str(r[0]).replace("::vertex", "").replace("::edge", "")
         rels_str = str(r[1]).replace("::vertex", "").replace("::edge", "")
@@ -425,7 +436,7 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
         if signature in seen_paths:
             continue
         seen_paths.add(signature)
-        nodes = [{"id": ids[i], "name": names[i],
+        nodes = [{"id": entity_ids.get(names[i]), "name": names[i],
                   "label": parsed[i].get("label")}
                  for i in range(len(names))]
         relations = []
