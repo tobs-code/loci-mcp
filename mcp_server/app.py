@@ -8,6 +8,11 @@ Use `remember` to store facts, decisions, and observations about entities.
 Use `recall` to search semantically, by keyword, or via graph traversal.
 Use `relate` to connect entities in the knowledge graph.
 
+Project-scoped reads include global memories by default. Pass
+`include_global=false` when strict project isolation is required.
+Collection tools use `results` as their canonical list field; compatibility
+aliases may also be present in older tool responses.
+
 === WHEN TO REMEMBER ===
 - User preferences and corrections
 - Architectural decisions, conventions, commands

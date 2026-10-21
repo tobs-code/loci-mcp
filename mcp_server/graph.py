@@ -383,6 +383,8 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
                project: str | None = None) -> dict[str, Any]:
     """Find paths between two entities in the graph.
 
+    The canonical collection is ``results``. ``paths`` remains as a
+    compatibility alias for older clients.
     `project` selects that project's graph; without it the global graph is used.
     """
     logger.info("find_paths from=%s to=%s max_hops=%s project=%s",
@@ -464,4 +466,5 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
     if paths:
         shortest_hops = min(path["hops"] for path in paths)
         paths = [path for path in paths if path["hops"] == shortest_hops]
+    # Keep the legacy ``paths`` alias while standardizing on ``results``.
     return ok(STATUS_OK, count=len(paths), results=paths, paths=paths)

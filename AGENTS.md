@@ -35,7 +35,7 @@ shape:
 | Key | Meaning |
 |-----|---------|
 | `ok` | `false` when the call failed, `true` otherwise |
-| `status` | `stored`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok` |
+| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok` |
 | `id` | Id of the affected memory (`null` for collections and for failures) |
 | `error` | Error message, `null` on success |
 | `warnings` | Non-fatal notes (skipped checks, superseded facts) |
