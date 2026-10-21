@@ -59,6 +59,19 @@ def test_recall_can_return_the_original_project_name():
     assert hit == {"id": memory_id, "project": "Team Alpha"}
 
 
+def test_memory_projection_accepts_internal_project_alias():
+    memory_id = remember("Read contract: internal project alias",
+                         project="projection-alias")["id"]
+
+    result = recall("internal project alias", project="projection-alias",
+                    limit=5, fields=["id", "_project"])
+
+    assert _hit(result, memory_id) == {
+        "id": memory_id,
+        "_project": "projection-alias",
+    }
+
+
 def test_project_recall_prioritizes_project_hits_over_global_ties():
     remember("Scope ranking: deployment uses blue green rollout", project="scope-rank")
     remember("Scope ranking: deployment requires signed release", scope="global")
@@ -187,6 +200,20 @@ def test_list_entities_rejects_non_positive_limits():
     result = list_entities(limit=0)
     assert result["ok"] is False
     assert "limit" in result["error"]
+
+
+def test_list_entities_can_exclude_global_entities():
+    remember("Read contract: project entity scope", entity="ProjectOnly",
+             project="entity-list-scope")
+    remember("Read contract: global entity scope", entity="GlobalOnly",
+             scope="global")
+
+    result = list_entities(project="entity-list-scope", include_global=False)
+
+    assert result["ok"] is True
+    assert all(row["project"] == "entity-list-scope"
+               for row in result["results"])
+    assert any(row["name"] == "ProjectOnly" for row in result["results"])
 
 
 def test_init_context_slim_bootstrap_drops_internal_fields():

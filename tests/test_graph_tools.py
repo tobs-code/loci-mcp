@@ -106,7 +106,10 @@ def test_find_paths_returns_shortest_paths_and_respects_max_hops():
     assert path["hops"] == 2
 
     assert find_paths("A", "C", max_hops=1)["count"] == 0
-    assert find_paths("A", "Z")["count"] == 0
+    missing = find_paths("A", "Z")
+    assert missing["ok"] is False
+    assert missing["status"] == "not_found"
+    assert missing["entity"] == "Z"
 
 
 def test_relate_batch_keeps_projects_isolated_and_is_idempotent():

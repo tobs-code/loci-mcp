@@ -38,7 +38,7 @@ SCORE_FIELDS = (
     "_graph_weight",
 )
 
-SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS + ("project",))
+SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS + ("project", "_project"))
 
 
 def validate_fields(fields: list[str] | None) -> str | None:
@@ -78,7 +78,7 @@ def project(row: dict, fields: list[str] | None = None) -> dict:
     if fields is not None:
         projected = {}
         for field in fields:
-            if field == "project":
+            if field in ("project", "_project"):
                 value = row.get("_project")
                 if value is None:
                     value = row.get("scope")

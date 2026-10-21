@@ -401,6 +401,19 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
     conn = get_conn()
     try:
         cur = conn.cursor()
+        scope = _scope_key(project)
+        cur.execute(
+            "SELECT name FROM entities WHERE project = %s AND name IN (%s, %s)",
+            (scope, from_entity, to_entity),
+        )
+        known_entities = {row[0] for row in cur.fetchall()}
+        missing = [name for name in (from_entity, to_entity)
+                   if name not in known_entities]
+        if missing:
+            conn.rollback()
+            return fail(STATUS_NOT_FOUND,
+                        f"entity not found: {missing[0]}",
+                        entity=missing[0])
         cur.execute("SET search_path TO ag_catalog, public")
         fe_json = json.dumps(from_entity)
         te_json = json.dumps(to_entity)

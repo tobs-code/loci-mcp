@@ -307,12 +307,15 @@ def get_entity(name: str | None = None, project: str | None = None,
 
 
 def list_entities(entity_type: str | None = None, limit: int = 50,
-                  project: str | None = None) -> dict[str, Any]:
+                  project: str | None = None,
+                  include_global: bool = True) -> dict[str, Any]:
     """Browse entities.
 
     Returns graph entities (created via `relate`) plus entity names that only
     exist on memories. With `project`, that project and global scope are
-    listed; without it every scope is listed. Each row carries its `project`.
+    listed by default; set `include_global=False` for strict project
+    isolation. Without `project` every scope is listed. Each row carries its
+    `project`.
     """
     logger.info("list_entities entity_type=%s limit=%s project=%s",
                 entity_type, limit, project)
@@ -324,12 +327,21 @@ def list_entities(entity_type: str | None = None, limit: int = 50,
         cur = conn.cursor()
         tables = (_retrieval_tables(cur, project) if project
                   else _all_mem_tables(cur))
+        if project and not include_global:
+            tables = [table for table in tables if table != "memories"]
         names = _project_names(cur)
         scope_of = {t: (names.get(t[len("mem_"):], t[len("mem_"):])
                         if t != "memories" else "global") for t in tables}
 
-        conditions = ["(project = %s OR project = 'global')"] if project else ["TRUE"]
-        params: list[Any] = [project] if project else []
+        if project and include_global:
+            conditions = ["(project = %s OR project = 'global')"]
+            params: list[Any] = [project]
+        elif project:
+            conditions = ["project = %s"]
+            params = [project]
+        else:
+            conditions = ["TRUE"]
+            params = []
         if entity_type:
             conditions.append("type = %s")
             params.append(entity_type)

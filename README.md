@@ -130,7 +130,7 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`, `fields` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields` |
 | `get_entity` | Entity details (including graph connections) + all linked memories; `include_superseded`, `fields` |
-| `list_entities` | Browse all entities (`entity_type`, `project`) |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`) |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
 
 ### Graph (Apache AGE)
@@ -140,7 +140,7 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 | `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
 | `unrelate` | Delete a single directed relation |
 | `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
-| `find_paths` | Shortest paths between two entities (`project`-scoped) |
+| `find_paths` | Shortest paths between two existing entities (`project`-scoped); missing entities return `not_found` |
 
 ### Maintenance
 | Tool | Description |
