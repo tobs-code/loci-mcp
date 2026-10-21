@@ -135,8 +135,9 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
             )
             row = cur.fetchone()
             mem_id = _store_memory(
-                cur, e["context"], emb, "fact", ctx_entity, 0.8,
-                {"relation_type": e["relation_type"], "from": e["from_entity"],
+                cur, e["context"], emb, "context", ctx_entity, 0.8,
+                {"relation_context": True, "relation_type": e["relation_type"],
+                 "from": e["from_entity"],
                  "to": e["to_entity"], "weight": e["weight"]},
                 project, None,
             )
@@ -440,4 +441,7 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
             })
         paths.append({"nodes": nodes, "relations": relations,
                       "hops": len(nodes) - 1})
+    if paths:
+        shortest_hops = min(path["hops"] for path in paths)
+        paths = [path for path in paths if path["hops"] == shortest_hops]
     return ok(STATUS_OK, count=len(paths), results=paths, paths=paths)

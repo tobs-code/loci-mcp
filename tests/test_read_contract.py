@@ -7,6 +7,8 @@ from mcp_server.server import (
     list_entities,
     recall,
     remember,
+    relate,
+    list_memories,
 )
 
 
@@ -98,6 +100,26 @@ def test_get_entity_can_limit_the_memory_fields():
 
     memory = next(m for m in result["memories"] if m["id"] == memory_id)
     assert set(memory) == {"id", "content"}
+
+
+def test_get_entity_returns_details_for_graph_only_entities():
+    relate("GraphOnlyA", "GraphOnlyB", "KNOWS")
+
+    result = get_entity(entity="GraphOnlyA")
+
+    assert result["ok"] is True
+    assert result["details"]["name"] == "GraphOnlyA"
+    assert result["details"]["connections"][0]["entity"] == "GraphOnlyB"
+
+
+def test_relation_context_is_searchable_but_hidden_from_memory_browse():
+    relation = relate("BrowseA", "BrowseB", "KNOWS", context="Met in Berlin")
+
+    assert relation["context_memory"]
+    assert any(r["id"] == relation["context_memory"]
+               for r in recall("Met in Berlin")["results"])
+    assert not any(r["id"] == relation["context_memory"]
+                   for r in list_memories(limit=20)["results"])
 
 
 def test_list_entities_answers_with_the_envelope():

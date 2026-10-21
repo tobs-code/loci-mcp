@@ -4,7 +4,7 @@ from typing import Any
 
 from mcp_server.db import get_conn
 from mcp_server.config import DEFAULT_MIN_SIMILARITY
-from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
+from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
 from mcp_server.projection import (
     dedupe_near_duplicates,
@@ -169,17 +169,21 @@ def list_memories(
             params.append(mem_type)
         where = " AND ".join(conditions)
         for table in tables:
+            project_names = None if table == "memories" else _project_names(cur)
             cur.execute(
                 f"SELECT * FROM {table} WHERE {where} ORDER BY updated_at DESC LIMIT %s",
                 params + [limit],
             )
-            for row in cur.fetchall():
-                item = dict(zip([d[0] for d in cur.description], row))
+            columns = [d[0] for d in cur.description]
+            table_rows = cur.fetchall()
+            for row in table_rows:
+                item = dict(zip(columns, row))
+                if (item.get("metadata") or {}).get("relation_context"):
+                    continue
                 if table == "memories":
                     item["_project"] = "global"
                 else:
-                    names = _project_names(cur)
-                    item["_project"] = names.get(table[4:], table[4:])
+                    item["_project"] = project_names.get(table[4:], table[4:])
                 rows.append(item)
         conn.commit()
     except Exception as e:
@@ -228,6 +232,16 @@ def get_entity(name: str | None = None, project: str | None = None,
             (target, scope),
         )
         row = cur.fetchone()
+        if not row:
+            label = _scope_label(project)
+            name_json = json.dumps(target)
+            cur.execute("SET search_path TO ag_catalog, public")
+            cur.execute(
+                f"SELECT * FROM cypher('memory_graph', $$ "
+                f"MATCH (n:{label} {{name: {name_json}}}) RETURN n $$) AS (n agtype)"
+            )
+            if cur.fetchone():
+                row = (None, target, label, scope)
         if row:
             entity_data = {"id": row[0], "name": row[1], "type": row[2],
                            "project": row[3], "connections": []}
@@ -254,6 +268,8 @@ def get_entity(name: str | None = None, project: str | None = None,
         return fail(STATUS_ERROR, str(e), entity=target)
     finally:
         conn.close()
+    if entity_data is None and not memories:
+        return fail(STATUS_NOT_FOUND, f"entity not found: {target}", entity=target)
     return ok(STATUS_OK, entity=target, details=entity_data,
               memories=[project_row(m, fields) for m in memories])
 
