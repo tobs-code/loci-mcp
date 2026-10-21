@@ -99,6 +99,12 @@ def test_list_entities_answers_with_the_envelope():
     assert any(r["name"] == "Uma" for r in result["results"])
 
 
+def test_list_entities_rejects_non_positive_limits():
+    result = list_entities(limit=0)
+    assert result["ok"] is False
+    assert "limit" in result["error"]
+
+
 def test_init_context_slim_bootstrap_drops_internal_fields():
     remember("Read contract: bootstrap fact for alpha", project="alpha")
 

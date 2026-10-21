@@ -263,6 +263,8 @@ def list_entities(entity_type: str | None = None, limit: int = 50,
     logger.info("list_entities entity_type=%s limit=%s project=%s",
                 entity_type, limit, project)
     project = _norm_project(project)
+    if limit < 1:
+        return fail(STATUS_ERROR, "limit must be >= 1")
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -342,8 +344,9 @@ def init_context(project: str | None = None, detail: str = "slim") -> dict[str, 
             total += table_total
             active += table_active
         conn.commit()
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
     if detail == "slim":

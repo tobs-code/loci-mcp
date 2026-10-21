@@ -311,6 +311,8 @@ def find_connections(
     project = _norm_project(project)
     if not entity_name:
         return fail(STATUS_ERROR, "entity is required")
+    if limit < 1:
+        return fail(STATUS_ERROR, "limit must be >= 1")
     if direction not in ("outgoing", "incoming", "both"):
         return fail(STATUS_ERROR,
                     "direction must be 'outgoing', 'incoming' or 'both'")
@@ -376,7 +378,13 @@ def find_paths(from_entity: str, to_entity: str, max_hops: int = 5,
     logger.info("find_paths from=%s to=%s max_hops=%s project=%s",
                 from_entity, to_entity, max_hops, project)
     project = _norm_project(project)
-    max_hops = max(1, min(int(max_hops), 10))
+    try:
+        max_hops = int(max_hops)
+    except (TypeError, ValueError):
+        return fail(STATUS_ERROR, "max_hops must be an integer")
+    if max_hops < 1:
+        return fail(STATUS_ERROR, "max_hops must be >= 1")
+    max_hops = min(max_hops, 10)
     label = _scope_label(project)
     conn = get_conn()
     try:

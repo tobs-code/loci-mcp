@@ -74,6 +74,19 @@ def test_find_connections_filters_by_direction_and_relation_type():
     assert "direction" in invalid["error"]
 
 
+def test_graph_tools_reject_non_positive_limits():
+    assert find_connections("A", limit=0)["ok"] is False
+    assert "limit" in find_connections("A", limit=0)["error"]
+    assert find_paths("A", "B", max_hops=0)["ok"] is False
+    assert "max_hops" in find_paths("A", "B", max_hops=0)["error"]
+
+
+def test_find_paths_rejects_non_integer_hops():
+    result = find_paths("A", "B", max_hops="many")
+    assert result["ok"] is False
+    assert "max_hops" in result["error"]
+
+
 def test_find_paths_returns_shortest_paths_and_respects_max_hops():
     relate("A", "B", "KNOWS")
     relate("B", "C", "KNOWS")
