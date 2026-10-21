@@ -129,7 +129,7 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 |------|-------------|
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`, `fields` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields` |
-| `get_entity` | Entity details (including graph connections) + all linked memories; `include_superseded`, `fields` |
+| `get_entity` | Entity details (including graph connections) + all linked memories; `include_global`, `include_superseded`, `fields` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`) |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
 
@@ -159,6 +159,13 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 
 ## Retrieval
 
+- **Read scope defaults:** `recall` and `get_entity` use global scope when
+  `project` is omitted; with a project they include that project's and global
+  memories by default. `list_memories` and `list_entities` list all scopes when
+  `project` is omitted, and project + global by default when it is set. Pass
+  `include_global=false` for project-only reads. `init_context` uses global
+  scope when `project` is omitted, project + global when set, and all scopes
+  with `project="*"`; `include_global=false` excludes global memories.
 - `recall` searches the project table (if `project` is set) **and** the
   global `memories` table; global facts remain visible inside a project.
   Project hits receive a small scope tie-breaker. Set `include_global=false`
@@ -259,10 +266,10 @@ contradiction detection; `/nli` then returns `0.0` for every pair.
   `Project_<slug>` for a project) plus a `project` property; `entities` has
   `UNIQUE(name, project)`. Identical entity names therefore do not collide
   across projects.
-- `project` is accepted by: `get_entity`, `list_entities`, `relate`,
-  `relate_batch`, `find_connections`, `find_paths`, `forget`,
-  `export_memories`, `import_memories`. Without `project` the scope is global
-  (`export`/`init_context`: all scopes).
+- `project` is accepted by reads and graph tools. Graph tools use the global
+  graph when it is omitted; `export_memories` exports all scopes when omitted,
+  and `import_memories` restores each record to its exported scope. For
+  `init_context`, use `project="*"` to include all scopes.
 
 ## Backup & Restore
 

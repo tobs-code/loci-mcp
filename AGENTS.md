@@ -42,7 +42,9 @@ shape:
 
 Tools that return a collection add `count` and `results`. Tools with extra
 payload add their own keys (e.g. `counts` for `forget`, `superseded` for
-`remember`, `recent_memories` for `init_context`).
+`remember`, `recent_memories` for `init_context`). Some tools also return
+legacy aliases; agents should prefer canonical fields (`results` for
+collections and `data` for export payloads).
 
 Failed calls never raise: they return `ok: false` with `error` set.
 
@@ -64,10 +66,10 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 | Tool | Description |
 |------|-------------|
 | `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `entity`) to include connected entities; `fields` to narrow columns; logs `access_count` |
-| `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `fields` |
-| `get_entity` | Get entity details + all linked memories + graph connections; `include_superseded`; `fields` |
-| `list_entities` | Browse all entities (global and project tables) |
-| `init_context` | Bootstrap: recent memories across all tables + projects + entity count + health; `detail="slim"` (default, deduped) or `"full"` |
+| `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `include_global`, `fields` |
+| `get_entity` | Get entity details + all linked memories + graph connections; `include_global`, `include_superseded`, `fields` |
+| `list_entities` | Browse entities; filters: `entity_type`, `project`, `include_global` |
+| `init_context` | Bootstrap: recent memories + entity count + health; global by default, project + global when `project` is set, all scopes with `project="*"`; `detail="slim"` (default, deduped) or `"full"` |
 
 ### Graph (Apache AGE)
 | Tool | Description |
@@ -96,6 +98,13 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 - `recall` searches the project table (if `project` is set) **and** the global
   `memories` table. Project rows win when the same content exists in both
   (dedup via `content_hash`); global facts stay visible from inside a project.
+- Read scope defaults vary by tool: `recall` and `get_entity` use global scope
+  when `project` is omitted; with a project they include that project's and
+  global memories by default. `list_memories` and `list_entities` list all
+  scopes when `project` is omitted, and project + global by default when it is
+  set. Pass `include_global=false` for project-only reads. `init_context`
+  uses global scope when `project` is omitted, project + global when it is set,
+  and all scopes with `project="*"`; `include_global=false` excludes globals.
 - FTS is OR-based (`_fts_query`): a multi-term query matches documents that
   contain any term. FTS rank contributions are weighted at `FTS_WEIGHT = 0.6`
   so a single common word cannot outrank the best semantic hit.
@@ -204,12 +213,15 @@ With `include_superseded=true` in `recall` or `get_entity`, superseded facts can
   `Project_<suffix>` for a project) plus a `project` property; the SQL mirror
   `entities` has `UNIQUE(name, project)`. Two projects can use the same entity
   name without collisions, and global facts stay visible inside a project.
-- `get_entity`, `list_entities`, `list_memories`, `relate`, `relate_batch`,
-  `unrelate`, `find_connections`, `find_paths`, `forget`, `export_memories` and
-  `import_memories` accept `project`; omitting it means global scope (for
-  `export`/`init_context`: all scopes). `forget(entity=..., project=...)`
-  deletes only that scope's node and memories; without `project` it removes
-  every scope.
+- `get_entity`, `list_entities`, `list_memories`, `recall`, `init_context`,
+  `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
+  `forget`, `export_memories` and `import_memories` accept `project`. Read
+  defaults are described above. Graph tools use the global graph when
+  `project` is omitted. `export_memories` exports all scopes when omitted;
+  `import_memories` restores each record to its exported scope. For
+  `init_context`, use `project="*"` to include all scopes. `forget(entity=...,
+  project=...)` deletes only that scope's node and memories; without `project`
+  it removes every scope.
 
 ## Backup & Restore
 
@@ -260,7 +272,9 @@ it explicitly.
 | `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent) |
 | `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
 | `recall` | `min_similarity` (0..1), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `fields` | Drops semantically weak / stale hits; `graph_boost` requires `entity` |
-| `list_memories` | `entity`, `mem_type`, `project`, `limit`, `fields` | Browse without a query |
+| `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `fields` | Browse without a query |
+| `list_entities` | `entity_type`, `project`, `include_global`, `limit` | Without `project`, lists all scopes |
+| `init_context` | `project`, `include_global`, `detail` | `project="*"` includes all projects |
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set |
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts are reported individually |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from |

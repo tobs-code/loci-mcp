@@ -10,8 +10,8 @@ Use `relate` to connect entities in the knowledge graph.
 
 Project-scoped reads include global memories by default. Pass
 `include_global=false` when strict project isolation is required.
-Collection tools use `results` as their canonical list field; compatibility
-aliases may also be present in older tool responses.
+Collection tools use `results` as their canonical list field. Some responses
+also include legacy compatibility aliases; prefer the canonical fields.
 
 === WHEN TO REMEMBER ===
 - User preferences and corrections
