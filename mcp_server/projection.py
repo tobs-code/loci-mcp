@@ -64,7 +64,17 @@ def project(row: dict, fields: list[str] | None = None) -> dict:
     returned; internal fields are dropped.
     """
     if fields is not None:
-        return {f: row[f] for f in fields if f in row}
+        projected = {}
+        for field in fields:
+            if field == "project":
+                value = row.get("_project")
+                if value is None:
+                    value = row.get("scope")
+                if value is not None:
+                    projected[field] = value
+            elif field in row:
+                projected[field] = row[field]
+        return projected
     keep = PUBLIC_FIELDS + SCORE_FIELDS
     return {f: row[f] for f in keep if f in row}
 

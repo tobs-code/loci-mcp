@@ -174,7 +174,13 @@ def list_memories(
                 params + [limit],
             )
             for row in cur.fetchall():
-                rows.append(dict(zip([d[0] for d in cur.description], row)))
+                item = dict(zip([d[0] for d in cur.description], row))
+                if table == "memories":
+                    item["_project"] = "global"
+                else:
+                    names = _project_names(cur)
+                    item["_project"] = names.get(table[4:], table[4:])
+                rows.append(item)
         conn.commit()
     except Exception as e:
         conn.rollback()

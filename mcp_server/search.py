@@ -4,7 +4,7 @@ from typing import Any
 
 from mcp_server.config import FTS_WEIGHT, RRF_K
 from mcp_server.db import get_conn
-from mcp_server.scopes import _ag_str, _retrieval_tables, _scope_label
+from mcp_server.scopes import _ag_str, _project_names, _retrieval_tables, _scope_label
 from mcp_server.scoring import (
     _blend_scores,
     _decay_norm,
@@ -129,6 +129,7 @@ def _search_memories_rrf(
     # 4. Load details per table (project first), dropping cross-table duplicates
     rows: list[dict] = []
     seen_hashes: set[str] = set()
+    project_names = _project_names(cur)
     for table in tables:
         ids = [row_id for row_id in top_ids if table_of.get(row_id) == table]
         if not ids:
@@ -140,6 +141,10 @@ def _search_memories_rrf(
             d = by_id.get(row_id)
             if d is None:
                 continue
+            if table == "memories":
+                d["_project"] = "global"
+            else:
+                d["_project"] = project_names.get(table[4:], table[4:])
             c_hash = d.get("content_hash") or ""
             if c_hash and c_hash in seen_hashes:
                 continue
@@ -212,6 +217,7 @@ def _search_memories(
 
     rows: list[dict] = []
     seen_hashes: set[str] = set()
+    project_names = _project_names(cur)
     for table in tables:
         conditions: list[str] = ["TRUE"]
         params: list[Any] = []
@@ -256,6 +262,10 @@ def _search_memories(
         colnames = [desc[0] for desc in cur.description] if cur.description else []
         for row in cur.fetchall():
             d = dict(zip(colnames, row))
+            if table == "memories":
+                d["_project"] = "global"
+            else:
+                d["_project"] = project_names.get(table[4:], table[4:])
             if "distance" in d and d["distance"] is not None:
                 d["_distance"] = float(d.pop("distance"))
                 d["_similarity"] = round(1.0 - d["_distance"], 4)

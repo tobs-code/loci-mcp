@@ -46,6 +46,17 @@ def test_recall_can_return_only_the_requested_fields():
     assert set(hit) == {"id", "content"}
 
 
+def test_recall_can_return_the_original_project_name():
+    memory_id = remember("Read contract: project names are preserved",
+                         project="Team Alpha")["id"]
+
+    result = recall("project names are preserved", project="Team Alpha",
+                    limit=5, fields=["id", "project"])
+
+    hit = _hit(result, memory_id)
+    assert hit == {"id": memory_id, "project": "Team Alpha"}
+
+
 def test_recall_warns_when_graph_boost_has_no_entity():
     remember("Read contract: graph boost without entity")
 
