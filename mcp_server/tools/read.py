@@ -42,6 +42,7 @@ def recall(
     min_similarity: float | None = DEFAULT_MIN_SIMILARITY,  # 0..1
     fields: list[str] | None = None,
     only_superseded: bool = False,
+    include_global: bool = True,
 ) -> dict[str, Any]:
     """Search memories using hybrid vector + fulltext search (RRF fusion).
 
@@ -53,6 +54,7 @@ def recall(
     min_decay_score (0..1) filters on the normalized decay score.
     Set only_superseded=True to return only invalidated facts.
     Set fields=["id", "content"] to receive only the named columns.
+    Set include_global=False to restrict a project search to project memories.
     """
     logger.info("recall query='%s' entity=%s hybrid=%s include_decay=%s graph_boost=%s min_similarity=%s",
                 query[:80], entity, hybrid, include_decay, graph_boost, min_similarity)
@@ -76,18 +78,22 @@ def recall(
         cur = conn.cursor()
         
         # Neue RRF-Funktion nutzen
+        tables = _retrieval_tables(cur, project)
+        if project and not include_global:
+            tables = [table for table in tables if table != "memories"]
         results = _search_memories(
-            cur, query_emb, query if hybrid else None, 
-            mem_type, entity, limit, project, 
-            include_decay, include_superseded=include_superseded, 
+            cur, query_emb, query if hybrid else None,
+            mem_type, entity, limit, project,
+            include_decay, include_superseded=include_superseded,
             min_similarity=min_similarity,
-            hybrid=hybrid
+            hybrid=hybrid, tables=tables,
         )
         
         # Graph-enhanced retrieval when enabled
         if graph_boost and entity:
             results = _search_memories_graph_boost(
-                results, entity, limit, project, include_decay
+                results, entity, limit, project, include_decay,
+                include_global=include_global,
             )
 
         # Update access counters (decay frequency)
@@ -138,11 +144,13 @@ def list_memories(
     project: str | None = None,
     include_superseded: bool = False,
     fields: list[str] | None = None,
+    include_global: bool = True,
 ) -> dict[str, Any]:
     """Browse stored memories without a search query.
 
     Newest first. Project scope also lists global memories, like `recall`.
-    Set `fields` to narrow the returned columns.
+    Set `fields` to narrow the returned columns. Set `include_global=False`
+    to restrict a project browse to project memories.
     """
     logger.info("list_memories entity=%s mem_type=%s limit=%s project=%s",
                 entity, mem_type, limit, project)
@@ -155,6 +163,8 @@ def list_memories(
         cur = conn.cursor()
         tables = (_retrieval_tables(cur, project) if project
                   else _all_mem_tables(cur))
+        if project and not include_global:
+            tables = [table for table in tables if table != "memories"]
         conditions: list[str] = []
         params: list[Any] = []
         if include_superseded:
@@ -331,11 +341,13 @@ def list_entities(entity_type: str | None = None, limit: int = 50,
     return ok(STATUS_OK, count=len(rows), results=rows)
 
 
-def init_context(project: str | None = None, detail: str = "slim") -> dict[str, Any]:
+def init_context(project: str | None = None, detail: str = "slim",
+                 include_global: bool = True) -> dict[str, Any]:
     """Call at session start. Returns recent + important bootstrap info + health.
 
-    Pass `project` to bootstrap for one project; global memories are always
-    included. Without a project all project tables are summarized.
+    Pass `project` to bootstrap for one project; global memories are included
+    by default. Set `include_global=False` to exclude them. Without a project
+    all project tables are summarized.
     `detail="slim"` (default) returns only the fields a session needs and
     removes near-duplicates; `detail="full"` returns every column.
     """
@@ -351,6 +363,8 @@ def init_context(project: str | None = None, detail: str = "slim") -> dict[str, 
         cur = conn.cursor()
         tables = (_retrieval_tables(cur, project) if project
                   else _all_mem_tables(cur))
+        if project and not include_global:
+            tables = [table for table in tables if table != "memories"]
         memories = _search_memories(cur, None, None, None, None, 10, project,
                                     include_decay=True, tables=tables)
         names = _project_names(cur)

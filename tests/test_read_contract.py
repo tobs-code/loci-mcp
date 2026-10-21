@@ -59,6 +59,38 @@ def test_recall_can_return_the_original_project_name():
     assert hit == {"id": memory_id, "project": "Team Alpha"}
 
 
+def test_project_recall_prioritizes_project_hits_over_global_ties():
+    remember("Scope ranking: deployment uses blue green rollout", project="scope-rank")
+    remember("Scope ranking: deployment requires signed release", scope="global")
+
+    result = recall("deployment rollout", project="scope-rank", limit=5)
+
+    assert result["results"][0]["scope"] == "project"
+
+
+def test_project_recall_can_exclude_global_hits():
+    remember("Scope filter: project-only deployment fact", project="scope-filter")
+    remember("Scope filter: global deployment fact", scope="global")
+
+    result = recall("deployment fact", project="scope-filter",
+                    include_global=False, limit=10)
+
+    assert result["ok"] is True
+    assert all(hit["scope"] == "project" for hit in result["results"])
+
+
+def test_project_browse_and_context_can_exclude_global_hits():
+    remember("Scope browse: project fact", project="scope-browse")
+    remember("Scope browse: global fact", scope="global")
+
+    browsed = list_memories(project="scope-browse", include_global=False)
+    context = init_context(project="scope-browse", include_global=False)
+
+    assert all(hit["scope"] == "project" for hit in browsed["results"])
+    assert all(hit.get("scope") == "project"
+               for hit in context["recent_memories"])
+
+
 def test_recall_warns_when_graph_boost_has_no_entity():
     remember("Read contract: graph boost without entity")
 

@@ -36,6 +36,9 @@ DEFAULT_DUPLICATE_THRESHOLD = 0.9
 DEFAULT_MIN_SIMILARITY = 0.3
 
 
+PROJECT_SCOPE_BOOST = 0.05
+
+
 # Dedupe modes for remember/remember_batch.
 DEDUPE_MODES = {"exact", "semantic", "off"}
 

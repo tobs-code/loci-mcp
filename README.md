@@ -127,11 +127,11 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `graph_boost`, `fields` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `fields` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`, `fields` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields` |
 | `get_entity` | Entity details (including graph connections) + all linked memories; `include_superseded`, `fields` |
 | `list_entities` | Browse all entities (`entity_type`, `project`) |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed), counters, projects, graph entity count, health; `detail="slim"\|"full"` |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
 
 ### Graph (Apache AGE)
 | Tool | Description |
@@ -161,6 +161,8 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 
 - `recall` searches the project table (if `project` is set) **and** the
   global `memories` table; global facts remain visible inside a project.
+  Project hits receive a small scope tie-breaker. Set `include_global=false`
+  for a project-only search.
 - FTS is OR-based (`_fts_query`), weighted with `FTS_WEIGHT = 0.6` so a single
   common word cannot outrank the best semantic hit.
 - `_similarity` = `1 - cosine distance` (0..1), the same scale as `min_similarity`.

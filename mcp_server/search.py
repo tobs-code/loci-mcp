@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Any
 
-from mcp_server.config import FTS_WEIGHT, RRF_K
+from mcp_server.config import FTS_WEIGHT, PROJECT_SCOPE_BOOST, RRF_K
 from mcp_server.db import get_conn
 from mcp_server.scopes import _ag_str, _project_names, _retrieval_tables, _scope_label
 from mcp_server.scoring import (
@@ -166,12 +166,15 @@ def _search_memories_rrf(
                     d.get("created_at"), d.get("updated_at"),
                     d.get("access_count", 0), d.get("importance", 1.0),
                 )
+            if project and table != "memories":
+                d["_scope_boost"] = PROJECT_SCOPE_BOOST
             rows.append(d)
 
     # 5. Re-rank
     if include_decay:
         for r in rows:
-            r["_final_score"] = _blend_scores(r["_rrf_norm"], r["_decay_norm"])
+            r["_final_score"] = (_blend_scores(r["_rrf_norm"], r["_decay_norm"])
+                                  + r.get("_scope_boost", 0.0))
         rows.sort(key=lambda x: -x.get("_final_score", 0))
     else:
         rows.sort(key=lambda x: -x.get("_rrf_score", 0))
@@ -313,6 +316,7 @@ def _search_memories_graph_boost(
     project: str | None,
     include_decay: bool = False,
     graph_boost_weight: float = 0.3,  # 30% boost for graph candidates
+    include_global: bool = True,
 ) -> list[dict]:
     """
     Augments search results with memories from connected entities via the graph.
@@ -329,6 +333,8 @@ def _search_memories_graph_boost(
     try:
         cur = conn.cursor()
         tables = _retrieval_tables(cur, project)
+        if project and not include_global:
+            tables = [table for table in tables if table != "memories"]
 
         # 1. Find connected entities via Apache AGE (any edge direction/type)
         cur.execute("SET search_path TO ag_catalog, public")
