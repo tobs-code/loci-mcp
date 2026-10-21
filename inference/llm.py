@@ -1,0 +1,278 @@
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+NLI_SYSTEM = "Determine if Fact B contradicts Fact A."
+NLI_INSTRUCTION = (
+    "Respond in JSON with keys 'label' (one of: contradiction, entailment, "
+    "neutral) and 'score' (0.0-1.0)."
+)
+NLI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {
+            "type": "string",
+            "enum": ["contradiction", "entailment", "neutral"],
+        },
+        "score": {"type": "number"},
+    },
+    "required": ["label", "score"],
+    "additionalProperties": False,
+}
+
+_PROVIDERS = {
+    "groq": {
+        "style": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "openai/gpt-oss-20b",
+        "key_env": "GROQ_API_KEY",
+        "model_env": "GROQ_MODEL",
+    },
+    "openai": {
+        "style": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "key_env": "OPENAI_API_KEY",
+        "model_env": None,
+    },
+    "anthropic": {
+        "style": "anthropic",
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-3-5-haiku-latest",
+        "key_env": "ANTHROPIC_API_KEY",
+        "model_env": None,
+    },
+    "ollama": {
+        "style": "openai",
+        "base_url": "http://host.docker.internal:11434/v1",
+        "model": "llama3.2",
+        "key_env": None,
+        "model_env": None,
+    },
+    "openai-compatible": {
+        "style": "openai",
+        "base_url": "",
+        "model": "",
+        "key_env": "LLM_API_KEY",
+        "model_env": None,
+    },
+}
+
+_NO_KEY_PROVIDERS = {"ollama", "openai-compatible"}
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str
+    model: str
+    api_key: str
+    base_url: str
+    style: str
+
+    @property
+    def configured(self) -> bool:
+        if self.provider == "none" or not self.base_url or not self.model:
+            return False
+        if self.provider in _NO_KEY_PROVIDERS:
+            return True
+        return bool(self.api_key)
+
+
+def _detect_provider(env) -> str:
+    for provider, key_env in (
+        ("groq", "GROQ_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+    ):
+        if (env.get(key_env) or "").strip():
+            return provider
+    if (env.get("LLM_BASE_URL") or "").strip():
+        return "openai-compatible"
+    if (env.get("OLLAMA_BASE_URL") or "").strip():
+        return "ollama"
+    return "groq"
+
+
+def _normalize_ollama_url(url: str) -> str:
+    url = url.rstrip("/")
+    if not url.endswith("/v1"):
+        url += "/v1"
+    return url
+
+
+def load_config(env=None) -> LLMConfig:
+    env = os.environ if env is None else env
+    provider = (env.get("LLM_PROVIDER") or "groq").strip().lower()
+    if provider == "auto":
+        provider = _detect_provider(env)
+    if provider in ("none", "off", "disabled"):
+        return LLMConfig("none", "", "", "", "none")
+    if provider not in _PROVIDERS:
+        logger.warning("Unknown LLM_PROVIDER %r, using openai-compatible", provider)
+        provider = "openai-compatible"
+
+    defaults = _PROVIDERS[provider]
+    model = (env.get("LLM_MODEL") or "").strip()
+    if not model and defaults["model_env"]:
+        model = (env.get(defaults["model_env"]) or "").strip()
+    if not model:
+        model = defaults["model"]
+
+    api_key = (env.get("LLM_API_KEY") or "").strip()
+    if not api_key and defaults["key_env"]:
+        api_key = (env.get(defaults["key_env"]) or "").strip()
+
+    base_url = (env.get("LLM_BASE_URL") or "").strip()
+    if not base_url and provider == "ollama":
+        base_url = (env.get("OLLAMA_BASE_URL") or "").strip()
+    if not base_url:
+        base_url = defaults["base_url"]
+    if provider == "ollama" and base_url:
+        base_url = _normalize_ollama_url(base_url)
+
+    return LLMConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        style=defaults["style"],
+    )
+
+
+def build_chat_request(config: LLMConfig, system: str, user: str,
+                       response_format: dict | None = None):
+    base = config.base_url.rstrip("/")
+    if config.style == "anthropic":
+        url = f"{base}/messages"
+        headers = {
+            "content-type": "application/json",
+            "x-api-key": config.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        body = {
+            "model": config.model,
+            "max_tokens": 300,
+            "temperature": 0.0,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }
+        return url, headers, body
+
+    url = f"{base}/chat/completions"
+    headers = {"content-type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 300,
+    }
+    if response_format is not None:
+        body["response_format"] = response_format
+    return url, headers, body
+
+
+def extract_text(config: LLMConfig, payload: dict) -> str:
+    if config.style == "anthropic":
+        blocks = payload.get("content") or []
+        if isinstance(blocks, list):
+            return "".join(
+                block.get("text", "") for block in blocks
+                if isinstance(block, dict)
+            )
+        return ""
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+    content = (choices[0].get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict)
+        )
+    return ""
+
+
+def parse_nli_json(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def nli_score(payload: dict | None) -> float:
+    if not payload:
+        return 0.0
+    try:
+        label = str(payload.get("label", "")).lower()
+        score = float(payload.get("score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if label == "contradiction" and score > 0.0:
+        return min(score, 1.0)
+    return 0.0
+
+
+def classify(config: LLMConfig, query: str, document: str) -> float:
+    if not config.configured:
+        return 0.0
+
+    system = f"{NLI_SYSTEM} {NLI_INSTRUCTION}"
+    user = f"Fact A: {query}\nFact B: {document}"
+
+    if config.style == "anthropic":
+        attempts = [None]
+    else:
+        attempts = [
+            {"type": "json_schema", "json_schema": {
+                "name": "nli", "strict": True, "schema": NLI_SCHEMA,
+            }},
+            {"type": "json_object"},
+            None,
+        ]
+
+    last_error = None
+    for response_format in attempts:
+        url, headers, body = build_chat_request(
+            config, system, user, response_format,
+        )
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=60)
+            if resp.status_code >= 400:
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                continue
+            parsed = parse_nli_json(extract_text(config, resp.json()))
+            if parsed is None:
+                last_error = "response was not valid NLI JSON"
+                continue
+            return nli_score(parsed)
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise RuntimeError(f"LLM request failed: {last_error}")

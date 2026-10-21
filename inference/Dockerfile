@@ -9,9 +9,8 @@ RUN pip install --no-cache-dir \
     requests
 
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('jinaai/jina-embeddings-v5-text-nano-retrieval')"
-RUN pip install --no-cache-dir groq
 
-COPY app.py /app/app.py
+COPY app.py llm.py /app/
 WORKDIR /app
 
 EXPOSE 8000

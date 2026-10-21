@@ -5,18 +5,20 @@ PostgreSQL 17 with **pgvector** (vector similarity search), **Apache AGE** (Cyph
 ## Quick Start
 
 ```bash
-cp .env.example .env   # add your GROQ_API_KEY
+cp .env.example .env   # configure an LLM provider (Groq by default)
 docker compose up -d
 ```
 
-> `GROQ_API_KEY` is required — `docker-compose.yml` aborts without it. The key
-> is only needed for the `/nli` endpoint (contradiction detection).
+> Contradiction detection needs an LLM key. Groq is the default; set
+> `LLM_PROVIDER` to `openai`, `anthropic`, `ollama`, `openai-compatible` or
+> `auto` to use another provider, or `none` to disable NLI. Embeddings always
+> run locally on CPU.
 
 After that, these services are running:
 | Service | Port | Description |
 |---------|------|-------------|
 | **PostgreSQL** | `5432` | User/DB: `memory`, password: `geheim` |
-| **Inference API** | `8001` | Embeddings (Jina v5 nano) + NLI (Groq) |
+| **Inference API** | `8001` | Embeddings (Jina v5 nano) + NLI (configurable LLM) |
 | **Loci MCP** | `8766` | MCP server (Streamable HTTP) for AI agents |
 
 ## MCP Server — Client Connection
@@ -126,7 +128,7 @@ Then in the Claude Code MCP config:
 ### Maintenance
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts for **one entity** (Groq NLI + vector pre-filter); `entity` is required |
+| `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`) |
 | `import_memories` | Restore from JSON/JSONL (`data`, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
 | `server_health` | Check Postgres + Inference connectivity |
@@ -170,8 +172,54 @@ Allowed values: `fact`, `decision`, `learning`, `preference`, `pattern`,
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
-| `GROQ_API_KEY` | – | Required for `/nli`; without a key, NLI returns 0.0 everywhere |
-| `GROQ_MODEL` | `llama-3.1-8b-instant` (compose: `openai/gpt-oss-20b`) | NLI model |
+| `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
+| `LLM_MODEL` | provider default | NLI model (empty = provider default) |
+| `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
+| `LLM_BASE_URL` | provider default | Base URL for OpenAI-compatible or Ollama endpoints |
+| `GROQ_API_KEY` | – | Groq key (backwards compatible) |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` (compose) | Groq model (backwards compatible) |
+| `OPENAI_API_KEY` | – | Used when `LLM_PROVIDER=openai` |
+| `ANTHROPIC_API_KEY` | – | Used when `LLM_PROVIDER=anthropic` |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
+
+### LLM Providers
+
+`/nli` uses one provider at a time. The default is Groq; the legacy
+`GROQ_API_KEY`/`GROQ_MODEL` variables keep working.
+
+| Provider | Default model | Default endpoint |
+|----------|---------------|------------------|
+| `groq` | `openai/gpt-oss-20b` | `https://api.groq.com/openai/v1` |
+| `openai` | `gpt-4o-mini` | `https://api.openai.com/v1` |
+| `anthropic` | `claude-3-5-haiku-latest` | `https://api.anthropic.com/v1` |
+| `ollama` | `llama3.2` | `http://host.docker.internal:11434/v1` |
+| `openai-compatible` | – (set `LLM_MODEL`) | – (set `LLM_BASE_URL`) |
+
+Examples:
+
+```dotenv
+# OpenAI
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+
+# Anthropic
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Ollama on the host
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+
+# Any OpenAI-compatible endpoint (LM Studio, vLLM, OpenRouter, ...)
+LLM_PROVIDER=openai-compatible
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=...
+LLM_MODEL=...
+```
+
+`LLM_PROVIDER=auto` picks the first configured key (Groq, OpenAI, Anthropic),
+then `LLM_BASE_URL`, then `OLLAMA_BASE_URL`. `LLM_PROVIDER=none` disables
+contradiction detection; `/nli` then returns `0.0` for every pair.
 
 ## Scopes & Project Names
 
@@ -223,8 +271,8 @@ Allowed values: `fact`, `decision`, `learning`, `preference`, `pattern`,
 With `remember(check_contradictions=true)`, the 15 semantically nearest active
 facts of the same entity (`mem_type='fact'`) are pre-filtered per pgvector —
 separately for the project and global tables — and then checked for a real
-contradiction via Groq NLI (`/nli`). From a score of ≥ 0.7, the old fact is
-automatically superseded.
+contradiction via the configured LLM (`/nli`, Groq by default). From a score
+of ≥ 0.7, the old fact is automatically superseded.
 
 `contradictions_report(entity=...)` works only on **active** facts of an entity:
 for each fact, the 20 nearest vector neighbors are fetched and only the
@@ -291,7 +339,7 @@ r = requests.post("http://localhost:8001/embed", json={
 })
 vectors = r.json()["embeddings"]
 
-# NLI / contradiction detection (Groq, requires GROQ_API_KEY)
+# NLI / contradiction detection (configured LLM provider)
 r = requests.post("http://localhost:8001/nli", json={
     "query": "Max lives in Berlin",
     "documents": ["Max lives in Hamburg"]
@@ -302,7 +350,7 @@ contradiction_scores = r.json()["contradiction_scores"]
 ## Testing
 
 Tests run against an isolated `loci_test` database (created and dropped
-automatically) and a local fake inference server, so no Groq key is needed.
+automatically) and a local fake inference server, so no LLM key is needed.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -333,4 +381,5 @@ python -m pytest
 | `tests/` | Integration tests against an isolated `loci_test` database |
 | `inference/Dockerfile` | Inference service with sentence-transformers |
 | `inference/app.py` | FastAPI server (`/embed`, `/nli`, `/health`) |
+| `inference/llm.py` | Provider abstraction for Groq, OpenAI, Anthropic, Ollama and OpenAI-compatible APIs |
 | `AGENTS.md` | Full tool documentation for AI agents |

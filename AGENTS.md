@@ -18,7 +18,7 @@ backed by PostgreSQL + pgvector (vector search) + Apache AGE (graph/Cypher).
               │  PostgreSQL   │      │  Inference   │
               │  + pgvector   │      │  API (:8001) │
               │  + Apache AGE │      │  Embeddings  │
-              └──────────────┘      │  + NLI (Groq)│
+              └──────────────┘      │  + NLI (LLM) │
                                     └──────────────┘
 ```
 
@@ -55,7 +55,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Maintenance & Advanced
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts per entity (Groq LLM NLI + vector neighbor pre-filter) |
+| `contradictions_report` | Detect conflicting facts per entity (LLM NLI + vector neighbor pre-filter) |
 | `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved |
 | `import_memories` | Restore JSON/JSONL; explicit ids make re-import idempotent; graph is restored from JSON exports |
 | `server_health` | Check Postgres + Inference connectivity |
@@ -117,7 +117,7 @@ Two paths, both using **vector pre-filtering** to avoid massive API calls:
 
 1. The new fact's embedding is computed (already available from step 1)
 2. **Vector pre-filter**: pgvector `<=>` finds the 15 nearest neighbors (index scan, no full-table scan)
-3. **NLI per candidate**: `/nli` (Groq LLM) checks each candidate for a real contradiction
+3. **NLI per candidate**: `/nli` (configured LLM) checks each candidate for a real contradiction
 4. At score ≥ 0.7 the old fact is automatically invalidated via `superseded_by = new_id`
 
 → **Change**: Previously `/rerank` (cross-encoder) was used, which produced false positives (semantic similarity ≠ contradiction). Endpoint and model were removed.
@@ -126,19 +126,25 @@ Two paths, both using **vector pre-filtering** to avoid massive API calls:
 
 1. All **active** facts for the entity are loaded (max 200; already superseded pairs are done and not re-checked)
 2. **Vector self-join**: for each fact, the 20 nearest neighbors are fetched via `ORDER BY embedding <=>`
-3. Only the deduplicated candidate pairs are checked via `/nli` (Groq LLM)
+3. Only the deduplicated candidate pairs are checked via `/nli` (configured LLM)
 4. Pairs with confidence > 0.7 count as a contradiction
 
-→ **Savings**: O(n²) → O(n × k) Groq calls (k=20).
+→ **Savings**: O(n²) → O(n × k) LLM calls (k=20).
 
 ### Inference Endpoints
 
 | Endpoint | Model | Usage |
 |----------|-------|-------|
 | `/embed` | `jinaai/jina-embeddings-v5-text-nano-retrieval` (local, CPU) | Vectors for `query` and `document` |
-| `/nli` | `openai/gpt-oss-20b` via Groq (external, LLM) | `_check_contradictions` + `contradictions_report` |
+| `/nli` | Configurable (Groq by default; OpenAI, Anthropic, Ollama, OpenAI-compatible) | `_check_contradictions` + `contradictions_report` |
 
-The `/nli` endpoint first tries `json_schema` + `strict: true` (Groq constrained decoding) and falls back to `json_object` on errors. Requires `max_tokens >= 200`.
+Provider selection lives in `inference/llm.py` and is controlled by
+`LLM_PROVIDER` (`groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`,
+`auto`, `none`). `LLM_MODEL`, `LLM_API_KEY` and `LLM_BASE_URL` override the
+provider defaults; `GROQ_API_KEY`/`GROQ_MODEL` remain backwards compatible.
+For OpenAI-style providers `/nli` first tries `json_schema` + `strict: true`,
+then `json_object`, then a plain request. Anthropic uses `/messages`; no
+`response_format` is sent.
 
 **Note**: The quality of contradiction detection depends heavily on the embedding model (`jina-embeddings-v5`), but that is not a problem — the model provides very good similarity values for semantically similar texts. Distracting prefixes such as `Batch-X: ` in the content should be avoided because they destroy embedding similarity. If necessary, increase `neighbors_per_fact` in `contradictions_report`.
 
@@ -197,8 +203,18 @@ With `include_superseded=true` in `recall` or `get_entity`, superseded facts can
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
-| `GROQ_API_KEY` | – | Required for `/nli`; without it NLI returns 0.0 for everything |
-| `GROQ_MODEL` | `llama-3.1-8b-instant` (compose: `openai/gpt-oss-20b`) | NLI model |
+| `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
+| `LLM_MODEL` | provider default | NLI model (empty = provider default) |
+| `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
+| `LLM_BASE_URL` | provider default | Base URL for OpenAI-compatible/Ollama endpoints |
+| `GROQ_API_KEY` | – | Groq key (backwards compatible) |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` (compose) | Groq model (backwards compatible) |
+| `OPENAI_API_KEY` | – | Used when `LLM_PROVIDER=openai` |
+| `ANTHROPIC_API_KEY` | – | Used when `LLM_PROVIDER=anthropic` |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
+
+Without a usable LLM configuration `/nli` returns `0.0` for every pair;
+`LLM_PROVIDER=none` disables it explicitly.
 
 ## Tool Parameter Reference
 
@@ -238,8 +254,8 @@ docker compose up -d postgres inference
 pip install -r mcp_server/requirements.txt
 python -m mcp_server
 
-# Full stack (all services; needs GROQ_API_KEY in .env):
-cp .env.example .env   # fill in GROQ_API_KEY
+# Full stack (all services; configure an LLM provider in .env):
+cp .env.example .env   # Groq by default; see LLM_PROVIDER for alternatives
 docker compose up -d
 
 # After changing embedding model or prompts (rebuilds both images):
