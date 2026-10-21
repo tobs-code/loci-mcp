@@ -44,6 +44,7 @@ def ensure_schema():
         except Exception:
             conn.rollback()
             cur = conn.cursor()
+        conn.commit()
     except Exception:
         conn.rollback()
         raise

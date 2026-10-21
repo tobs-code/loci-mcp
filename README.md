@@ -159,7 +159,7 @@ Then in the Claude Code MCP config:
 
 Allowed values: `fact`, `decision`, `learning`, `preference`, `pattern`,
 `incident`, `runbook`, `context`, `observation`, `convention`, `command`,
-`note`. Other values are rejected (`MEMORY_TYPES` in `server.py`).
+`note`. Other values are rejected (`MEMORY_TYPES` in `config.py`).
 
 ## Configuration
 
@@ -299,6 +299,16 @@ r = requests.post("http://localhost:8001/nli", json={
 contradiction_scores = r.json()["contradiction_scores"]
 ```
 
+## Testing
+
+Tests run against an isolated `loci_test` database (created and dropped
+automatically) and a local fake inference server, so no Groq key is needed.
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
 ## Files
 
 | File | Purpose |
@@ -307,9 +317,20 @@ contradiction_scores = r.json()["contradiction_scores"]
 | `docker-compose.yml` | Container orchestration |
 | `init.sql` | Schema + extensions + AGE graph |
 | `mcp_server/` | Python MCP server (FastMCP + pgvector + AGE) |
+| `mcp_server/server.py` | Public facade: registers the tools and starts the transports |
+| `mcp_server/app.py` | FastMCP instance and server instructions |
+| `mcp_server/config.py` | Memory types, scopes and scoring constants |
 | `mcp_server/db.py` | Schema, migrations, connection handling |
+| `mcp_server/scopes.py` | Project slugs, scope labels and per-project tables |
+| `mcp_server/scoring.py` | Decay, RRF helpers and ID/content hashing |
+| `mcp_server/storage.py` | Store, supersede, dedup, contradiction and access helpers |
+| `mcp_server/search.py` | Vector + FTS RRF search and graph boost |
+| `mcp_server/graph.py` | Apache AGE relations and traversal tools |
+| `mcp_server/backup.py` | Export/import of memories and the graph |
+| `mcp_server/tools/` | Write, read and maintenance MCP tools |
 | `mcp_server/inference_client.py` | HTTP client for `/embed`, `/nli`, `/health` |
 | `mcp_server/reembed.py` | Re-embed all memories after a model/prompt change |
+| `tests/` | Integration tests against an isolated `loci_test` database |
 | `inference/Dockerfile` | Inference service with sentence-transformers |
 | `inference/app.py` | FastAPI server (`/embed`, `/nli`, `/health`) |
 | `AGENTS.md` | Full tool documentation for AI agents |
