@@ -29,6 +29,7 @@ SCORE_FIELDS = (
     "_distance",
     "_rrf_score",
     "_rrf_norm",
+    "_relevance_score",
     "_decay_score",
     "_decay_norm",
     "_final_score",

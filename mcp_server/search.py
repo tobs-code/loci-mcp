@@ -152,6 +152,7 @@ def _search_memories_rrf(
                 seen_hashes.add(c_hash)
             d["_rrf_score"] = fused_scores.get(row_id, 0.0)
             d["_rrf_norm"] = d["_rrf_score"] / max_rrf
+            d["_relevance_score"] = d["_rrf_norm"]
             if row_id in similarities:
                 d["_similarity"] = round(similarities[row_id], 4)
                 d["_distance"] = round(1.0 - similarities[row_id], 4)

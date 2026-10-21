@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import (
@@ -293,7 +293,7 @@ def unrelate(
 
 def find_connections(
     entity_name: str | None = None,
-    direction: str = "both",
+    direction: Literal["outgoing", "incoming", "both"] = "both",
     relation_type: str | None = None,
     limit: int = 20,
     project: str | None = None,

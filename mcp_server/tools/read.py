@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from mcp_server.db import get_conn
 from mcp_server.config import DEFAULT_MIN_SIMILARITY
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 def recall(
     query: str,
-    mem_type: str | None = None,
+    mem_type: Literal["fact", "decision", "learning", "preference", "pattern", "incident", "runbook", "context", "observation", "convention", "command", "note"] | None = None,
     entity: str | None = None,
     limit: int = 10,
     project: str | None = None,
@@ -139,7 +139,7 @@ def recall(
 
 def list_memories(
     entity: str | None = None,
-    mem_type: str | None = None,
+    mem_type: Literal["fact", "decision", "learning", "preference", "pattern", "incident", "runbook", "context", "observation", "convention", "command", "note"] | None = None,
     limit: int = 20,
     project: str | None = None,
     include_superseded: bool = False,

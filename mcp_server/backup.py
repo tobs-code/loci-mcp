@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 
 from mcp_server.db import get_conn
@@ -78,7 +78,7 @@ def _export_graph(cur, project: str | None) -> dict:
 
 
 def export_memories(
-    format: str = "json",
+    format: Literal["json", "jsonl"] = "json",
     project: str | None = None,
     include_embeddings: bool = False,
     include_superseded: bool = False,
@@ -161,7 +161,7 @@ def _parse_dt(value) -> datetime | None:
 def import_memories(
     data: str | dict,
     project: str | None = None,
-    format: str = "json",
+    format: Literal["json", "jsonl"] = "json",
     skip_duplicates: bool = True,
     fuzzy_threshold: float | None = None,
 ) -> dict[str, Any]:

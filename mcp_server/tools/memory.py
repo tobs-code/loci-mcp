@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from mcp_server.config import (
     DEDUPE_MODES,
@@ -46,16 +46,16 @@ logger = logging.getLogger(__name__)
 
 def remember(
     content: str,
-    mem_type: str = "fact",
+    mem_type: Literal["fact", "decision", "learning", "preference", "pattern", "incident", "runbook", "context", "observation", "convention", "command", "note"] = "fact",
     entity: str | None = None,
     importance: float = 1.0,
     metadata: dict[str, Any] | None = None,
-    scope: str | None = None,
+    scope: Literal["global", "project"] | None = None,
     project: str | None = None,
     supersede: str | None = None,
     check_contradictions: bool = False,
     fuzzy_threshold: float | None = None,
-    dedupe: str = "exact",
+    dedupe: Literal["exact", "semantic", "off"] = "exact",
     supersede_content: str | None = None,
     supersede_last: bool = False,
 ) -> dict[str, Any]:
@@ -201,8 +201,8 @@ def remember_batch(
     skip_duplicates: bool = True,
     fuzzy_threshold: float | None = None,
     check_contradictions: bool = False,
-    scope: str | None = None,
-    dedupe: str = "exact",
+    scope: Literal["global", "project"] | None = None,
+    dedupe: Literal["exact", "semantic", "off"] = "exact",
 ) -> dict[str, Any]:
     """Store multiple facts at once. Each dict needs 'content'.
 
@@ -481,7 +481,8 @@ def forget(
     """Remove a fact by memory_id or delete an entity and all its memories.
 
     The entity can be passed as `entity` or `entity_name`.
-    When soft=True (default), marks as superseded instead of hard delete.
+    When soft=True (default), hides the memory by setting deleted_at and a
+    forgotten sentinel; it remains available only for database-level recovery.
     Without `project`, the id/entity is looked up in every table; deleting an
     entity also removes its memories from all scopes and its graph node.
     """
