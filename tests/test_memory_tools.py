@@ -108,7 +108,13 @@ def test_get_entity_returns_memories_even_without_a_graph_node():
     result = get_entity("Carol")
 
     assert result["entity"] == "Carol"
-    assert result["details"] is None
+    assert result["details"] == {
+        "id": None,
+        "name": "Carol",
+        "type": "memory-only",
+        "project": "global",
+        "connections": [],
+    }
     assert [m["id"] for m in result["memories"]] == [memory_id]
 
 

@@ -81,6 +81,14 @@ def test_graph_tools_reject_non_positive_limits():
     assert "max_hops" in find_paths("A", "B", max_hops=0)["error"]
 
 
+def test_find_connections_reports_unknown_entities_as_not_found():
+    result = find_connections("Unknown")
+
+    assert result["ok"] is False
+    assert result["status"] == "not_found"
+    assert result["entity"] == "Unknown"
+
+
 def test_find_paths_rejects_non_integer_hops():
     result = find_paths("A", "B", max_hops="many")
     assert result["ok"] is False

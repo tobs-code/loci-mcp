@@ -337,6 +337,15 @@ def find_connections(
     conn = get_conn()
     try:
         cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM entities WHERE name = %s AND project = %s LIMIT 1",
+            (entity_name, _scope_key(project)),
+        )
+        if cur.fetchone() is None:
+            conn.rollback()
+            return fail(STATUS_NOT_FOUND,
+                        f"entity not found: {entity_name}",
+                        entity=entity_name)
         cur.execute("SET search_path TO ag_catalog, public")
         cur.execute(
             f"SELECT * FROM cypher('memory_graph', $$ {query} $$) AS "

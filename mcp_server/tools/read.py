@@ -292,6 +292,14 @@ def get_entity(name: str | None = None, project: str | None = None,
         return fail(STATUS_ERROR, str(e), entity=target)
     finally:
         conn.close()
+    if entity_data is None and memories:
+        entity_data = {
+            "id": None,
+            "name": target,
+            "type": "memory-only",
+            "project": _scope_key(project),
+            "connections": [],
+        }
     if entity_data is None and not memories:
         return fail(STATUS_NOT_FOUND, f"entity not found: {target}", entity=target)
     return ok(STATUS_OK, entity=target, details=entity_data,

@@ -39,6 +39,8 @@ def test_export_jsonl_is_flat_and_has_no_graph():
     record = json.loads(lines[0])
     assert record["content"] == "Export me"
     assert "graph" not in record
+    assert exported["data_format"] == "jsonl"
+    assert exported["graph_included"] is False
 
 
 def test_import_restores_records_and_graph_into_a_new_project():
