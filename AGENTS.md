@@ -103,7 +103,8 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   `_rrf_score` keeps the raw fusion value.
 - `_similarity` is `1 - cosine distance`, i.e. 0..1 on the same scale as
   `min_similarity`. Exact matches are typically 0.75-0.9, unrelated facts
-  below ~0.3.
+  below ~0.3. `recall` defaults to `min_similarity=0.3`; pass `null` to opt
+  out.
 - `hybrid=false` bypasses RRF and uses a single retriever (vector when an
   embedding exists, otherwise FTS) — `hybrid=true` (default) is recommended.
 - `graph_boost=true` (requires `entity`) traverses one hop in the scope graph,
@@ -244,7 +245,9 @@ With `include_superseded=true` in `recall` or `get_entity`, superseded facts can
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
 
 Without a usable LLM configuration `/nli` returns `0.0` for every pair;
-`LLM_PROVIDER=none` disables it explicitly.
+contradiction tools report a warning and `nli_configured=false` instead of
+presenting that as a clean contradiction scan. `LLM_PROVIDER=none` disables
+it explicitly.
 
 ## Tool Parameter Reference
 
@@ -323,4 +326,3 @@ docker compose exec loci-mcp python -m mcp_server.reembed
   }
 }
 ```
-

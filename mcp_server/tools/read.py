@@ -3,6 +3,7 @@ import logging
 from typing import Any
 
 from mcp_server.db import get_conn
+from mcp_server.config import DEFAULT_MIN_SIMILARITY
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
 from mcp_server.projection import (
@@ -38,7 +39,7 @@ def recall(
     min_decay_score: float | None = None,
     include_superseded: bool = False,
     graph_boost: bool = False,  # Neu: Graph-Enhanced Retrieval
-    min_similarity: float | None = None,  # 0..1, filtert semantisch schwache Treffer
+    min_similarity: float | None = DEFAULT_MIN_SIMILARITY,  # 0..1
     fields: list[str] | None = None,
     only_superseded: bool = False,
 ) -> dict[str, Any]:

@@ -164,6 +164,7 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 - FTS is OR-based (`_fts_query`), weighted with `FTS_WEIGHT = 0.6` so a single
   common word cannot outrank the best semantic hit.
 - `_similarity` = `1 - cosine distance` (0..1), the same scale as `min_similarity`.
+  `recall` defaults to `min_similarity=0.3`; pass `null` to opt out.
 - Embeddings are prompt-aware: queries use `mode="query"`, stored content uses
   `mode="document"`. After changing the model or prompts, re-embed:
   `docker compose exec loci-mcp python -m mcp_server.reembed`.

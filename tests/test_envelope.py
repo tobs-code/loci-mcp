@@ -7,7 +7,7 @@ plus, for tools that return a collection:
   {"count": int, "results": [...]}
 """
 
-from mcp_server.server import forget, remember, remember_batch, update_memory
+from mcp_server.server import forget, relate, remember, remember_batch, update_memory
 
 
 def test_remember_answers_with_the_envelope():
@@ -100,3 +100,13 @@ def test_forget_reports_an_unknown_id_as_not_found():
     assert result["ok"] is False
     assert result["status"] == "not_found"
     assert result["error"] == "NOT FOUND: missing-id"
+
+
+def test_forget_entity_reports_the_actual_relation_count():
+    relate("Relation count source", "Relation count target one", "KNOWS")
+    relate("Relation count source", "Relation count target two", "USES")
+
+    result = forget(entity="Relation count source", soft=True)
+
+    assert result["ok"] is True
+    assert result["counts"]["relations"] == 2

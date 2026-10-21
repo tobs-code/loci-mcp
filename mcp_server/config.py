@@ -32,6 +32,10 @@ FTS_WEIGHT = 0.6
 DEFAULT_DUPLICATE_THRESHOLD = 0.9
 
 
+# Avoid returning clearly unrelated vector hits unless callers opt out.
+DEFAULT_MIN_SIMILARITY = 0.3
+
+
 # Dedupe modes for remember/remember_batch.
 DEDUPE_MODES = {"exact", "semantic", "off"}
 

@@ -22,6 +22,7 @@ from mcp_server.envelope import (
     ok,
 )
 from mcp_server.inference_client import embed
+from mcp_server.inference_client import nli_configured
 from mcp_server.scopes import (
     _all_mem_tables,
     _ensure_project_table,
@@ -117,7 +118,8 @@ def remember(
                       warnings=["memory already exists; nothing stored"])
 
         contradictions = []
-        if check_contradictions and entity:
+        nli_unavailable = check_contradictions and nli_configured() is False
+        if check_contradictions and entity and not nli_unavailable:
             contradictions = _check_contradictions(
                 cur, content, entity, store_project, emb
             )
@@ -151,12 +153,14 @@ def remember(
         warnings: list[str] = []
         if check_contradictions and entity and contradictions:
             warnings.append(
-                f"superseded {len(contradictions)} contradicting memory/factories"
+                f"superseded {len(contradictions)} contradicting memory/facts"
             )
+        elif nli_unavailable:
+            warnings.append("contradiction check skipped: NLI provider is not configured")
         elif check_contradictions and not entity:
             warnings.append("contradiction check skipped: entity required")
         if superseded and not check_contradictions:
-            warnings.append(f"superseded {len(superseded)} memory/factories")
+            warnings.append(f"superseded {len(superseded)} memory/facts")
         payload: dict[str, Any] = {"superseded": superseded}
         if check_contradictions:
             payload["contradictions"] = {"found": bool(contradictions),
@@ -522,7 +526,8 @@ def forget(
                     "WHERE source_id = ANY(%s) OR target_id = ANY(%s)",
                     (entity_ids, entity_ids),
                 )
-                counts["relations"] = cur.rowcount
+                relation_count = cur.fetchone()
+                counts["relations"] = relation_count[0] if relation_count else 0
             if project:
                 label = _scope_label(project)
                 cur.execute(

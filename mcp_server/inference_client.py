@@ -40,8 +40,22 @@ def nli(query: str, documents: list[str]) -> list[float]:
 
 
 def health() -> bool:
+    return health_details() is not None
+
+
+def health_details() -> dict | None:
     try:
         resp = _get_session().get(f"{INFERENCE_URL}/health", timeout=5)
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        return payload if isinstance(payload, dict) else {}
     except requests.RequestException:
-        return False
+        return None
+
+
+def nli_configured() -> bool | None:
+    details = health_details()
+    if details is None or "llm_configured" not in details:
+        return None
+    return bool(details["llm_configured"])

@@ -4,7 +4,7 @@ from typing import Any
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
-from mcp_server.inference_client import health as _inference_health, nli
+from mcp_server.inference_client import health as _inference_health, health_details, nli
 from mcp_server.scopes import (
     _all_mem_tables,
     _count_entities,
@@ -18,18 +18,6 @@ logger = logging.getLogger(__name__)
 
 def contradictions_report(entity: str | None = None,
                          project: str | None = None,
-                         limit: int = 20) -> list[dict]:
-    """Find potentially conflicting facts stored for the same entity.
-
-    Uses vector similarity to find candidate pairs, then NLI to confirm.
-    Returns pairs with confidence scores in [0, 1] (higher = more likely contradictory).
-    """
-    logger.info("contradictions_report entity=%s limit=%s", entity, limit)
-    project = _norm_project(project)
-    if not entity:
-        return [{"error": "entity parameter is required. contradictions_report works on one entity at a time."}]
-def contradictions_report(entity: str | None = None,
-                         project: str | None = None,
                          limit: int = 20) -> dict[str, Any]:
     """Find potentially conflicting facts stored for the same entity.
 
@@ -41,6 +29,11 @@ def contradictions_report(entity: str | None = None,
     if not entity:
         return fail(STATUS_ERROR, "entity parameter is required. "
                                    "contradictions_report works on one entity at a time.")
+    inference = health_details()
+    if inference is not None and inference.get("llm_configured") is False:
+        return ok(STATUS_OK, count=0, results=[], warnings=[
+            "contradiction check skipped: NLI provider is not configured"
+        ], nli_configured=False)
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -118,7 +111,15 @@ def server_health() -> dict[str, Any]:
         conn.close()
     except Exception:
         pass
-    return ok(STATUS_OK, postgres=pg_ok, inference=_health_check())
+    inference_details = health_details()
+    return ok(
+        STATUS_OK,
+        postgres=pg_ok,
+        inference=inference_details is not None,
+        nli_configured=(inference_details.get("llm_configured")
+                        if inference_details is not None
+                        and "llm_configured" in inference_details else None),
+    )
 
 
 def stats_resource() -> str:

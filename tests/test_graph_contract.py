@@ -109,6 +109,7 @@ def test_server_health_answers_with_the_envelope():
     assert result["ok"] is True
     assert result["postgres"] is True
     assert result["inference"] is True
+    assert "nli_configured" in result
 
 
 def test_export_answers_with_the_envelope_and_round_trips_through_import():
