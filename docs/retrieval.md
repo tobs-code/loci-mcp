@@ -48,8 +48,10 @@ look like a successful search.
 
 `recall` searches the project table (if `project` is set) **and** the global
 `memories` table, so global facts remain visible inside a project. Project
-hits receive a small scope tie-breaker (`_scope_boost`, 0.05). When the same
-content exists in both scopes, the project copy wins.
+hits receive a small scope tie-breaker (`_scope_boost`, up to 0.05,
+compressed with the relevance: `0.05 × (1 − relevance)`, so a strong hit stays
+below 1.0 and comparable). When the same content exists in
+both scopes, the project copy wins.
 
 ## Score fields
 
@@ -59,7 +61,7 @@ content exists in both scopes, the project copy wins.
 | `_distance` | Raw cosine distance to the query. |
 | `_text_score` | Normalized rank of the full-text hit (1.0 = best). |
 | `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. |
-| `_scope_boost` | The 0.05 that a project row gets on top of `_relevance_score`. |
+| `_scope_boost` | The compressed boost a project row gets on top of `_relevance_score`: `0.05 × (1 − relevance)`, at most 0.05 for a weak hit. |
 | `_rrf_score` / `_rrf_norm` | Raw RRF fusion value and its normalized form. |
 | `_decay_score` / `_decay_norm` | Raw decay value (uncapped) and the normalized 0..1 score. |
 | `_final_score` | The ranking score in 0..1: relevance blended with decay plus the graph boost. Only present with `include_decay=true` or `graph_boost=true`. |

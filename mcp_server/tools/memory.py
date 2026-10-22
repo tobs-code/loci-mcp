@@ -356,7 +356,12 @@ def remember(
             warnings.append("contradiction check skipped: NLI provider is not configured")
         elif contradiction_skip:
             warnings.append(f"contradiction check skipped: {contradiction_skip}")
-        elif check_contradictions and not entity:
+        if check_contradictions and not entity and not nli_unavailable \
+                and not contradiction_skip and not contradictions:
+            # Independent of the block above: even a clean scan must say that
+            # it compared the fact against nearest memories across all
+            # entities when no entity was set. Hiding it behind `elif` made
+            # the broader comparison silent.
             warnings.append(
                 "no entity set: the contradiction check compared the fact "
                 "against the nearest memories across all entities")
@@ -870,7 +875,10 @@ def restore_memory(
     that: it clears `deleted_at` (and the forgotten sentinel) so the memory is
     visible to `recall`/`list_memories` again. Only soft-forgotten memories can
     be restored; hard-deleted rows and active memories are reported as
-    `not_found`.
+    `not_found`. A memory that was superseded before it was forgotten keeps
+    `superseded_by`: the restore clears the forgotten sentinel, never the
+    invalidation - it cannot resurrect an old fact next to the one that
+    replaced it.
 
     Without `project` the id is looked up in every scope. An id that exists in
     several scopes is refused; pass `project` to select one.
@@ -904,10 +912,14 @@ def restore_memory(
         restored = 0
         restored_table = None
         for table in tables:
+            # NULLIF clears only the forgotten sentinel; a `superseded_by` id
+            # from a real supersede stays set, so a restored memory cannot
+            # resurrect next to the fact that replaced it.
             cur.execute(
-                f"UPDATE {table} SET deleted_at = NULL, superseded_by = NULL, "
+                f"UPDATE {table} SET deleted_at = NULL, "
+                f"superseded_by = NULLIF(superseded_by, %s), "
                 f"updated_at = NOW() WHERE id = %s AND deleted_at IS NOT NULL",
-                (memory_id,),
+                (SENTINEL_FORGOTTEN, memory_id),
             )
             if cur.rowcount:
                 restored += cur.rowcount
@@ -1024,8 +1036,8 @@ def forget(
                         counts["memories"] += cur.fetchone()[0]
                     else:
                         cur.execute(
-                            f"UPDATE {table} SET superseded_by = %s, deleted_at = NOW() "
-                            f"WHERE id = %s AND deleted_at IS NULL",
+                            f"UPDATE {table} SET superseded_by = COALESCE(superseded_by, %s), "
+                            f"deleted_at = NOW() WHERE id = %s AND deleted_at IS NULL",
                             (SENTINEL_FORGOTTEN, memory_id),
                         )
                         counts["memories"] += cur.rowcount
@@ -1060,7 +1072,8 @@ def forget(
                         cur.execute(f"SELECT COUNT(*) FROM {table} {where}")
                         counts["memories"] += cur.fetchone()[0]
                     elif soft:
-                        cur.execute(f"UPDATE {table} SET superseded_by = %s, "
+                        cur.execute(f"UPDATE {table} SET "
+                                    f"superseded_by = COALESCE(superseded_by, %s), "
                                     f"deleted_at = NOW() WHERE deleted_at IS NULL",
                                     (SENTINEL_FORGOTTEN,))
                         counts["memories"] += cur.rowcount
@@ -1096,8 +1109,13 @@ def forget(
                     STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED)
                 return ok(status, id=None, entity="*", project=scope_name,
                           counts=counts, dry_run=dry_run,
-                          message=(f"{'Would remove' if dry_run else 'Removed'} "
-                                   f"all memories of {scope_name}"))
+                          message=(
+                              f"{'Would remove' if dry_run else 'Soft-forgotten' if soft else 'Deleted'} "
+                              f"all memories of {scope_name}"
+                              + (" (rows stay recoverable with "
+                                 "restore_memory; use drop_project to remove "
+                                 "the scope completely)" if soft and not dry_run else "")
+                          ))
             # The scope filter must match the delete path exactly: without a
             # project the entity is removed from *every* scope, so the preview
             # has to count every scope as well. Otherwise `dry_run` reports
@@ -1155,9 +1173,11 @@ def forget(
                                 (entity_name,))
                     counts["memories"] += cur.fetchone()[0]
                 elif soft:
-                    cur.execute(f"UPDATE {tbl} SET superseded_by = %s, deleted_at = NOW() "
+                    cur.execute(f"UPDATE {tbl} SET "
+                                f"superseded_by = COALESCE(superseded_by, %s), "
+                                f"deleted_at = NOW() "
                                 f"WHERE entity = %s AND deleted_at IS NULL",
-                               (SENTINEL_FORGOTTEN, entity_name))
+                                (SENTINEL_FORGOTTEN, entity_name))
                     counts["memories"] += cur.rowcount
                 else:
                     cur.execute(f"DELETE FROM {tbl} WHERE entity = %s", (entity_name,))
@@ -1175,7 +1195,8 @@ def forget(
 
                 elif soft:
                     cur.execute(
-                        f"UPDATE {tbl} SET superseded_by = %s, deleted_at = NOW() "
+                        f"UPDATE {tbl} SET superseded_by = COALESCE(superseded_by, %s), "
+                        f"deleted_at = NOW() "
                         f"WHERE deleted_at IS NULL AND {relation_context_filter}",
                         (SENTINEL_FORGOTTEN, entity_name, entity_name),
                     )

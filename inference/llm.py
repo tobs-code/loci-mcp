@@ -311,17 +311,22 @@ def classify(config: LLMConfig, query: str, document: str,
         url, headers, body = build_chat_request(
             config, system, user, response_format,
         )
-        try:
-            resp = requests.post(url, headers=headers, json=body, timeout=60)
-            if resp.status_code >= 400:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                continue
-            parsed = parse_nli_json(extract_text(config, resp.json()))
-            if parsed is None:
-                last_error = "response was not valid NLI JSON"
-                continue
-            return nli_score(parsed)
-        except Exception as exc:
-            last_error = exc
-            continue
+        # The response format is deterministic, the provider answer is not:
+        # an occasional non-JSON reply (rate-limit page, truncated decode)
+        # is retried with the same format before falling back to the next
+        # one, so a transient hiccup does not fail the comparison.
+        for retry in range(3):
+            try:
+                resp = requests.post(url, headers=headers, json=body, timeout=60)
+                if resp.status_code >= 400:
+                    last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    break
+                parsed = parse_nli_json(extract_text(config, resp.json()))
+                if parsed is None:
+                    last_error = "response was not valid NLI JSON"
+                    continue
+                return nli_score(parsed)
+            except Exception as exc:
+                last_error = exc
+                break
     raise RuntimeError(f"LLM request failed: {last_error}")

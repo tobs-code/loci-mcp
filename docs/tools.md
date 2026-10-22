@@ -126,10 +126,10 @@ memory is visible to `recall`/`list_memories` again. Find the id with
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted`, `include_relation_context` |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `fields`, `limit`, `offset` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"`; synthetic `<from>_<relation>_<to>` entities are hidden |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global`; `project="*"` lists every scope |
 | `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
@@ -156,6 +156,7 @@ The search tool. `query` is required and non-empty.
 | `fields` | list? | Only return these columns, e.g. `["id", "content"]`. |
 | `updated_after` | string? | Only memories changed at or after this ISO date. |
 | `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. |
+| `include_relation_context` | bool | True (default) includes the relation-context sentences of graph edges; False hides them. |
 | `offset` | int | Skip this many ranked hits (default 0). The answer reports `has_more` and `next_offset`. |
 
 The answer reports `candidates` (the hits that made it into the ranking),
@@ -183,7 +184,9 @@ answer reports `total`, `has_more` and `next_offset`. `include_deleted=true`
 lists soft-forgotten rows and includes their `deleted_at`, which is how an agent
 finds an id for `restore_memory`. Forgotten rows carry the machine-readable
 `forgotten: true` flag; the `__forgotten__` sentinel is removed from
-`superseded_by` in those rows (it was overwriting the real value).
+`superseded_by` in those rows (it was overwriting the real value). Superseded
+history stays hidden unless `include_superseded=true` is also passed - the two
+flags are orthogonal.
 
 Without `project` every scope is listed; `project="global"` lists only the
 shared scope. `include_relation_context=false` hides the relation-context
@@ -194,8 +197,9 @@ sentences of the graph edges, which repeat what the edge already says.
 `entity` (`name` is kept as alias), `project`, `include_global`,
 `include_superseded`, `fields`, `limit` (default 100), `offset`.
 Memory-only entities have no graph node;
-`details.type` is then `memory-only`. A missing entity answers with
-`status: "not_found"`. The `memories` list is sorted by `updated_at`
+`details.type` is then `memory-only`; a graph node's `details.type` is `graph`
+with the raw AGE label of its scope in `details.label`. A missing entity
+answers with `status: "not_found"`. The `memories` list is sorted by `updated_at`
 descending, newest change first. It also contains the relation-context
 sentences of the entity's edges - they are stored under the synthetic entity
 `<from>_<relation>_<to>`, so without this they would not show up here at all.
@@ -208,10 +212,12 @@ and a truncated answer says so in `warnings` instead of looking complete.
 sorted by name, so `offset` is stable. Synthetic relation-context entities
 (`A_KNOWS_B`) are hidden unless the name also carries a real memory.
 
-`entity_type` selects one kind of entity: a graph node (whose type is the AGE
-label of its scope - `Entity` for the shared scope, `Project_<suffix>` for a
-project) or a memory-only entity (`memory-only`). `count` and `total` always
-agree, and an entity that has a graph node is never reported as memory-only.
+`entity_type` selects one kind of entity: `graph` (every graph node),
+`memory-only`, or a raw AGE label (`Entity` for the shared scope,
+`Project_<suffix>` for a project) for exactly one scope's nodes. The `type`
+column is user-facing: `graph` with the raw AGE label in `label`, or
+`memory-only`. `count` and `total` always agree, and an entity that has a
+graph node is never reported as memory-only.
 
 ### `init_context`
 

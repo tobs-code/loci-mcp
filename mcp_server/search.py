@@ -101,6 +101,7 @@ def _search_memories_rrf(
     tables: list[str] | None = None,
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
+    exclude_relation_context: bool = False,
     stats: dict[str, Any] | None = None,
 ) -> list[dict]:
     """
@@ -128,6 +129,11 @@ def _search_memories_rrf(
     fts_lexemes: list[str] = _fts_lexemes(cur, query_text)
     extra_conditions, extra_params = _extra_conditions(updated_after,
                                                         metadata_filter)
+    if exclude_relation_context:
+        # The relation-context sentences repeat what the graph edge already
+        # says; leave them out of a recall ranking when asked to.
+        extra_conditions = extra_conditions + [
+            "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
 
     # (score, id, table) tuples, merged across tables before ranking
     vec_candidates: list[tuple[float, str, str]] = []
@@ -291,10 +297,14 @@ def _search_memories_rrf(
                                          text_scores.get(row_id, 0.0))
             # A project-scoped row wins over an identical global one: the
             # global scope is the fallback, not an equal peer. The boost is
-            # published as `_scope_boost` so the ranking stays explainable.
+            # compressed towards 1 instead of added and clamped, so strong
+            # hits stay comparable (0.97 vs 1.0 instead of flat 1.0) and the
+            # value remains inside the documented 0..1 range. Published as
+            # `_scope_boost` so the ranking stays explainable.
             if table != "memories":
-                relevance = min(1.0, relevance + PROJECT_SCOPE_BOOST)
-                d["_scope_boost"] = PROJECT_SCOPE_BOOST
+                effective_boost = round(PROJECT_SCOPE_BOOST * (1.0 - relevance), 4)
+                relevance = relevance + effective_boost
+                d["_scope_boost"] = effective_boost
             d["_relevance_score"] = round(relevance, 4)
             if not include_embedding:
                 d.pop("embedding", None)
@@ -351,6 +361,7 @@ def _search_memories(
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
     recent_first: bool = False,
+    exclude_relation_context: bool = False,
     stats: dict[str, Any] | None = None,
 ) -> list[dict]:
     """
@@ -366,7 +377,8 @@ def _search_memories(
             cur, query_embedding, query_text, mem_type, entity, limit, project,
             include_decay, include_embedding, include_superseded, min_similarity,
             tables=tables, updated_after=updated_after,
-            metadata_filter=metadata_filter, stats=stats,
+            metadata_filter=metadata_filter,
+            exclude_relation_context=exclude_relation_context, stats=stats,
         )
 
     # Legacy fallback for individual retrievers
@@ -380,6 +392,9 @@ def _search_memories(
     fts_lexemes: list[str] = _fts_lexemes(cur, query_text)
     extra_conditions, extra_params = _extra_conditions(updated_after,
                                                         metadata_filter)
+    if exclude_relation_context:
+        extra_conditions = extra_conditions + [
+            "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
 
     rows: list[dict] = []
     seen_hashes: set[str] = set()
@@ -537,6 +552,7 @@ def _search_memories_graph_boost(
     include_global: bool = True,
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
+    exclude_relation_context: bool = False,
     all_projects: bool = False,
 ) -> list[dict]:
     """
@@ -591,6 +607,10 @@ def _search_memories_graph_boost(
         # 2. Fetch memories of connected entities
         extra_conditions, extra_params = _extra_conditions(updated_after,
                                                             metadata_filter)
+        if exclude_relation_context:
+            extra_conditions = extra_conditions + [
+                "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
+        extra_sql = "" if not extra_conditions else " AND " + " AND ".join(extra_conditions)
         existing_ids = {r["id"] for r in existing_results}
         project_names = _project_names(cur)
         for entity_name, weight in graph_entities:
@@ -598,8 +618,7 @@ def _search_memories_graph_boost(
                 cur.execute(
                     f"SELECT * FROM {table} "
                     f"WHERE entity = %s AND superseded_by IS NULL AND deleted_at IS NULL"
-                    + ("" if not extra_conditions
-                       else " AND " + " AND ".join(extra_conditions))
+                    + extra_sql
                     + " LIMIT 5",
                     [entity_name] + extra_params,
                 )

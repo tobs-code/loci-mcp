@@ -260,7 +260,10 @@ def test_recall_publishes_the_scope_boost():
     result = recall("boost contract", project="beta", limit=5)
 
     hit = next(r for r in result["results"] if r["content"].startswith("Boost"))
-    assert hit["_scope_boost"] == 0.05
+    # The boost is compressed towards 1 with the relevance, so it stays in
+    # (0, 0.05] instead of saturating every strong hit at relevance 1.0.
+    assert 0.0 < hit["_scope_boost"] <= 0.05
+    assert hit["_relevance_score"] <= 1.0
 
 
 # --- messages that must not mislead -------------------------------------

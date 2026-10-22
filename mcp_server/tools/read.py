@@ -161,6 +161,12 @@ def recall(
         dict[str, Any] | None,
         Field(description="Only memories whose metadata contains these "
                           "key/value pairs, e.g. {'ticket': 'QA-1'}.")] = None,
+    include_relation_context: Annotated[
+        bool,
+        Field(description="True (default) includes the relation-context "
+                          "sentences of graph edges (entity "
+                          "'<from>_<relation>_<to>'); False hides them from "
+                          "the ranking.")] = True,
 ) -> dict[str, Any]:
     """Search memories using hybrid vector + fulltext search (RRF fusion).
 
@@ -195,6 +201,8 @@ def recall(
     Set fields=["id", "content"] to receive only the named columns.
     Set include_global=False to restrict a project search to project memories.
     `updated_after` and `metadata_filter` narrow the result set.
+    include_relation_context=False hides the relation-context sentences of
+    the graph edges from the ranking (they repeat what the edge already says).
     `offset` pages through the ranked results (with `limit`); the response
     reports `has_more` and `next_offset`.
     `project="*"` searches every scope at once. A project that does not
@@ -205,11 +213,16 @@ def recall(
                 query[:80], entity, hybrid, include_decay, graph_boost, min_similarity)
     # "*" means every scope. It is resolved before the project name is
     # normalized, otherwise it would become a project called "*".
+    # The raw value tells explicit scope intent apart from the default: an
+    # explicitly requested single scope must not produce a warning that
+    # suggests searching the other scopes.
+    raw_project = project
     all_projects = project == "*"
     try:
         project = None if all_projects else _norm_project(project)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
+    explicit_scope = bool(raw_project and str(raw_project).strip())
     warnings: list[str] = []
     if not query or not query.strip():
         return fail(STATUS_ERROR, "query must not be empty")
@@ -277,6 +290,7 @@ def recall(
             min_similarity=min_similarity,
             hybrid=hybrid, tables=tables,
             updated_after=updated_after, metadata_filter=metadata_filter,
+            exclude_relation_context=not include_relation_context,
             stats=stats,
         )
 
@@ -286,6 +300,7 @@ def recall(
                 results, boost_entity, fetch_limit, project, include_decay,
                 include_global=include_global,
                 updated_after=updated_after, metadata_filter=metadata_filter,
+                exclude_relation_context=not include_relation_context,
                 all_projects=all_projects,
             )
             if results and all(r.get("_relevance_score") is None
@@ -392,7 +407,11 @@ def recall(
             )
         else:
             warnings.append("no results: nothing in this scope matches the query")
-        if other_scopes:
+        # Scope transparency: a caller who never named a project (and did not
+        # switch globals off) must learn that other scopes exist. An
+        # explicitly requested scope is no warning: the isolation was the
+        # intent, and "use project='*'" would contradict it.
+        if other_scopes and not explicit_scope and include_global:
             warnings.append(
                 f"only the scope(s) {', '.join(scopes_searched)} were searched; "
                 f"other scopes exist ({', '.join(other_scopes)}) - use "
@@ -483,7 +502,8 @@ def list_memories(
         bool,
         Field(description="Also list soft-forgotten memories (recognizable by "
                           "a non-null `deleted_at`). Use it before "
-                          "`restore_memory`.")] = False,
+                          "`restore_memory`. Superseded history stays hidden "
+                          "unless `include_superseded` is also set.")] = False,
     include_relation_context: Annotated[
         bool,
         Field(description="True (default) also lists the relation-context "
@@ -502,7 +522,9 @@ def list_memories(
     changes the sorting and `contains` filters on a literal substring of the
     content. `offset` pages through a scope that has more matches than
     `limit`. Pass `memory_id` for a direct id lookup and `include_deleted=True`
-    to include soft-forgotten memories (they carry `deleted_at`).
+    to include soft-forgotten memories (they carry `deleted_at`); superseded
+    history stays hidden unless `include_superseded=True` is also passed —
+    the two flags are orthogonal.
     `include_relation_context=False` hides the relation-context sentences of
     the graph edges. A project that does not exist is reported in `warnings`:
     the browse then only covered the global scope.
@@ -561,9 +583,14 @@ def list_memories(
             tables = [table for table in tables if table != "memories"]
         conditions: list[str] = []
         params: list[Any] = []
-        if include_deleted:
-            # Everything, including superseded history and forgotten rows.
+        if include_deleted and include_superseded:
+            # Everything: superseded history and forgotten rows.
             conditions.append("TRUE")
+        elif include_deleted:
+            # Active rows plus the forgotten ones (the ids a restore needs).
+            # Superseded history stays hidden unless `include_superseded`
+            # asks for it: the two flags are orthogonal.
+            conditions.append("(deleted_at IS NOT NULL OR superseded_by IS NULL)")
         elif include_superseded:
             conditions.append("deleted_at IS NULL")
         else:
@@ -767,6 +794,8 @@ def get_entity(name: Annotated[
 
     The entity can be passed as `entity` or `name`.
     Memory-only entities have no graph node; `details.type` is `memory-only`.
+    A graph node's `details.type` is `graph` with the raw AGE label of its
+    scope in `details.label`.
     Set fields=["id", "content"] to receive only the named memory columns.
     Set include_global=False to restrict a project lookup to project memories.
     The relation-context sentences of the entity's edges are included, even
@@ -834,8 +863,9 @@ def get_entity(name: Annotated[
             if cur.fetchone():
                 row = (None, target, label, scope)
         if row:
-            entity_data = {"id": row[0], "name": row[1], "type": row[2],
-                           "project": row[3], "connections": []}
+            entity_data = {"id": row[0], "name": row[1], "type": "graph",
+                           "label": row[2], "project": row[3],
+                           "connections": []}
             # also query AGE for graph neighbors (same scope label)
             label = _scope_label(project)
             cur.execute("SET search_path TO ag_catalog, public")
@@ -891,13 +921,11 @@ def get_entity(name: Annotated[
 def list_entities(
     entity_type: Annotated[
         str | None,
-        Field(description="Only list entities of this graph type. The graph "
-                          "type of a scope is its AGE label: 'Entity' for the "
-                          "shared scope, 'Project_<suffix>' for a project "
-                          "(the suffix is visible in the `type` column of an "
-                          "unfiltered listing). Memory-only entities have the "
-                          "type 'memory-only' - ask for that type to list "
-                          "only them.")] = None,
+        Field(description="Only list entities of this kind. 'graph' selects "
+                          "every graph node, 'memory-only' only the entities "
+                          "without a graph node; a raw AGE label (e.g. "
+                          "'Project_loci_test_c602412f') selects exactly that "
+                          "scope's nodes. Without it both kinds are listed.")] = None,
     limit: Annotated[
         int,
         Field(description="Maximum number of results (default 50).")] = 50,
@@ -922,13 +950,15 @@ def list_entities(
     listed by default; set `include_global=False` for strict project
     isolation. Without `project` every scope is listed; `project="global"`
     lists only the shared scope. Each row carries its `project`; `graph_node`
-    is false for memory-only entities. Synthetic relation-context entities
+    is false for memory-only entities. The `type` column says which kind an
+    entity is: 'graph' (with the raw AGE label of its scope in `label`) or
+    'memory-only'. Synthetic relation-context entities
     (`<from>_<relation>_<to>`) are not listed. The list is
     sorted by name; `offset` pages through it.
     `count` and `total` always agree: an entity that has a graph node is
     reported as such even when `entity_type` hides that node.
-    `entity_type` selects one kind of entity: a graph node or a memory-only
-    entity. Without it both are listed.
+    `entity_type` selects one kind of entity: 'graph', 'memory-only', or a
+    raw AGE label for one scope's nodes. Without it both kinds are listed.
     A project that does not exist is reported in `warnings`: the browse then
     only covered the global scope.
     """
@@ -988,22 +1018,36 @@ def list_entities(
 
         conditions = list(scope_conditions)
         params = list(scope_params)
-        if entity_type:
+        # The type filter selects one kind of entity: "graph" selects every
+        # graph node, "memory-only" only the entities without one, and a raw
+        # AGE label (e.g. "Project_loci_test_x1") selects exactly that scope's
+        # nodes - the old, label-based filter stays accepted.
+        if entity_type and entity_type not in ("graph", "memory-only"):
             conditions.append("type = %s")
             params.append(entity_type)
         where = " AND ".join(conditions)
-        cur.execute(f"SELECT COUNT(*) FROM entities WHERE {where}", params)
-        total = cur.fetchone()[0]
         # No LIMIT here: `count` and `total` must agree, and the memory-only
         # entities below are loaded in full anyway. The window is cut after
         # the sort.
+        if entity_type == "memory-only":
+            # The graph rows above are cut, so `total` must not count them:
+            # the memory-only counts below are the whole total then.
+            total = 0
+        else:
+            cur.execute(f"SELECT COUNT(*) FROM entities WHERE {where}", params)
+            total = cur.fetchone()[0]
         cur.execute(
             f"SELECT id, name, type, project FROM entities "
             f"WHERE {where} ORDER BY name",
             params,
         )
-        rows = [{"id": r[0], "name": r[1], "type": r[2], "project": r[3],
-                 "graph_node": True} for r in cur.fetchall()]
+        rows = [{"id": r[0], "name": r[1], "type": "graph", "label": r[2],
+                 "project": r[3], "graph_node": True} for r in cur.fetchall()]
+        if entity_type == "memory-only":
+            # A raw label filter restricted the graph rows above; the
+            # "memory-only" kind has no SQL label, so the graph rows are cut
+            # here and only the memory-only entities below stay listed.
+            rows = []
 
         seen = {(r["name"], r["project"]) for r in rows}
         # The type filter selects one kind of entity: a graph node carries
@@ -1045,7 +1089,8 @@ def list_entities(
                 # Memory-only entity: same row shape as a graph node, so an
                 # agent never has to guess which keys exist.
                 rows.append({"id": None, "name": ent, "type": "memory-only",
-                             "project": scope, "graph_node": False})
+                             "label": None, "project": scope,
+                             "graph_node": False})
         conn.commit()
     except Exception as e:
         conn.rollback()
