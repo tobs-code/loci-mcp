@@ -60,8 +60,8 @@ validation error.
 ### Write
 | Tool | Description |
 |------|-------------|
-| `remember` | Store a fact/decision/learning with auto-embedding, dedup mode (`dedupe`), supersede variants (`supersede`, `supersede_content`, `supersede_last`), optional contradiction check; the answer names the `scope`/`project` it wrote to |
-| `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, `dedupe`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`, optional `check_contradictions`; every entry names its `scope`/`project` |
+| `remember` | Store a fact/decision/learning with auto-embedding, dedup mode (`dedupe`), supersede variants (`supersede`, `supersede_content`, `supersede_last` with scope-wide fallback), `auto_supersede_near_duplicate`, optional contradiction check, optional TTL (`expires_at`, ISO 8601); the answer names the `scope`/`project` it wrote to |
+| `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, `dedupe`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`/`expires_at`, optional `check_contradictions`; every entry names its `scope`/`project` |
 | `update_memory` | Update content, importance, metadata, entity or type (re-embeds on content change); a content change is refused as `duplicate` when it would duplicate another active memory (`dedupe`, `fuzzy_threshold`) |
 | `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`, `dedupe`, `fuzzy_threshold`; invalid/unknown/duplicate entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete by `memory_id`, `memory_ids` or entity; `entity` also removes the graph node and that scope's memories; `entity="*"` empties a whole project (soft by default: recoverable rows, the scope itself survives - `drop_project` removes the scope completely); `dry_run` previews exactly what the real call removes; `counts` reports memories/entities/relations separately |
@@ -276,6 +276,16 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   so a silent fork or a reworded duplicate is visible. The check is skipped
   with `dedupe="off"` (that mode explicitly asks for every write to land).
   A one-word change (0.857 for the fake test embedding) lands in this window.
+- With `auto_supersede_near_duplicate=true` the near-duplicate is not warned
+  about but replaced: the new memory takes over and the old one is listed in
+  `superseded` (warning `auto-supersede: replaced near-duplicate ...`). In
+  `remember_batch` the flag is per-fact and also works under
+  `dedupe="off"`.
+- `supersede_last` resolves the best match **of the entity**; without an
+  entity it falls back to the best-matching active memory of the whole scope.
+  The entity path replaces from similarity 0.5 on, the scope-wide fallback is
+  stricter (0.75, i.e. the near-duplicate floor) because the target may
+  belong to another entity. A skipped or scope-wide resolve is always warned.
 - A cross-scope supersede is named, never silent: when a project write
   invalidates a fact of the shared `memories` table (the contradiction check,
   or an explicit `supersede` of a global id), the fact disappears from
@@ -316,6 +326,20 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   `min_decay_score=0.9` keeps fresh, important facts. The filter runs before
   the access counters of the current query are counted.
 - `_decay_score` keeps the raw value (uncapped, can exceed 1.0)
+
+# TTL (`expires_at`)
+
+- `remember` and `remember_batch` (per fact) accept `expires_at` (ISO 8601,
+  e.g. '2027-01-15' or '2026-10-25T12:00:00Z'); an invalid value is a named
+  argument error, never a silent no-TTL write.
+- An expired row is not an active memory anymore: it disappears from
+  `recall`/`list_memories`/`get_entity`/`contradictions_report`, is no
+  duplicate candidate for a re-store, and is skipped by the dedupe,
+  supersede-pool and near-duplicate checks (pooled in `ACTIVE_ROW_SQL`).
+- Expired rows are NOT deleted: the row keeps its data (`expires_at`
+  visible in read outputs) until it is removed with `forget` or superseded.
+  `export_memories` still exports them (a backup never loses rows), and
+  they do not resurface through reads on their own.
 
 ## Contradiction Detection
 
@@ -390,7 +414,14 @@ when their attribute values differ ("staging API on port 9443" vs "inference
 service on port 8001" was 0.95 under an earlier prompt that attributed every
 field difference to one subject). The `/nli` contract carries optional
 `query_entity`/`document_entities` labels that both contradiction paths send;
-mismatched labels add a "likely different subjects" hint to the user prompt.
+mismatched labels add a hint to the user prompt to first verify that the texts
+name the same concrete item — since the prompt widening of Oct 2026 the hint no
+longer pushes toward neutral: when both texts plainly discuss the same named
+item (same feature, plan, ticket, service), a differing date/number or a direct
+negation is still a contradiction ("FeatureX cannot release before 2027" vs
+"FeatureX ships December 2026" under labels `ReleasePlan`/`Roadmap` was 0.0
+before and is 0.95 now). Facts about genuinely different subjects (staging API
+vs inference service) stay neutral.
 Earlier prompts judged "deploys to staging" vs "deploys to production" as
 neutral (both could be true) — the widened prompt detects that once the
 subject is shared. Near-identical wording alone does not make two facts the
@@ -546,8 +577,8 @@ warning. Write tools keep the fact and warn
 | `init_context` | `project` (`"*"` = every scope), `include_global`, `detail`, `limit` | every memory reports its `project`; the list holds the most recently changed memories; `projects` names every covered scope (including `"global"`); `graph_entities_count` counts the covered scopes only |
 | `list_projects` | `include_empty` | Lists every scope with a memory table, with memories/entities/relations counts; `total_memories` splits into `active`/`superseded`/`forgotten` |
 | `drop_project` | `project`, `dry_run` | Removes the scope completely (table, registry, graph nodes, mirror rows); a graph-only scope is removed as well; `global` is refused (use `forget(entity="*", project="global")`) |
-| `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set; the answer names the scope it wrote to; an unknown `supersede` id replaces nothing and warns |
-| `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
+| `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last`, `auto_supersede_near_duplicate`, `expires_at` (ISO 8601) | `global` stores in `memories` even when `project` is set; the answer names the scope it wrote to; an unknown `supersede` id replaces nothing and warns; `supersede_last` works without an entity (scope-wide best match, stricter topic floor 0.75) |
+| `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, auto_supersede_near_duplicate?, expires_at?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
 | `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project`, `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold` (0..1) | Content changes are re-embedded; a content change that would duplicate another active memory answers `duplicate` with `duplicate_of` and applies nothing (`dedupe="off"` bypasses the check); an id that exists in several scopes is refused (`scopes`); an unknown id returns `not_found` before the "nothing to update" validation |
 | `update_batch` | `updates: [{memory_id, content?, importance?, metadata?, entity?, mem_type?, project?, dedupe?, fuzzy_threshold?}]` | Savepoints: an invalid/unknown/ambiguous/duplicate entry is reported in its result entry (`partial`), the rest is still applied; `ok` is false only when nothing could be updated |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
@@ -569,9 +600,11 @@ measured similarity. A near-duplicate that dedupe did not reject (similarity
 
 `supersede_last` replaces the memory of an entity that matches the new fact
 best (most similar, not the newest) only when the new fact is about the same
-topic (cosine similarity ≥ 0.5). Otherwise no memory is replaced, the new
-fact is stored additionally and the response carries a warning - replacing
-an unrelated fact would destroy it silently.
+topic (cosine similarity ≥ 0.5). Without an entity the best-matching memory of
+the whole scope is the target, guarded by the stricter 0.75 near-duplicate
+floor (the target may belong to another entity). Otherwise no memory is
+replaced, the new fact is stored additionally and the response carries a
+warning - replacing an unrelated fact would destroy it silently.
 
 ## When to use which tool
 

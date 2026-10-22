@@ -48,7 +48,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | Tool | Description |
 |------|-------------|
 | `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, optional contradiction check, `scope` global/project) |
-| `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
+| `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `auto_supersede_near_duplicate`, `expires_at`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance, metadata, entity or type |
 | `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete by `memory_id`, `memory_ids` or entity; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
@@ -68,9 +68,11 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `project` | string? | Project scope. `global` is reserved and means the shared scope. |
 | `supersede` | string? | Memory id this fact replaces. |
 | `supersede_content` | string? | Exact content of the memory this fact replaces. |
-| `supersede_last` | bool | Replace the memory of the same entity that matches the new fact best (most similar, not the newest) - only if the new fact is about the same topic (similarity >= 0.5), otherwise the fact is stored additionally and a warning is returned. |
+| `supersede_last` | bool | Replace the memory that matches the new fact best (most similar, not the newest) - of the entity, or across the whole scope when no entity is set. Only if the new fact is about the same topic (similarity >= 0.5; scope-wide without an entity >= 0.75), otherwise the fact is stored additionally and a warning is returned. |
 | `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
+| `auto_supersede_near_duplicate` | bool | When the write is a reworded copy of an active memory (near-duplicate, similarity >= 0.75), replace that memory instead of storing a fork; the response lists it in `superseded`. Runs even with `dedupe="off"` when the flag is set. |
+| `expires_at` | string? | ISO 8601 TTL: the memory leaves the active set after this timestamp (hidden in reads, no duplicate candidate). The row itself stays until it is `forget`-den or superseded; exports keep it. Wrong format = named argument error. |
 | `fuzzy_threshold` | number? | Similarity threshold for `dedupe="semantic"` (default 0.85). |
 
 The answer carries `superseded` (the ids that were invalidated) and, with
@@ -99,7 +101,8 @@ ids) and a `cross-scope supersede` warning so that this is never silent.
 ### `remember_batch`
 
 `facts` is a list of objects; only `content` is required, everything else works
-like in `remember`. The top-level `skip_duplicates` flag controls content
+like in `remember` (including the per-fact `auto_supersede_near_duplicate`
+flag). The top-level `skip_duplicates` flag controls content
 dedupe, and `check_contradictions` applies to every fact. Invalid facts are
 reported individually, the rest is still stored (`status: "partial"`). A fact
 without `content` or one that is not an object at all does not abort the batch

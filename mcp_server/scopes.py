@@ -248,11 +248,13 @@ def _ensure_project_table(cur, project: str) -> None:
             access_count INT DEFAULT 0,
             superseded_by TEXT,
             deleted_at TIMESTAMPTZ,
+            expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+    cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
     # Look indexes up by table + definition: long project names get truncated
     # by PostgreSQL to 63 characters, so the exact index name is unreliable.
     cur.execute(

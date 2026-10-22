@@ -42,7 +42,7 @@ from mcp_server.search import (
     _search_memories,
     _search_memories_graph_boost,
 )
-from mcp_server.storage import _log_access
+from mcp_server.storage import ACTIVE_ROW_SQL, _log_access
 from mcp_server.tools.maintenance import _health_check
 
 logger = logging.getLogger(__name__)
@@ -616,7 +616,7 @@ def list_memories(
         elif include_superseded:
             conditions.append("deleted_at IS NULL")
         else:
-            conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+            conditions.append(ACTIVE_ROW_SQL)
         if not include_relation_context:
             # The relation-context sentences live under a synthetic entity and
             # repeat what the edge already says.
@@ -755,7 +755,7 @@ def _relation_context_memories(cur, target: str, tables: list[str],
         if include_superseded:
             conditions.append("deleted_at IS NULL")
         else:
-            conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+            conditions.append(ACTIVE_ROW_SQL)
         cur.execute(
             f"SELECT * FROM {table} WHERE {' AND '.join(conditions)}",
             params,
@@ -783,7 +783,7 @@ def _count_entity_memories(cur, target: str, tables: list[str],
     if include_superseded:
         where = "entity = %s AND deleted_at IS NULL"
     else:
-        where = ("entity = %s AND superseded_by IS NULL AND deleted_at IS NULL")
+        where = ("entity = %s AND " + ACTIVE_ROW_SQL + "")
     parts = [
         f"SELECT COALESCE(content_hash, id) AS key FROM {table} WHERE {where}"
         for table in tables
@@ -1136,7 +1136,7 @@ def list_entities(
             total += cur.fetchone()[0]
             cur.execute(
                 f"SELECT entity FROM {table} "
-                f"WHERE entity IS NOT NULL AND superseded_by IS NULL AND deleted_at IS NULL "
+                f"WHERE entity IS NOT NULL AND " + ACTIVE_ROW_SQL + " "
                 f"GROUP BY entity HAVING bool_or({context_flag})"
             )
             for (ent,) in cur.fetchall():

@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
@@ -8,6 +9,7 @@ from mcp_server.config import (
     DEDUPE_MODES,
     MEMORY_TYPE_HELP,
     MEMORY_TYPES,
+    NEAR_DUPLICATE_THRESHOLD,
     SENTINEL_FORGOTTEN,
     SUPERSEDE_SIMILARITY_MIN,
     VALID_SCOPES,
@@ -47,6 +49,7 @@ from mcp_server.storage import (
     _find_by_content,
     _find_by_id,
     _find_last_for_entity,
+    _find_last_in_scope,
     _find_near_duplicate,
     _find_superseded_match,
     _scope_of_id,
@@ -101,12 +104,23 @@ class BatchFact(BaseModel):
     supersede_content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                                    description="Exact content of the memory this fact replaces.")
     supersede_last: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]},
-                                description="Replace the memory of the same "
-                                            "entity that best matches the new "
-                                            "fact (most similar, not the newest). "
-                                            "Only when the new fact is about the same "
+                                description="Replace the memory that best "
+                                            "matches the new fact (most "
+                                            "similar, not the newest) - of the "
+                                            "entity, or across the whole scope "
+                                            "when no entity is set. Only when the "
+                                            "new fact is about the same "
                                             "topic (similarity >= 0.5); otherwise the "
                                             "fact is stored additionally.")
+    auto_supersede_near_duplicate: Any = Field(
+        default=None,
+        json_schema_extra={"type": ["boolean", "null"]},
+        description="Replace an active near-duplicate (similarity >= 0.75) "
+                    "instead of storing the reworded copy as a fork.")
+    expires_at: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Optional ISO 8601 timestamp when this memory stops "
+                    "being active (TTL).")
     fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                                  description="Similarity threshold 0.0-1.0 for semantic dedup.")
     dedupe: Any = Field(default=None, json_schema_extra={
@@ -247,12 +261,28 @@ def remember(
         Field(description="Exact content of the memory this fact replaces.")] = None,
     supersede_last: Annotated[
         bool,
-        Field(description="Replace the memory of the same entity that best "
-                          "matches the new fact (most similar, not the "
-                          "newest). Only replaces it when the new fact is about "
+        Field(description="Replace the memory that best matches the new fact "
+                          "(most similar, not the newest) - of the entity, "
+                          "or across the whole scope when no entity is set. "
+                          "Only replaces it when the new fact is about "
                           "the same topic (similarity >= 0.5); otherwise the "
                           "fact is stored additionally and a warning is "
                           "returned.")] = False,
+    auto_supersede_near_duplicate: Annotated[
+        bool,
+        Field(description="When the new fact is a reworded copy of an "
+                          "active memory (near-duplicate similarity >= 0.75), "
+                          "replace that memory instead of storing a "
+                          "duplicate; the response lists it in "
+                          "`superseded`.")] = False,
+    expires_at: Annotated[
+        str | None,
+        Field(description="Optional ISO 8601 timestamp (e.g. '2027-01-15' or "
+                          "'2026-10-25T12:00:00Z') when this memory stops being "
+                          "active (TTL). Expired memories disappear from all "
+                          "active reads and dedupe; the row itself stays until "
+                          "it is pruned or soft-forgotten. Omit for an "
+                          "open-ended memory.")] = None,
 ) -> dict[str, Any]:
     """Store a memory (fact, decision, learning, preference, ...).
 
@@ -260,10 +290,15 @@ def remember(
     If `check_contradictions` is true, returns warnings for conflicting existing facts.
     Use `supersede` to replace an existing memory by ID, `supersede_content` to
     replace the fact with the same wording, or `supersede_last` to replace the
-    best-matching fact of the same entity (most similar, not the newest).
+    best-matching fact of the same entity (most similar, not the newest);
+    without an entity the best-matching memory of the whole scope is replaced
+    (same topic guard).
     `supersede_last` refuses to replace a fact
     that is about a different topic (it would destroy it); the new fact is
     stored additionally and the response carries a warning.
+    `auto_supersede_near_duplicate=true` turns the near-duplicate warning
+    into an action: the reworded copy replaces the old memory instead of
+    forking it.
     `dedupe` selects how duplicates are detected: "exact" (default, content
     hash), "semantic" (also vector similarity, see `fuzzy_threshold`) or "off".
     A duplicate answer names the mode that matched ("exact" or "semantic") and
@@ -305,6 +340,13 @@ def remember(
         return fail(STATUS_ERROR, "importance must be between 0.0 and 1.0")
     if fuzzy_threshold is not None and not 0.0 <= fuzzy_threshold <= 1.0:
         return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
+    if expires_at is not None:
+        try:
+            datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            return fail(STATUS_ERROR,
+                        "expires_at must be an ISO 8601 timestamp "
+                        "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
     if metadata is not None and not isinstance(metadata, dict):
         return fail(STATUS_ERROR, "metadata must be an object")
     effective_scope = scope or ("project" if project else "global")
@@ -371,7 +413,8 @@ def remember(
         # response can warn. dedupe='off' means "store everything", so it
         # also skips this warning.
         near_dup = (_find_near_duplicate(cur, content, store_project, emb)
-                    if dedupe != "off" else None)
+                    if (dedupe != "off" or auto_supersede_near_duplicate)
+                    else None)
 
         contradictions = []
         contradiction_skip: str | None = None
@@ -402,9 +445,20 @@ def remember(
             conn.rollback()
             return fail(STATUS_ERROR, str(e))
 
+        # `auto_supersede_near_duplicate` turns the near-duplicate warning
+        # into an action: instead of forking the old fact (old + reworded
+        # copy side by side), the new memory replaces the matching one. The
+        # near-duplicate check already ran above; the floor is the
+        # NEAR_DUPLICATE_THRESHOLD, so only a reworded copy qualifies.
+        auto_near: dict | None = None
+        if auto_supersede_near_duplicate and near_dup \
+                and near_dup["id"] not in superseded:
+            auto_near = near_dup
+            superseded.append(near_dup["id"])
+
         mem_id = _store_memory(cur, content, emb, mem_type, entity,
                                importance, meta, store_project, None,
-                               scope=effective_scope)
+                               scope=effective_scope, expires_at=expires_at)
 
         for old_id in superseded:
             _supersede(cur, store_project, mem_id, old_id)
@@ -481,7 +535,20 @@ def remember(
                 f"invalidated). The new fact was stored as active, so both "
                 f"versions are reachable now; verify this revert is intended"
             )
-        if near_dup:
+        if auto_near:
+            warnings.append(
+                f"auto-supersede: replaced near-duplicate "
+                f"{near_dup['id']} (similarity {near_dup['similarity']}) "
+                f"instead of storing a reworded copy")
+        elif near_dup and near_dup["id"] in superseded:
+            # The explicit supersede path already replaced this memory:
+            # telling the agent to also pass supersede=<id> would be stale
+            # advice, so the near-duplicate is reported as handled.
+            warnings.append(
+                f"near-duplicate {near_dup['id']} (similarity "
+                f"{near_dup['similarity']}) was replaced by the supersede "
+                f"target of this write")
+        elif near_dup:
             warnings.append(_near_duplicate_warning(near_dup))
         if cross_scope_superseded:
             warnings.append(_cross_scope_warning(cross_scope_superseded))
@@ -501,6 +568,7 @@ def remember(
             warnings.append(
                 "no entity set: the contradiction check compared the fact "
                 "against the nearest memories across all entities")
+        auto_count = 1 if auto_near else 0
         if superseded and not check_contradictions:
             warnings.append(f"superseded {len(superseded)} memory/facts")
         if carried_keys:
@@ -581,22 +649,48 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
                 f"scope; nothing was replaced"
             )
     if supersede_last:
-        if not entity:
-            raise ValueError("supersede_last requires an entity")
-        found = _find_last_for_entity(cur, entity, store_project, embedding)
+        if entity:
+            found = _find_last_for_entity(cur, entity, store_project, embedding)
+        else:
+            # No entity: the best match across the whole scope. The
+            # similarity guard still decides - a scope-wide fallback must
+            # not replace an unrelated memory either.
+            found = _find_last_in_scope(cur, store_project, embedding)
+            if found:
+                warnings.append(
+                    "supersede_last without an entity: resolved the "
+                    "best-matching memory across the scope instead of one "
+                    "entity")
+        if not found and not entity:
+            warnings.append(
+                "supersede_last skipped: no embedding available, so the "
+                "same-topic match without an entity cannot be resolved; "
+                "nothing was replaced")
+        elif not found:
+            warnings.append(
+                f"supersede_last skipped: no memory of entity {entity!r} "
+                f"is active; nothing was replaced")
         if found:
             target_id, old_content, similarity = found
-            if (similarity is not None
-                    and similarity < SUPERSEDE_SIMILARITY_MIN):
+            topic_floor = (SUPERSEDE_SIMILARITY_MIN if entity
+                           else max(SUPERSEDE_SIMILARITY_MIN,
+                                    NEAR_DUPLICATE_THRESHOLD))
+            if similarity is not None and similarity < topic_floor:
+                pool = repr(entity) if entity else "the scope"
                 warnings.append(
-                    f"supersede_last skipped: no memory of entity {entity!r} "
-                    f"is about the same topic (best match {old_content!r} "
-                    f"with similarity {similarity} < "
-                    f"{SUPERSEDE_SIMILARITY_MIN}); the new fact was stored "
-                    f"as an additional memory"
+                    f"supersede_last skipped: no memory of "
+                    f"{pool}"
+                    f" is about the same topic (best match {old_content!r} "
+                    f"with similarity {similarity} < {topic_floor}); the new "
+                    f"fact was stored as an additional memory"
                 )
             else:
                 targets.append(target_id)
+                if not entity:
+                    warnings.append(
+                        f"supersede_last: replaced the best-matching memory "
+                        f"of the scope (similarity {similarity}); an entity "
+                        f"tag would make this targeting explicit")
     # Keep order, drop duplicates.
     return list(dict.fromkeys(targets)), warnings
 
@@ -676,7 +770,9 @@ def remember_batch(
 
     Optional keys: mem_type (one of the memory types), entity, importance,
     metadata, scope ("project" or "global"), project, supersede (memory id
-    or content), supersede_last, fuzzy_threshold, and dedupe ("exact",
+    or content), supersede_content, supersede_last,
+    auto_supersede_near_duplicate, expires_at (ISO 8601 TTL timestamp),
+    fuzzy_threshold, and dedupe ("exact",
     "semantic", or "off").
     Set skip_duplicates=False to allow storing identical content multiple times.
     Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
@@ -777,6 +873,14 @@ def remember_batch(
         if not isinstance(meta, dict):
             prepared.append((None, "metadata must be an object"))
             continue
+        fexpires = fact.get("expires_at")
+        if fexpires is not None:
+            try:
+                datetime.fromisoformat(str(fexpires).replace("Z", "+00:00"))
+            except ValueError:
+                prepared.append((None,
+                                 "expires_at must be an ISO 8601 timestamp"))
+                continue
         prepared.append(({
             "content": content,
             "mem_type": mem_type,
@@ -790,6 +894,9 @@ def remember_batch(
             "supersede": fact.get("supersede"),
             "supersede_content": fact.get("supersede_content"),
             "supersede_last": bool(fact.get("supersede_last")),
+            "auto_supersede_near_duplicate":
+                bool(fact.get("auto_supersede_near_duplicate")),
+            "expires_at": fexpires,
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -874,7 +981,8 @@ def remember_batch(
                     # the entry so a batch write cannot fork silently either.
                     # skip_duplicates=False means "store duplicates anyway",
                     # so the whole check (and its warning) is skipped then.
-                    if fact_dedupe != "off":
+                    if fact_dedupe != "off" \
+                            or spec.get("auto_supersede_near_duplicate"):
                         near_dup = _find_near_duplicate(
                             cur, spec["content"], store_project, embeddings[i])
 
@@ -898,11 +1006,18 @@ def remember_batch(
                     spec["supersede_content"], spec["supersede_last"],
                     embeddings[i],
                 )
+                # Per-fact flag: a near-duplicate replaces the old memory
+                # instead of forking it (same semantics as in `remember`).
+                fact_auto_near = spec.get("auto_supersede_near_duplicate")
+                if fact_auto_near and near_dup \
+                        and near_dup["id"] not in superseded:
+                    superseded.append(near_dup["id"])
 
                 mid = _store_memory(
                     cur, spec["content"], embeddings[i], spec["mem_type"],
                     spec["entity"], spec["importance"], spec["metadata"],
                     store_project, scope=spec["scope"],
+                    expires_at=spec.get("expires_at"),
                 )
 
                 for old_id in superseded:
@@ -939,7 +1054,15 @@ def remember_batch(
                      "project": (store_project or "global")}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
-            if near_dup:
+            if near_dup and spec.get("auto_supersede_near_duplicate"):
+                entry.setdefault("warnings", []).append(
+                    f"auto-supersede: replaced near-duplicate "
+                    f"{near_dup['id']} (similarity {near_dup['similarity']}) "
+                    f"instead of storing a reworded copy")
+            elif near_dup and near_dup["id"] in superseded:
+                # Already replaced through the explicit supersede path.
+                pass
+            elif near_dup:
                 entry.setdefault("warnings", []).append(
                     _near_duplicate_warning(near_dup))
             if cross_scope_superseded:

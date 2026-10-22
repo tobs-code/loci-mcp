@@ -21,6 +21,7 @@ PUBLIC_FIELDS = (
     "superseded_by",
     "created_at",
     "updated_at",
+    "expires_at",
     "project",
 )
 
@@ -42,7 +43,8 @@ SCORE_FIELDS = (
 )
 
 SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS
-                              + ("_project", "deleted_at", "forgotten"))
+                              + ("_project", "deleted_at", "forgotten",
+                                 "expires_at"))
 
 
 def validate_fields(fields: list[str] | None) -> str | None:

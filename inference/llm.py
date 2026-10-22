@@ -310,11 +310,14 @@ def nli_user_message(query: str, document: str,
     if (query_entity and document_entity
             and query_entity.strip().lower() != document_entity.strip().lower()):
         message += (
-            "\nThe entity labels differ, so the facts may describe "
-            "different subjects: answer neutral unless both texts plainly "
-            "talk about the same system, service or person. When both texts "
-            "name the exact same specific system or instance and one "
-            "negates the other, that is still a contradiction."
+            "\nThe entity labels differ, so first check what the texts "
+            "themselves say. When both texts plainly discuss the same "
+            "concrete item (the same feature, plan, incident, system or "
+            "request is named or described in both), the labels do not "
+            "matter and you judge normally: a differing date/number or a "
+            "direct negation between them is a contradiction. Treat the "
+            "facts as different subjects only when the texts themselves "
+            "indicate different instances (no shared named item)."
         )
     return message
 

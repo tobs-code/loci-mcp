@@ -9,7 +9,15 @@ from mcp_server.config import (
 )
 from mcp_server.inference_client import nli
 from mcp_server.scopes import _mem_table, _retrieval_tables
-from mcp_server.scoring import _content_hash, _gen_id, _now
+from mcp_server.scoring import _gen_id, _now, _content_hash
+
+# The read/dedupe definition of "this memory is usable". An expired row
+# (expires_at in the past) is neither a duplicate candidate nor a retrieval
+# hit anymore - it stays in the tables until it is pruned or exported.
+ACTIVE_ROW_SQL = (
+    "superseded_by IS NULL AND deleted_at IS NULL "
+    "AND (expires_at IS NULL OR expires_at > NOW())"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +32,28 @@ def _store_memory(
     project: str | None,
     supersede: str | None = None,
     scope: str | None = None,
+    expires_at: str | None = None,
 ) -> str:
     mem_id = _gen_id()
     now = _now()
     table = _mem_table(project)
     c_hash = _content_hash(content)
     effective_scope = scope or ("project" if project else "global")
+    # expires_at arrives as an ISO string the caller already validated; a
+    # NULL value keeps the memory open-ended (the common case).
+    if expires_at is not None:
+        cur.execute(
+            f"""INSERT INTO {table}
+                (id, content, content_hash, embedding, mem_type, scope, entity,
+                 importance, metadata, superseded_by, created_at, updated_at,
+                 expires_at)
+            VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s::timestamptz)""",
+            (mem_id, content, c_hash, embedding_vec, mem_type,
+             effective_scope, entity, importance, json.dumps(metadata),
+             supersede, now, now, expires_at),
+        )
+        return mem_id
     cur.execute(
         f"""INSERT INTO {table}
             (id, content, content_hash, embedding, mem_type, scope, entity,
@@ -78,7 +102,7 @@ def _deduplicate(cur, content: str, project: str | None,
     exclude_params = [exclude_id] if exclude_id else []
     cur.execute(
         f"SELECT id FROM {table} WHERE content_hash = %s "
-        f"AND superseded_by IS NULL AND deleted_at IS NULL{exclude_sql} LIMIT 1",
+        f"AND {ACTIVE_ROW_SQL}{exclude_sql} LIMIT 1",
         [c_hash] + exclude_params,
     )
     row = cur.fetchone()
@@ -90,7 +114,7 @@ def _deduplicate(cur, content: str, project: str | None,
         max_dist = 1.0 - threshold
         cur.execute(
             f"SELECT id, embedding <=> %s::vector AS dist "
-            f"FROM {table} WHERE superseded_by IS NULL AND deleted_at IS NULL AND embedding IS NOT NULL"
+            f"FROM {table} WHERE {ACTIVE_ROW_SQL} AND embedding IS NOT NULL"
             f"{exclude_sql} "
             f"ORDER BY dist ASC LIMIT 1",
             [embedding_vec] + exclude_params,
@@ -127,7 +151,7 @@ def _find_near_duplicate(cur, content: str, project: str | None,
     cur.execute(
         f"SELECT id, embedding <=> %s::vector AS dist FROM {table} "
         f"WHERE content_hash <> %s "
-        f"AND superseded_by IS NULL AND deleted_at IS NULL "
+        f"AND {ACTIVE_ROW_SQL} "
         f"AND embedding IS NOT NULL{exclude_sql} "
         f"ORDER BY dist ASC LIMIT 1",
         params,
@@ -238,7 +262,7 @@ def _find_by_content(cur, content: str, project: str | None,
     c_hash = _content_hash((content or "").strip())
     params: list[Any] = [c_hash]
     sql = (f"SELECT id FROM {table} WHERE content_hash = %s "
-           f"AND superseded_by IS NULL AND deleted_at IS NULL")
+           f"AND {ACTIVE_ROW_SQL}")
     if entity:
         sql += " AND entity = %s"
         params.append(entity)
@@ -265,7 +289,7 @@ def _find_last_for_entity(cur, entity: str, project: str | None,
         cur.execute(
             f"SELECT id, content, embedding <=> %s::vector AS dist "
             f"FROM {table} WHERE entity = %s "
-            f"AND superseded_by IS NULL AND deleted_at IS NULL "
+            f"AND {ACTIVE_ROW_SQL} "
             f"ORDER BY dist ASC, updated_at DESC LIMIT 1",
             (embedding, entity),
         )
@@ -277,12 +301,39 @@ def _find_last_for_entity(cur, entity: str, project: str | None,
         return row[0], row[1], similarity
     cur.execute(
         f"SELECT id FROM {table} WHERE entity = %s "
-        f"AND superseded_by IS NULL AND deleted_at IS NULL "
+        f"AND {ACTIVE_ROW_SQL} "
         f"ORDER BY updated_at DESC LIMIT 1",
         (entity,),
     )
     row = cur.fetchone()
     return (row[0], None, None) if row else None
+
+
+def _find_last_in_scope(cur, project: str | None,
+                        embedding: list[float] | None = None
+                        ) -> tuple[str, str, float | None] | None:
+    """The active memory of the scope that best matches the new fact.
+
+    Fallback for `supersede_last` when no entity is set: the same
+    same-topic guard applies, but the candidate pool is the whole scope
+    instead of one entity's memories. Needs an embedding (similarity is the
+    topic check); without one the caller must refuse the mode instead of
+    guessing "the newest is about the same topic".
+    """
+    if embedding is None:
+        return None
+    table = _mem_table(project)
+    cur.execute(
+        f"SELECT id, content, embedding <=> %s::vector AS dist "
+        f"FROM {table} "
+        f"WHERE {ACTIVE_ROW_SQL} "
+        f"ORDER BY dist ASC, updated_at DESC LIMIT 1",
+        (embedding,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return row[0], row[1], round(1.0 - float(row[2]), 4)
 
 
 def _check_contradictions(cur, content: str, entity: str | None,
@@ -323,7 +374,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
                     f"SELECT id, content, entity FROM {table} "
                     f"WHERE {sql_where} AND content_hash <> %s "
                     f"AND embedding IS NOT NULL "
-                    f"AND superseded_by IS NULL AND deleted_at IS NULL "
+                    f"AND {ACTIVE_ROW_SQL} "
                     f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
                     params + [new_hash, embedding_vec, remaining],
                 )
@@ -331,7 +382,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
                 cur.execute(
                     f"SELECT id, content, entity FROM {table} "
                     f"WHERE {sql_where} AND content_hash <> %s "
-                    f"AND superseded_by IS NULL AND deleted_at IS NULL "
+                    f"AND {ACTIVE_ROW_SQL} "
                     f"ORDER BY created_at DESC LIMIT %s",
                     params + [new_hash, remaining],
                 )

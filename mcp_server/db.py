@@ -73,6 +73,7 @@ def ensure_schema():
                 access_count INT DEFAULT 0,
                 superseded_by TEXT,
                 deleted_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
@@ -149,6 +150,7 @@ def ensure_schema():
             "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(mem_type)",
             "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(superseded_by) WHERE superseded_by IS NULL AND deleted_at IS NULL",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
             "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)",
             "CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id)",
             "CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id)",

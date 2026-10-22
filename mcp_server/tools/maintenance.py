@@ -16,6 +16,7 @@ from mcp_server.scopes import (
     _retrieval_tables,
 )
 from mcp_server.search import _search_memories
+from mcp_server.storage import ACTIVE_ROW_SQL
 from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -192,7 +193,7 @@ def contradictions_report(entity: Annotated[
                     f"WHERE id != %s {entity_sql} "
                     f"{filter_sql} "
                     f"AND embedding IS NOT NULL "
-                    f"AND superseded_by IS NULL AND deleted_at IS NULL "
+                    f"AND " + ACTIVE_ROW_SQL + " "
                     f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
                     [f["id"]] + entity_params + filter_params
                     + [f["embedding"], neighbors_per_fact],

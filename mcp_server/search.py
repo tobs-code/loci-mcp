@@ -18,6 +18,7 @@ from mcp_server.scopes import (
     _retrieval_tables,
     _scope_label,
 )
+from mcp_server.storage import ACTIVE_ROW_SQL
 from mcp_server.scoring import (
     _blend_scores,
     _clamp01,
@@ -236,7 +237,7 @@ def _search_memories_rrf(
             # Superseded history is retrievable, intentionally deleted rows are not.
             conditions.append("deleted_at IS NULL")
         else:
-            conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+            conditions.append(ACTIVE_ROW_SQL)
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
@@ -538,7 +539,7 @@ def _search_memories(
         if include_superseded:
             conditions.append("deleted_at IS NULL")
         else:
-            conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+            conditions.append(ACTIVE_ROW_SQL)
 
         where = " AND ".join(conditions)
         cur.execute(
@@ -707,7 +708,7 @@ def _search_memories_graph_boost(
             for table in tables:
                 cur.execute(
                     f"SELECT * FROM {table} "
-                    f"WHERE entity = %s AND superseded_by IS NULL AND deleted_at IS NULL"
+                    f"WHERE entity = %s AND " + ACTIVE_ROW_SQL + ""
                     + extra_sql
                     + " LIMIT 5",
                     [entity_name] + extra_params,
