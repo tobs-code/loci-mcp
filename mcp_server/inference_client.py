@@ -33,10 +33,15 @@ def nli(query: str, documents: list[str]) -> list[float]:
     resp = _get_session().post(
         f"{INFERENCE_URL}/nli",
         json={"query": query, "documents": documents},
-        timeout=30,
+        timeout=60,
     )
     resp.raise_for_status()
-    return resp.json()["contradiction_scores"]
+    payload = resp.json()
+    if payload.get("error"):
+        # The scores are zeros from an aborted run, not a real judgment:
+        # callers must surface this instead of trusting 0.0 as "neutral".
+        raise RuntimeError(payload["error"])
+    return payload["contradiction_scores"]
 
 
 def health() -> bool:

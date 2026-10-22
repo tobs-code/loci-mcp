@@ -209,6 +209,8 @@ def remember(
             existing_id, mode, similarity = existing
             detail = ("exact content hash" if mode == "exact"
                       else f"semantic match (similarity {similarity})")
+            if mode == "exact" and dedupe == "semantic":
+                detail += "; the content hash short-circuits the semantic check"
             return ok(STATUS_DUPLICATE, id=existing_id,
                       warnings=[f"memory already exists; nothing stored "
                                 f"({detail})"],
@@ -221,11 +223,20 @@ def remember(
             cur, content, store_project, emb, fuzzy_threshold, dedupe=dedupe)
 
         contradictions = []
+        contradiction_skip: str | None = None
         nli_unavailable = check_contradictions and nli_configured() is False
         if check_contradictions and entity and not nli_unavailable:
-            contradictions = _check_contradictions(
-                cur, content, entity, store_project, emb
-            )
+            try:
+                contradictions = _check_contradictions(
+                    cur, content, entity, store_project, emb
+                )
+            except Exception as e:
+                # A failed NLI must not kill the write: the fact is stored
+                # unencumbered, but the skipped check is surfaced loudly so
+                # the caller does not mistake it for a clean scan.
+                logger.warning("contradiction check failed: %s", e)
+                contradictions = []
+                contradiction_skip = f"NLI unavailable: {e}"
 
         # Resolve the replaced memories before storing: "supersede_last" must
         # see the state before this fact exists.
@@ -306,6 +317,8 @@ def remember(
             )
         elif nli_unavailable:
             warnings.append("contradiction check skipped: NLI provider is not configured")
+        elif contradiction_skip:
+            warnings.append(f"contradiction check skipped: {contradiction_skip}")
         elif check_contradictions and not entity:
             warnings.append("contradiction check skipped: entity required")
         if superseded and not check_contradictions:
@@ -316,8 +329,17 @@ def remember(
                 + ", ".join(sorted(carried_keys)))
         payload: dict[str, Any] = {"superseded": superseded}
         if check_contradictions:
-            payload["contradictions"] = {"found": bool(contradictions),
-                                         "superseded": contradictions}
+            contradictions_payload: dict[str, Any] = {
+                "found": bool(contradictions),
+                "superseded": contradictions,
+            }
+            skip = (contradiction_skip
+                    or ("NLI provider is not configured"
+                        if nli_unavailable
+                        else ("entity required" if not entity else None)))
+            if skip:
+                contradictions_payload["skipped"] = skip
+            payload["contradictions"] = contradictions_payload
         return ok(STATUS_STORED, id=mem_id, warnings=warnings, **payload)
     except Exception as e:
         conn.rollback()
@@ -538,11 +560,18 @@ def remember_batch(
                         continue
 
                 contradictions = []
+                contradiction_skip: str | None = None
                 if check_contradictions and spec["entity"]:
-                    contradictions = _check_contradictions(
-                        cur, spec["content"], spec["entity"], store_project,
-                        embeddings[i],
-                    )
+                    try:
+                        contradictions = _check_contradictions(
+                            cur, spec["content"], spec["entity"], store_project,
+                            embeddings[i],
+                        )
+                    except Exception as exc:
+                        # A failed NLI must not roll the fact back: report the
+                        # skipped check instead of a wrong "clean" result.
+                        logger.warning("contradiction check failed: %s", exc)
+                        contradiction_skip = f"NLI unavailable: {exc}"
 
                 # Resolve replaced memories before this fact is stored.
                 superseded, guard_warnings = _supersede_targets(
@@ -582,8 +611,14 @@ def remember_batch(
                     "found": bool(auto_superseded),
                     "superseded": auto_superseded,
                 }
+                if contradiction_skip:
+                    entry["contradictions"]["skipped"] = contradiction_skip
+                    entry.setdefault("warnings", []).append(
+                        f"contradiction check skipped: {contradiction_skip}")
                 if not spec["entity"]:
                     entry["contradictions"]["skipped"] = "entity required"
+                    entry.setdefault("warnings", []).append(
+                        "contradiction check skipped: entity required")
             results.append(entry)
         conn.commit()
     except Exception as e:
@@ -678,7 +713,9 @@ def update_memory(
         params.append(mem_type)
 
     if not sets:
-        return fail(STATUS_ERROR, "nothing to update", id=memory_id)
+        return fail(STATUS_ERROR,
+                    "nothing to update: pass content, importance, metadata, "
+                    "entity or mem_type", id=memory_id)
     # Updated memories must also age like new ones for decay scoring.
     sets.append("updated_at = NOW()")
 

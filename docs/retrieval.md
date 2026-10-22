@@ -158,9 +158,22 @@ similar texts. Distracting prefixes such as `Batch-X: ` in the content destroy
 the similarity and should be avoided. If necessary, increase
 `neighbors_per_fact` in `contradictions_report`.
 
+The NLI prompt asks the model to compare the two facts **field by field**: a
+differing attribute (environment, host, port, version, date/time, state) or an
+explicit negation counts as a contradiction; merely added or missing details do
+not. Vague prompts produced false negatives - a vague prompt judged
+"deploys to staging" vs "deploys to production" as neutral, because both could
+be true at the same time (Oct 2026).
+
 Without a usable LLM configuration `/nli` returns `0.0` for every pair; the
 contradiction tools report a warning and `nli_configured=false` instead of
-presenting that as a clean contradiction scan.
+presenting that as a clean contradiction scan. The same applies to an NLI
+**outage**: `/nli` sets an `error` field instead of silently returning zeros,
+the client raises, and the write tools keep the fact but warn
+(`contradiction check skipped: NLI unavailable: ...`) in `warnings` and in
+`contradictions.skipped`. `contradictions_report` marks the scan as incomplete
+(`warnings: ["scan incomplete: ... - the result is not a clean contradiction
+scan"]`) when the loop aborts mid-way.
 
 ## Superseding
 

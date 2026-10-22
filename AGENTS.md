@@ -168,7 +168,9 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   (case-insensitive literal substring — the right tool for "which memory
   contains exactly X", where the semantic ranking of `recall` is not needed),
   `memory_id` (direct id lookup in the selected scope(s)) and
-  `include_deleted` (lists soft-forgotten rows, which then carry `deleted_at`).
+  `include_deleted` (lists soft-forgotten rows, which then carry `deleted_at`
+  and the machine-readable `forgotten: true` flag; the `__forgotten__` sentinel
+  is hidden from `superseded_by` in those rows).
   `recall` accepts `offset` (`has_more`/`next_offset` in the answer).
 - `init_context` returns the **most recently changed** memories of the scope
   (never a decay-ranked mix): a freshly stored fact always shows up, even if
@@ -272,6 +274,20 @@ then `json_object`, then a plain request. Anthropic uses `/messages`; no
 `response_format` is sent.
 
 **Note**: The quality of contradiction detection depends heavily on the embedding model (`jina-embeddings-v5`), but that is not a problem — the model provides very good similarity values for semantically similar texts. Distracting prefixes such as `Batch-X: ` in the content should be avoided because they destroy embedding similarity. If necessary, increase `neighbors_per_fact` in `contradictions_report`.
+
+**NLI prompt**: `/nli` asks the LLM to compare the two facts **field by field**;
+a differing attribute (environment, host, port, version, date/time, state) or
+an explicit negation is a contradiction (0.9-1.0), newly added or missing
+details are not. Earlier prompts judged "deploys to staging" vs "deploys to
+production" as neutral (both could be true) — the widened prompt detects those.
+
+**NLI outages are surfaced, never silent**: `/nli` sets an `error` field when
+scores are not a real judgment (provider down, not configured); the MCP client
+raises, write tools keep the fact but report `contradiction check skipped:
+NLI unavailable: ...` in `warnings` **and** `contradictions.skipped`;
+`contradictions_report` marks the scan as incomplete in `warnings`
+("scan incomplete: ... not a clean contradiction scan"). Zero contradiction
+scores are therefore always trustworthy.
 
 ### Auto-Supersede
 

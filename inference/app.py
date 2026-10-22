@@ -31,6 +31,9 @@ class NliRequest(BaseModel):
 
 class NliResponse(BaseModel):
     contradiction_scores: list[float]
+    # Set when the scores are NOT a real judgment (provider down, not
+    # configured): the caller must not mistake zeros for "no contradiction".
+    error: str | None = None
 
 
 @app.get("/health")
@@ -69,7 +72,8 @@ def nli(req: NliRequest):
         logger.warning(
             "NLI disabled: LLM provider %r is not configured", llm.provider,
         )
-        return NliResponse(contradiction_scores=[0.0] * len(req.documents))
+        return NliResponse(contradiction_scores=[0.0] * len(req.documents),
+                           error=f"LLM provider {llm.provider!r} is not configured")
 
     scores = []
     for idx, doc in enumerate(req.documents):
@@ -77,13 +81,14 @@ def nli(req: NliRequest):
             scores.append(classify(llm, req.query, doc))
         except Exception as exc:
             # Provider down / invalid key: don't silently claim "no
-            # contradiction" for every remaining document — abort early and
-            # say so in the logs.
+            # contradiction" for the remaining documents — abort early and
+            # carry the failure back to the caller so it can surface it.
             logger.warning(
                 "NLI unavailable, returning 0.0 for remaining documents: %s",
                 exc,
             )
             scores.extend([0.0] * (len(req.documents) - idx))
-            break
+            return NliResponse(contradiction_scores=scores,
+                               error=f"NLI unavailable: {exc}")
 
     return NliResponse(contradiction_scores=scores)

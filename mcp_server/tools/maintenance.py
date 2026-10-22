@@ -114,24 +114,34 @@ def contradictions_report(entity: Annotated[
         conn.close()
 
     contradictions: list[dict] = []
-    for f, neighbours in candidates.values():
-        if len(contradictions) >= limit:
-            break
-        # One LLM call per fact instead of one per pair.
-        scores = nli(f["content"], [n[1] for n in neighbours])
-        for (nid, ncontent), score in zip(neighbours, scores):
+    warnings: list[str] = []
+    nli_failed: str | None = None
+    try:
+        for f, neighbours in candidates.values():
             if len(contradictions) >= limit:
                 break
-            if score > 0.7:
-                contradictions.append({
-                    "a": {"id": f["id"], "content": f["content"]},
-                    "b": {"id": nid, "content": ncontent},
-                    "confidence": round(score, 3),
-                })
+            # One LLM call per fact instead of one per pair.
+            scores = nli(f["content"], [n[1] for n in neighbours])
+            for (nid, ncontent), score in zip(neighbours, scores):
+                if len(contradictions) >= limit:
+                    break
+                if score > 0.7:
+                    contradictions.append({
+                        "a": {"id": f["id"], "content": f["content"]},
+                        "b": {"id": nid, "content": ncontent},
+                        "confidence": round(score, 3),
+                    })
+    except Exception as e:
+        # An NLI outage must not crash the tool outside the envelope: the
+        # pairs seen so far stay in the result, the rest is skipped loudly.
+        nli_failed = f"NLI unavailable: {e}"
+        warnings.append(
+            f"scan incomplete: {nli_failed} - the result is not a clean "
+            f"contradiction scan; retry later")
+        logger.warning("contradictions_report NLI failed: %s", e)
 
     contradictions = contradictions[:limit]
 
-    warnings: list[str] = []
     resolved = 0
     if resolve == "newest" and contradictions:
         conn = get_conn()

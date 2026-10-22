@@ -8,8 +8,16 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-NLI_SYSTEM = "Determine if Fact B contradicts Fact A."
+NLI_SYSTEM = (
+    "You validate facts for a memory system. Both facts describe the same "
+    "subject (a service, person or system); compare them field by field."
+)
 NLI_INSTRUCTION = (
+    "If a concrete attribute differs (environment, host, port, version, "
+    "date/time, number, state) or one fact negates the other, that IS a "
+    "contradiction (score 0.9-1.0). Facts that merely omit details or add "
+    "new ones are NOT contradictions (neutral unless the overlap clearly "
+    "contradicts). Identical facts are entailment, not contradiction. "
     "Respond in JSON with keys 'label' (one of: contradiction, entailment, "
     "neutral) and 'score' (0.0-1.0)."
 )

@@ -6,7 +6,11 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from mcp_server.db import get_conn
-from mcp_server.config import DEFAULT_MIN_SIMILARITY, MEMORY_TYPE_HELP
+from mcp_server.config import (
+    DEFAULT_MIN_SIMILARITY,
+    MEMORY_TYPE_HELP,
+    SENTINEL_FORGOTTEN,
+)
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
 from mcp_server.projection import (
@@ -532,14 +536,27 @@ def list_memories(
     window = unique[offset:offset + limit]
     has_more = len(unique) > offset + limit
     projection_fields = fields
-    if include_deleted and projection_fields is None:
+    if include_deleted:
         # Without this the caller could not tell a forgotten row from an
         # active one.
-        projection_fields = list(PUBLIC_FIELDS) + ["deleted_at"]
-    return ok(STATUS_OK, count=len(window), total=total, offset=offset,
+        if projection_fields is None:
+            projection_fields = list(PUBLIC_FIELDS) + ["deleted_at"]
+        elif "deleted_at" not in projection_fields:
+            projection_fields = projection_fields + ["deleted_at"]
+    results = []
+    for row in window:
+        item = project_row(row, projection_fields)
+        # A machine-readable marker beats reading the '__forgotten__'
+        # sentinel out of superseded_by.
+        if row.get("deleted_at"):
+            item["forgotten"] = True
+            if item.get("superseded_by") == SENTINEL_FORGOTTEN:
+                item["superseded_by"] = None
+        results.append(item)
+    return ok(STATUS_OK, count=len(results), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
-              results=[project_row(r, projection_fields) for r in window])
+              results=results)
 
 
 def get_entity(name: Annotated[
@@ -642,6 +659,9 @@ def get_entity(name: Annotated[
         }
     if entity_data is None and not memories:
         return fail(STATUS_NOT_FOUND, f"entity not found: {target}", entity=target)
+    # The rows come from several tables: newest update first makes the
+    # detail view deterministic page-over-page.
+    memories.sort(key=lambda m: m.get("updated_at") or "", reverse=True)
     return ok(STATUS_OK, entity=target, details=entity_data,
               memories=[project_row(m, fields) for m in memories])
 

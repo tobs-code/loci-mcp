@@ -100,6 +100,10 @@ r = requests.post("http://localhost:8001/nli", json={
     "documents": ["Max lives in Hamburg"]
 })
 contradiction_scores = r.json()["contradiction_scores"]
+# `error` is set when the scores are NOT a real judgment (provider down or
+# not configured) - treat zeros from an errored run as "unknown", never as
+# "no contradiction".
+error = r.json().get("error")
 ```
 
 `/health` reports the status of both services.

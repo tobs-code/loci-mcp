@@ -157,14 +157,17 @@ where the semantic ranking of `recall` is not needed. `memory_id` looks a single
 id up directly in the selected scope(s). `offset` pages through a scope; the
 answer reports `total`, `has_more` and `next_offset`. `include_deleted=true`
 lists soft-forgotten rows and includes their `deleted_at`, which is how an agent
-finds an id for `restore_memory`.
+finds an id for `restore_memory`. Forgotten rows carry the machine-readable
+`forgotten: true` flag; the `__forgotten__` sentinel is removed from
+`superseded_by` in those rows (it was overwriting the real value).
 
 ### `get_entity`
 
 `entity` (`name` is kept as alias), `project`, `include_global`,
 `include_superseded`, `fields`. Memory-only entities have no graph node;
 `details.type` is then `memory-only`. A missing entity answers with
-`status: "not_found"`.
+`status: "not_found"`. The `memories` list is sorted by `updated_at`
+descending, newest change first.
 
 ### `list_entities`
 
