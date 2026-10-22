@@ -53,8 +53,8 @@ updates an existing node/edge instead of duplicating it).
 
 Re-importing the same file reports the existing ids as `skipped`. A non-empty
 `skipped` comes with `skipped_reasons` (`id_exists`, `duplicate_content`,
-`empty_content`) and a warning, so an idempotent re-import is distinguishable
-from a backup that silently lost rows. Records that fail
+`empty_content`, `invalid`) and a warning, so an idempotent re-import is
+distinguishable from a backup that silently lost rows. Records that fail
 validation (bad metadata, blank project, broken row) are counted in `invalid`
 and listed in `errors`; they are a subset of `skipped`, so
 `imported + skipped` still equals the number of records.

@@ -23,9 +23,9 @@ All other names are lower-cased, truncated and get a short SHA-1 of the
 *original* name appended:
 
 ```
-Project Alpha-2  ->  project_alpha_2_e6a52393
-Team             ->  team
-team             ->  team_9f2c1ab4     (different table)
+Project Alpha-2  ->  project_alpha_2_484299f9
+team             ->  team
+Team             ->  team_21888726     (different table)
 ```
 
 This keeps table and index names below PostgreSQL's 63-character limit, so
@@ -52,10 +52,11 @@ Graph tools use the global graph when `project` is omitted.
 
 ## Which tools accept `project`
 
+`remember`, `remember_batch`, `update_memory`, `update_batch`, `touch_memory`,
 `get_entity`, `list_entities`, `list_memories`, `recall`, `init_context`,
 `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
-`forget`, `restore_memory`, `export_memories`, `import_memories`,
-`drop_project`.
+`forget`, `restore_memory`, `contradictions_report`, `export_memories`,
+`import_memories`, `drop_project`.
 
 The read defaults differ per tool and are listed in
 [Retrieval & Scoring](retrieval.md#read-scope-defaults). For `init_context`,
@@ -77,8 +78,9 @@ passed explicitly. `recall` searches the shared scope in both cases.
 A memory id is unique **per scope, not globally**: an import copies the id
 into the target scope, and then the same id exists in two scopes.
 
-`update_memory`, `restore_memory` and `forget(memory_id=...)` therefore refuse
-an id that exists in several scopes and name the scopes in the error:
+`update_memory`, `touch_memory`, `restore_memory` and `forget(memory_id=...)`
+therefore refuse an id that exists in several scopes and name the scopes in the
+error:
 
 ```json
 {"ok": false, "status": "error",
@@ -88,13 +90,16 @@ an id that exists in several scopes and name the scopes in the error:
 ```
 
 With `project` the call is unambiguous, and the answer reports the scope that
-was changed. `forget(entity=...)` keeps removing the entity from every scope.
+was changed. The bulk form `forget(memory_ids=[...])` is different: each id is
+validated individually and, without `project`, applied to every scope; the
+answer reports every id in `bulk_results`. `forget(entity=...)` keeps removing
+the entity from every scope.
 
 ## The lifecycle of a project
 
 | Tool | Effect |
 |------|--------|
-| `list_projects` | Lists every scope with `memories`, `total_memories`, `superseded_memories`, `forgotten_memories`, `entities` and `relations`. |
+| `list_projects` | Lists every scope with a memory table, with `memories`, `total_memories`, `superseded_memories`, `forgotten_memories`, `entities` and `relations`. |
 | `forget(entity="*", project=…)` | **Empties** the scope: memories, graph nodes and mirror rows are removed, the scope itself survives. The shared scope is addressed with `project="global"`. |
 | `drop_project(project=…)` | **Removes** the scope completely: memory table, registry entry, graph nodes and mirror rows. `dry_run=true` previews the counts. `global` is refused. |
 
@@ -105,10 +110,11 @@ stray call cannot wipe the whole database.
 `drop_project` is permanent and refuses `global`. Use it when a project is
 finished and its scope should disappear from every listing.
 
-A project that only exists in the graph (a `relate` without a stored fact)
-has no memory table of its own; it is listed like every other scope and
-`drop_project` removes it as well, so its nodes cannot stay behind as
-orphans that no listing shows.
+A scope created by `relate` also gets a memory table, even when no fact is
+stored. A scope that exists only as graph rows (for example from a graph-only
+import) has no memory table and is therefore not listed by `list_projects`;
+`drop_project` still removes its graph nodes and mirror rows, so they cannot
+stay behind as orphans.
 
 ## Storing outside a project
 

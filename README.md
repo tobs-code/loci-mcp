@@ -58,9 +58,11 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 |------|--------------|
 | `remember` | Store a fact, decision or learning (auto-embedded, deduplicated) |
 | `remember_batch` | Store many facts at once |
-| `update_memory` | Change content, importance or metadata |
+| `update_memory` | Change content, importance, metadata, entity or type |
+| `update_batch` | Update many memories in one call |
 | `forget` | Soft delete or hard delete, by id or by entity |
 | `restore_memory` | Bring a soft-forgotten memory back |
+| `touch_memory` | Refresh a memory's recency without changing its content |
 
 **Read**
 

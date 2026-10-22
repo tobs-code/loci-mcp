@@ -54,8 +54,13 @@ LLM_MODEL=...
 
 `LLM_PROVIDER=auto` picks the first configured key (Groq, OpenAI, Anthropic),
 then `LLM_BASE_URL`, then `OLLAMA_BASE_URL`. `LLM_PROVIDER=none` disables
-contradiction detection; `/nli` then returns `0.0` for every pair and the
-contradiction tools report `nli_configured=false`.
+contradiction detection. Without a usable provider `/nli` returns placeholder
+`0.0` scores together with an `error`; the MCP client raises instead of
+treating those zeros as judgments. `contradictions_report` short-circuits when
+health reports no configured provider and returns `nli_configured=false` plus
+a warning; write tools keep the fact and warn
+(`contradiction check skipped: NLI unavailable: ...`) in `warnings` and
+`contradictions.skipped`.
 
 Embeddings always run locally on CPU — no key needed.
 

@@ -101,7 +101,9 @@ class BatchFact(BaseModel):
     supersede_content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                                    description="Exact content of the memory this fact replaces.")
     supersede_last: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]},
-                                description="Replace the newest memory of the same entity. "
+                                description="Replace the memory of the same "
+                                            "entity that best matches the new "
+                                            "fact (most similar, not the newest). "
                                             "Only when the new fact is about the same "
                                             "topic (similarity >= 0.5); otherwise the "
                                             "fact is stored additionally.")
@@ -245,10 +247,12 @@ def remember(
         Field(description="Exact content of the memory this fact replaces.")] = None,
     supersede_last: Annotated[
         bool,
-        Field(description="Replace the newest memory of the same entity. Only "
-                          "replaces it when the new fact is about the same "
-                          "topic (similarity >= 0.5); otherwise the fact is "
-                          "stored additionally and a warning is returned.")] = False,
+        Field(description="Replace the memory of the same entity that best "
+                          "matches the new fact (most similar, not the "
+                          "newest). Only replaces it when the new fact is about "
+                          "the same topic (similarity >= 0.5); otherwise the "
+                          "fact is stored additionally and a warning is "
+                          "returned.")] = False,
 ) -> dict[str, Any]:
     """Store a memory (fact, decision, learning, preference, ...).
 
@@ -256,7 +260,8 @@ def remember(
     If `check_contradictions` is true, returns warnings for conflicting existing facts.
     Use `supersede` to replace an existing memory by ID, `supersede_content` to
     replace the fact with the same wording, or `supersede_last` to replace the
-    newest fact of the same entity. `supersede_last` refuses to replace a fact
+    best-matching fact of the same entity (most similar, not the newest).
+    `supersede_last` refuses to replace a fact
     that is about a different topic (it would destroy it); the new fact is
     stored additionally and the response carries a warning.
     `dedupe` selects how duplicates are detected: "exact" (default, content
@@ -1076,7 +1081,8 @@ def update_memory(
     try:
         cur = conn.cursor()
         if project:
-            # The project copy and its global twin are updated together.
+            # Prefer the project copy over the shared one; only the first
+            # active match is updated.
             tables = [_mem_table(project), "memories"]
         else:
             # A memory id is unique per scope, not globally: an import can

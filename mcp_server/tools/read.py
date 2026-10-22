@@ -163,7 +163,9 @@ def recall(
     metadata_filter: Annotated[
         dict[str, Any] | None,
         Field(description="Only memories whose metadata contains these "
-                          "key/value pairs, e.g. {'ticket': 'QA-1'}.")] = None,
+                          "key/value pairs. Scalar values compare tolerantly "
+                          "(the string '8001' matches the number 8001); "
+                          "objects and arrays use JSON containment.")] = None,
     include_relation_context: Annotated[
         bool,
         Field(description="True (default) includes the relation-context "
@@ -493,8 +495,9 @@ def list_memories(
     metadata_filter: Annotated[
         dict[str, Any] | None,
         Field(description="Only memories whose metadata contains these "
-                          "key/value pairs. The values must have the same JSON "
-                          "type as in the stored metadata.")] = None,
+                          "key/value pairs. Scalar values compare tolerantly "
+                          "(the string '8001' matches the number 8001); "
+                          "objects and arrays use JSON containment.")] = None,
     order_by: Annotated[
         Literal["updated_at", "created_at", "access_count", "importance"],
         Field(description="Sort order (default: updated_at, newest first).")] = "updated_at",
@@ -1009,8 +1012,9 @@ def list_entities(
     'memory-only'. Synthetic relation-context entities
     (`<from>_<relation>_<to>`) are not listed. The list is
     sorted by name; `offset` pages through it.
-    `count` and `total` always agree: an entity that has a graph node is
-    reported as such even when `entity_type` hides that node.
+    `count` is the page size and `total` the full match count: an entity that
+    has a graph node is still reported as such even when `entity_type` hides
+    that node.
     `entity_type` selects one kind of entity: 'graph', 'memory-only', or a
     raw AGE label for one scope's nodes. Without it both kinds are listed.
     A project that does not exist is reported in `warnings`: the browse then
@@ -1084,7 +1088,7 @@ def list_entities(
             conditions.append("type = %s")
             params.append(entity_type)
         where = " AND ".join(conditions)
-        # No LIMIT here: `count` and `total` must agree, and the memory-only
+        # No LIMIT here: `total` must count every match, and the memory-only
         # entities below are loaded in full anyway. The window is cut after
         # the sort.
         if entity_type == "memory-only":
@@ -1203,9 +1207,10 @@ def init_context(project: Annotated[
     The memories are the most recently changed ones of the scope - a freshly
     stored fact always shows up, even if it was never read before.
     `projects` lists every scope the answer covers, including the shared
-    one ("global"). `active_memories` counts the rows a search would
-    return; `total_memories` counts every row of the scope, so the
-    difference is `superseded_memories` plus `forgotten_memories`.
+    one ("global"). `active_memories` counts the active rows across the
+    covered tables (a cross-scope copy can be counted in both);
+    `total_memories` counts every row of the scope, so the difference is
+    `superseded_memories` plus `forgotten_memories`.
     `graph_entities_count` counts the graph nodes of the covered scopes.
     """
     all_projects = project == "*"

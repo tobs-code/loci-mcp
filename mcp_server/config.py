@@ -104,9 +104,9 @@ DEFAULT_MIN_SIMILARITY = 0.40
 PROJECT_SCOPE_BOOST = 0.05
 
 
-# `supersede_last` replaces the newest memory of an entity. Only do that when
-# the new fact is actually about the same topic: below this cosine similarity
-# the two facts are unrelated and replacing would destroy the old one.
+# `supersede_last` replaces the best-matching memory of an entity. Only do
+# that when the new fact is actually about the same topic: below this cosine
+# similarity the two facts are unrelated and replacing would destroy the old one.
 SUPERSEDE_SIMILARITY_MIN = 0.5
 
 

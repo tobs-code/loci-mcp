@@ -48,10 +48,10 @@ Every tool answers with the same shape, so an agent never has to guess:
 | Tool | Description |
 |------|-------------|
 | `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, optional contradiction check, `scope` global/project) |
-| `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
-| `update_memory` | Update content (re-embedding), importance or metadata |
+| `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
+| `update_memory` | Update content (re-embedding), importance, metadata, entity or type |
 | `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
-| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
+| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete by `memory_id`, `memory_ids` or entity; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
 | `restore_memory` | Bring a soft-forgotten memory back; only rows with `deleted_at` set can be restored |
 | `touch_memory` | Bump `updated_at` without changing the content (refreshes the decay recency); optional `importance` |
 
@@ -99,11 +99,13 @@ ids) and a `cross-scope supersede` warning so that this is never silent.
 ### `remember_batch`
 
 `facts` is a list of objects; only `content` is required, everything else works
-like in `remember`. Invalid facts are reported individually, the rest is still
-stored (`status: "partial"`). A fact without `content` or one that is not an
-object at all does not abort the batch - it is reported as an error entry
-next to the facts that were stored. Every entry reports the `scope` and
-`project` it landed in, so a batch that mixes scopes stays readable.
+like in `remember`. The top-level `skip_duplicates` flag controls content
+dedupe, and `check_contradictions` applies to every fact. Invalid facts are
+reported individually, the rest is still stored (`status: "partial"`). A fact
+without `content` or one that is not an object at all does not abort the batch
+- it is reported as an error entry next to the facts that were stored. Every
+entry reports the `scope` and `project` it landed in, so a batch that mixes
+scopes stays readable.
 
 ### `update_memory`
 
@@ -127,17 +129,22 @@ updated.
 
 ### `forget`
 
-`memory_id` or `entity` (`entity_name` is kept as alias), `soft` (default
-`true`), `project`, `dry_run`.
+`memory_id`, `memory_ids` or `entity` (`entity_name` is kept as alias), `soft`
+(default `true`), `project`, `dry_run`. `memory_id` and `memory_ids` are
+mutually exclusive.
 
+- `memory_ids` removes a list of ids in one call. Each id is validated
+  individually and reported in `bulk_results`; without `project` the same id
+  is removed from every scope, while the single-id form refuses an ambiguous
+  id unless `project` selects one scope.
 - `entity="*"` plus `project` empties a whole scope; `project` is required for
   that, so a stray call cannot wipe the database. The shared scope is
   addressed with `project="global"`.
 - `dry_run=true` only reports the counts - and it counts exactly what the real
   call removes: without a `project` the entity is removed from every scope, so
   the preview counts the graph nodes and relations of every scope as well.
-- The answer carries `counts` (memories/entities/relations separately) and
-  `scopes` (the scopes the id was found in).
+- The answer carries `counts` (memories/entities/relations separately); the
+  single-id form also reports `scopes` (the scopes the id was found in).
 
 ### `restore_memory`
 
@@ -260,8 +267,8 @@ in several scopes; each row carries its `project`, so they are distinct rows.
 `memory-only`, or a raw AGE label (`Entity` for the shared scope,
 `Project_<suffix>` for a project) for exactly one scope's nodes. The `type`
 column is user-facing: `graph` with the raw AGE label in `label`, or
-`memory-only`. `count` and `total` always agree, and an entity that has a
-graph node is never reported as memory-only.
+`memory-only`. `count` is the page size and `total` the full match count, and
+an entity that has a graph node is never reported as memory-only.
 
 ### `init_context`
 
@@ -270,16 +277,17 @@ returns every column except the internal ones and the search score
 annotations, `include_global=false` excludes global memories.
 
 `projects` names every scope the answer covers, including the shared one
-(`"global"`). `active_memories` counts the rows a search would return,
-`total_memories` counts every row of the scope - the difference is
-`superseded_memories` plus `forgotten_memories`. `graph_entities_count` counts
+(`"global"`). `active_memories` counts the active rows across the covered
+tables (a cross-scope copy can be counted in both), `total_memories` counts
+every row of the scope - the difference is `superseded_memories` plus
+`forgotten_memories`. `graph_entities_count` counts
 the graph nodes of the covered scopes, not of the whole database.
 
 ### `list_projects`
 
-Lists every scope with `memories`, `total_memories`, `superseded_memories`,
-`forgotten_memories`, `entities` and `relations`. `include_empty=false` hides
-scopes without active memories.
+Lists every scope with a memory table, with `memories`, `total_memories`,
+`superseded_memories`, `forgotten_memories`, `entities` and `relations`.
+`include_empty=false` hides scopes without active memories.
 
 ## Graph tools
 

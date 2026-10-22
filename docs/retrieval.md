@@ -243,13 +243,15 @@ production" as neutral, because both could be true at the same time
 (Oct 2026); the opposite extreme - attributing differing attributes blindly
 to the same subject - produced cross-entity false positives (Oct 2026).
 
-Without a usable LLM configuration `/nli` returns `0.0` for every pair; the
-contradiction tools report a warning and `nli_configured=false` instead of
-presenting that as a clean contradiction scan. The same applies to an NLI
-**outage**: `/nli` sets an `error` field instead of silently returning zeros,
-the client raises, and the write tools keep the fact but warn
+Without a usable LLM configuration `/nli` returns placeholder `0.0` scores
+together with an `error`; the MCP client raises instead of treating those
+zeros as judgments. `contradictions_report` short-circuits when health reports
+no configured provider and returns `nli_configured=false` plus a warning; the
+write tools keep the fact and warn
 (`contradiction check skipped: NLI unavailable: ...`) in `warnings` and in
-`contradictions.skipped`. `contradictions_report` marks the scan as incomplete
+`contradictions.skipped`. The same error contract applies to an NLI
+**outage**: `/nli` sets an `error` field instead of silently returning zeros,
+and the client raises. `contradictions_report` marks the scan as incomplete
 (`warnings: ["scan incomplete: ... - the result is not a clean contradiction
 scan"]`) when the loop aborts mid-way.
 
