@@ -251,6 +251,7 @@ def test_import_reports_a_broken_metadata_per_record():
     assert result["ok"] is True
     assert result["imported"] == 1
     assert result["skipped"] == 1
+    assert result["invalid"] == 1
     assert any("broken-meta-1" in e for e in result.get("errors", [])), result
 
 

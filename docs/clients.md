@@ -95,4 +95,11 @@ curl http://localhost:8001/health   # inference
 ```
 
 The MCP server itself answers `server_health` with the status of Postgres, the
-inference API and the LLM provider.
+inference API and the LLM provider. It also reports `version`,
+`code_fingerprint` (a hash of the Python files that are actually running) and
+`started_at`. Compare `code_fingerprint` with the workspace to detect a stale
+container:
+
+```bash
+python -c "from mcp_server.version import code_fingerprint; print(code_fingerprint())"
+```

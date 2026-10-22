@@ -72,7 +72,7 @@ def test_contradictions_report_survives_nli_outage(monkeypatch):
              entity=entity, project="nli-outage-report")
     remember(content=f"{entity} stores reports on port 9002.",
              entity=entity, project="nli-outage-report")
-    monkeypatch.setattr("mcp_server.tools.maintenance.nli", _raise_nli)
+    monkeypatch.setattr("mcp_server.tools.maintenance.nli_detailed", _raise_nli)
     result = contradictions_report(entity=entity, project="nli-outage-report")
     assert result["ok"] is True
     warnings = " ".join(result["warnings"])
@@ -151,3 +151,57 @@ def test_update_memory_says_what_is_missing():
     assert result["ok"] is False
     assert "nothing to update: pass content, importance, metadata," in \
         result["error"]
+
+
+def test_nli_detailed_returns_partial_scores_and_keeps_the_warning(monkeypatch):
+    import mcp_server.inference_client as ic
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"contradiction_scores": [0.95, 0.0],
+                    "partial_error": "NLI unavailable for 1 of 2 document(s): bad JSON",
+                    "failed": 1}
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(ic, "_get_session", lambda: FakeSession())
+    scores, partial = ic.nli_detailed("A", ["B", "C"])
+    assert scores == [0.95, 0.0]
+    assert "1 of 2" in partial
+    # The plain wrapper keeps its list contract for existing callers.
+    assert ic.nli("A", ["B", "C"]) == [0.95, 0.0]
+
+
+def test_server_health_reports_the_running_code():
+    from mcp_server.tools.maintenance import server_health
+
+    result = server_health()
+    assert result["ok"] is True
+    assert result["version"]
+    assert len(result["code_fingerprint"]) == 12
+    assert result["started_at"]
+
+
+def test_list_memories_accepts_forgotten_in_fields():
+    from mcp_server.tools.memory import forget
+
+    stored = remember(content="Forgotten fields probe.",
+                      project="forgotten-fields")
+    active = list_memories(project="forgotten-fields",
+                           contains="Forgotten fields probe.",
+                           fields=["id", "forgotten"])
+    assert active["results"][0]["forgotten"] is False
+
+    forget(memory_id=stored["id"], project="forgotten-fields")
+    deleted = list_memories(project="forgotten-fields",
+                            contains="Forgotten fields probe.",
+                            include_deleted=True,
+                            fields=["id", "forgotten"])
+    assert deleted["results"][0]["forgotten"] is True

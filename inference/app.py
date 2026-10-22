@@ -31,9 +31,13 @@ class NliRequest(BaseModel):
 
 class NliResponse(BaseModel):
     contradiction_scores: list[float]
-    # Set when the scores are NOT a real judgment (provider down, not
-    # configured): the caller must not mistake zeros for "no contradiction".
+    # Set when NO score is a real judgment (provider down, not configured):
+    # the caller must not mistake the zeros for "no contradiction".
     error: str | None = None
+    # Set when only SOME documents failed: the successful scores are real,
+    # the failed ones are 0.0 and must not be read as "neutral".
+    partial_error: str | None = None
+    failed: int = 0
 
 
 @app.get("/health")
@@ -75,20 +79,33 @@ def nli(req: NliRequest):
         return NliResponse(contradiction_scores=[0.0] * len(req.documents),
                            error=f"LLM provider {llm.provider!r} is not configured")
 
-    scores = []
-    for idx, doc in enumerate(req.documents):
+    scores: list[float] = []
+    failures: list[str] = []
+    for doc in req.documents:
         try:
             scores.append(classify(llm, req.query, doc))
         except Exception as exc:
-            # Provider down / invalid key: don't silently claim "no
-            # contradiction" for the remaining documents — abort early and
-            # carry the failure back to the caller so it can surface it.
-            logger.warning(
-                "NLI unavailable, returning 0.0 for remaining documents: %s",
-                exc,
-            )
-            scores.extend([0.0] * (len(req.documents) - idx))
-            return NliResponse(contradiction_scores=scores,
-                               error=f"NLI unavailable: {exc}")
+            # One malformed provider response must not throw away the
+            # judgments for the other documents: record the failure, keep
+            # the 0.0 placeholder, and continue. A failed score is reported
+            # separately so the caller never reads it as "neutral".
+            logger.warning("NLI failed for one document: %s", exc)
+            scores.append(0.0)
+            failures.append(str(exc))
 
-    return NliResponse(contradiction_scores=scores)
+    if failures and len(failures) == len(req.documents):
+        # Nothing was judged: this is an outage, not a clean scan.
+        return NliResponse(
+            contradiction_scores=scores,
+            error=f"NLI unavailable: {failures[0]}",
+            failed=len(failures),
+        )
+    partial_error = None
+    if failures:
+        partial_error = (
+            f"NLI unavailable for {len(failures)} of {len(req.documents)} "
+            f"document(s): {failures[0]}"
+        )
+    return NliResponse(contradiction_scores=scores,
+                       partial_error=partial_error,
+                       failed=len(failures))

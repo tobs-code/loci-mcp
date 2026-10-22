@@ -153,3 +153,11 @@ def test_relate_batch_keeps_projects_isolated_and_is_idempotent():
     ])
     assert again["results"][0]["status"] == "updated"
     assert find_connections("A")["results"][0]["weight"] == 0.7
+
+
+def test_find_connections_hint_mentions_the_searched_project():
+    result = find_connections("Unknown", project="hint-scope")
+
+    assert result["ok"] is False
+    assert "hint-scope" in result["error"]
+    assert "without project" not in result["error"]

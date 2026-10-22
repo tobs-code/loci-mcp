@@ -4,6 +4,7 @@ from inference.llm import (
     build_chat_request,
     classify,
     load_config,
+    nli_score,
     parse_nli_json,
 )
 
@@ -253,3 +254,11 @@ def test_classify_aborts_when_every_format_fails(monkeypatch):
 
     with pytest.raises(RuntimeError, match="LLM request failed"):
         classify(config, "A", "B")
+
+
+def test_nli_score_normalizes_percentages_instead_of_clamping():
+    assert nli_score({"label": "contradiction", "score": 95}) == pytest.approx(0.95)
+    # An ambiguous 1.4 is understated, not promoted to a perfect 1.0.
+    assert nli_score({"label": "contradiction", "score": 1.4}) == pytest.approx(0.014)
+    assert nli_score({"label": "neutral", "score": 0.99}) == 0.0
+    assert nli_score({"label": "contradiction", "score": 500}) == 0.0

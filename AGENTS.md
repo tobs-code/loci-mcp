@@ -96,7 +96,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 | `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved; payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore JSON/JSONL (`data` accepts object or string); explicit ids make re-import idempotent; graph is restored from JSON exports |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes); `dry_run` previews the counts |
-| `server_health` | Check Postgres + Inference connectivity |
+| `server_health` | Check Postgres + Inference connectivity; reports `version`, `code_fingerprint` (detects a stale container) and `started_at` |
 
 ## MCP Resources
 | Resource | Description |
@@ -333,8 +333,11 @@ details are not. Earlier prompts judged "deploys to staging" vs "deploys to
 production" as neutral (both could be true) — the widened prompt detects those.
 
 **NLI outages are surfaced, never silent**: `/nli` sets an `error` field when
-scores are not a real judgment (provider down, not configured); the MCP client
-raises, write tools keep the fact but report `contradiction check skipped:
+**no** score is a real judgment (provider down, not configured); the MCP client
+raises. When only some documents fail it sets `partial_error` and `failed`:
+the successful scores are real, the failed ones are 0.0 and
+`contradictions_report` reports `scan partially incomplete: ...`. Write tools
+keep the fact but report `contradiction check skipped:
 NLI unavailable: ...` in `warnings` **and** `contradictions.skipped`;
 `contradictions_report` marks the scan as incomplete in `warnings`
 ("scan incomplete: ... not a clean contradiction scan"). Zero contradiction
@@ -411,7 +414,9 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
   into that project. Re-importing the same file reports those ids as `skipped`;
   `skip_duplicates=false` inserts them again instead.
   A record with a broken `metadata` value is reported individually (in
-  `errors`) and skipped — the rest of the import still runs.
+  `errors`) and skipped — the rest of the import still runs. `invalid` counts
+  those records; they are a subset of `skipped`, so `imported + skipped`
+  still equals the number of records.
   `data` accepts the export object or its JSON string. The string form is the
   safer one: some MCP clients repack a JSON array inside a free-form object
   into `{"item": ...}` (the server tolerates that, but why rely on it).

@@ -242,9 +242,18 @@ def nli_score(payload: dict | None) -> float:
         score = float(payload.get("score", 0.0))
     except (TypeError, ValueError):
         return 0.0
-    if label == "contradiction" and score > 0.0:
-        return min(score, 1.0)
-    return 0.0
+    if label != "contradiction" or score <= 0.0:
+        return 0.0
+    if score > 1.0:
+        # Some providers answer in percent (e.g. 95). Normalize instead of
+        # silently clamping 95 to 1.0, which presented a malformed score as a
+        # perfect contradiction. An out-of-range value is understated rather
+        # than over-trusted (a false contradiction supersedes a good memory).
+        if score <= 100.0:
+            score /= 100.0
+        else:
+            return 0.0
+    return min(score, 1.0)
 
 
 def classify(config: LLMConfig, query: str, document: str) -> float:

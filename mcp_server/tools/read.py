@@ -659,6 +659,10 @@ def list_memories(
             item["forgotten"] = True
             if item.get("superseded_by") == SENTINEL_FORGOTTEN:
                 item["superseded_by"] = None
+        elif fields and "forgotten" in fields:
+            # Requested explicitly: report `false` instead of omitting the
+            # key, so the shape stays stable for the caller.
+            item["forgotten"] = False
         results.append(item)
     return ok(STATUS_OK, count=len(results), total=total, offset=offset,
               has_more=has_more,

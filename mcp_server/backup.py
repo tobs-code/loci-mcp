@@ -432,11 +432,13 @@ def import_memories(
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return fail(STATUS_ERROR, str(e), imported=imported, skipped=skipped)
+        return fail(STATUS_ERROR, str(e), imported=imported, skipped=skipped,
+                    invalid=len(errors))
     finally:
         conn.close()
 
-    result = {"imported": imported, "skipped": skipped}
+    result = {"imported": imported, "skipped": skipped,
+              "invalid": len(errors)}
     if graph is not None:
         result["graph_entities"] = graph_entities
         result["graph_relations"] = graph_relations

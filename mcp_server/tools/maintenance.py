@@ -6,7 +6,7 @@ from pydantic import Field
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
-from mcp_server.inference_client import health_details, nli
+from mcp_server.inference_client import health_details, nli_detailed
 from mcp_server.scopes import (
     _all_mem_tables,
     _norm_project,
@@ -14,6 +14,7 @@ from mcp_server.scopes import (
     _retrieval_tables,
 )
 from mcp_server.search import _search_memories
+from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,11 @@ def contradictions_report(entity: Annotated[
             if len(contradictions) >= limit:
                 break
             # One LLM call per fact instead of one per pair.
-            scores = nli(f["content"], [n[1] for n in neighbours])
+            scores, partial = nli_detailed(f["content"], [n[1] for n in neighbours])
+            if partial:
+                note = f"scan partially incomplete: {partial}"
+                if note not in warnings:
+                    warnings.append(note)
             checked_pairs += len(neighbours)
             for (nid, ncontent), score in zip(neighbours, scores):
                 if len(contradictions) >= limit:
@@ -244,6 +249,9 @@ def server_health() -> dict[str, Any]:
     inference_details = health_details()
     return ok(
         STATUS_OK,
+        version=VERSION,
+        code_fingerprint=code_fingerprint(),
+        started_at=STARTED_AT,
         postgres=pg_ok,
         inference=inference_details is not None,
         nli_configured=(inference_details.get("llm_configured")
@@ -291,6 +299,9 @@ def stats_resource() -> str:
         conn.close()
 
     return json.dumps({
+        "version": VERSION,
+        "code_fingerprint": code_fingerprint(),
+        "started_at": STARTED_AT,
         "total_memories": total,
         "active_memories": active,
         "superseded_memories": superseded,

@@ -1,5 +1,8 @@
+import logging
 import os
 import requests
+
+logger = logging.getLogger(__name__)
 
 INFERENCE_URL = os.environ.get(
     "MEMORY_INFERENCE_URL",
@@ -27,9 +30,16 @@ def embed(texts: list[str], mode: str = "document") -> list[list[float]]:
     return r.json()["embeddings"]
 
 
-def nli(query: str, documents: list[str]) -> list[float]:
+def nli_detailed(query: str,
+                 documents: list[str]) -> tuple[list[float], str | None]:
+    """Return (scores, partial_error).
+
+    Raises when no document could be judged (outage). `partial_error` is set
+    when some documents failed: their score is 0.0 and must not be treated
+    as a clean "neutral" judgment.
+    """
     if not documents:
-        return []
+        return [], None
     resp = _get_session().post(
         f"{INFERENCE_URL}/nli",
         json={"query": query, "documents": documents},
@@ -38,10 +48,17 @@ def nli(query: str, documents: list[str]) -> list[float]:
     resp.raise_for_status()
     payload = resp.json()
     if payload.get("error"):
-        # The scores are zeros from an aborted run, not a real judgment:
+        # The scores are zeros from a failed run, not a real judgment:
         # callers must surface this instead of trusting 0.0 as "neutral".
         raise RuntimeError(payload["error"])
-    return payload["contradiction_scores"]
+    return payload["contradiction_scores"], payload.get("partial_error")
+
+
+def nli(query: str, documents: list[str]) -> list[float]:
+    scores, partial = nli_detailed(query, documents)
+    if partial:
+        logger.warning("%s", partial)
+    return scores
 
 
 def health() -> bool:

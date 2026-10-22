@@ -44,7 +44,10 @@ idempotent and restores the exact state. Project tables are recreated on
 demand, entities and relations are upserted with MERGE.
 
 Re-importing the same file reports the existing ids as `skipped`;
-`skip_duplicates=false` inserts them again instead.
+`skip_duplicates=false` inserts them again instead. Records that fail
+validation (bad metadata, blank project, broken row) are counted in `invalid`
+and listed in `errors`; they are a subset of `skipped`, so
+`imported + skipped` still equals the number of records.
 
 ## Pass the payload as a string
 

@@ -131,9 +131,12 @@ def _entity_not_found_hint(cur, entity_name: str, project: str | None) -> str:
         return (f"entity not found in the {scope} graph: {entity_name} "
                 f"(it exists in: {', '.join(sorted(other_scopes))} - pass "
                 f"project=<name> to search that graph)")
+    if project is None:
+        return (f"entity not found in the {scope} graph: {entity_name} "
+                f"(without project the global graph is searched; pass "
+                f"project=<name> if the entity lives in a project)")
     return (f"entity not found in the {scope} graph: {entity_name} "
-            f"(without project the global graph is searched; pass "
-            f"project=<name> if the entity lives in a project)")
+            f"(the entity may live in another project; pass that project)")
 
 
 def _sync_context_weight(cur, project: str | None, from_entity: str,
