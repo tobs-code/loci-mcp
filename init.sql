@@ -18,6 +18,7 @@ CREATE TABLE memories (
     access_count INT DEFAULT 0,
     superseded_by TEXT,
     deleted_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );

@@ -265,21 +265,23 @@ scan"]`) when the loop aborts mid-way.
   active, the new fact is stored additionally and the response carries a
   warning — replacing an unrelated fact would destroy it silently.
 
-Metadata of replaced memories is not lost: keys the new fact does not set are
-merged into the new memory (explicitly passed metadata always wins). The
-response lists the carried keys in a warning (`metadata carried over from
-the replaced memories: ...`).
+Metadata of replaced memories is not lost by default: keys the new fact does
+not set are merged into the new memory (explicitly passed metadata always
+wins). The response lists the carried keys in a warning (`metadata carried
+over from the replaced memories: ...`). Pass `metadata_mode="replace"` to drop
+the old keys instead.
 
 `remember` also warns when the new content matches a **superseded** memory: the
 fact is still stored as active (an intentional revert is legitimate), but the
 response names the old id and its replacement, so the fork is visible instead
 of silently reintroducing an invalidated fact.
 
-A stored fact that is still very similar to an active memory is reported as a
-**near-duplicate** (cosine similarity >= 0.75) without being rejected: the
-warning names the similar id and the measured similarity, so a reworded
-duplicate or a silent fork is visible even when dedupe let it through.
-`dedupe="off"` skips the check by design.
+A fact that is still very similar to an active memory is a **near-duplicate**
+(cosine similarity >= 0.75). `on_near_duplicate` decides what happens: `warn`
+(default) stores it and names the similar id and the measured similarity;
+`supersede` replaces the old memory; `reject` answers `duplicate` and stores
+nothing. `auto_supersede_near_duplicate=true` is the backwards-compatible
+alias for `supersede`. `dedupe="off"` skips the check only for `warn`.
 
 A write that invalidates a fact of the shared `memories` table (the
 contradiction check or an explicit `supersede` of a global id) hides it from

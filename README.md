@@ -1,7 +1,7 @@
 # Loci — Memory Server for AI Agents
 
 An MCP server that gives an agent a **persistent memory**: vector search over
-PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 23 tools to write,
+PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 24 tools to write,
 read, connect and forget.
 
 - **Hybrid retrieval** — vector similarity *and* full-text search, so both
@@ -58,10 +58,10 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 |------|--------------|
 | `remember` | Store a fact, decision or learning (auto-embedded, deduplicated) |
 | `remember_batch` | Store many facts at once |
-| `update_memory` | Change content, importance, metadata, entity or type |
+| `update_memory` | Change content, importance, metadata, entity, type or TTL |
 | `update_batch` | Update many memories in one call |
 | `forget` | Soft delete or hard delete, by id or by entity |
-| `restore_memory` | Bring a soft-forgotten memory back |
+| `restore_memory` | Bring one or several soft-forgotten memories back |
 | `touch_memory` | Refresh a memory's recency without changing its content |
 
 **Read**
@@ -70,6 +70,7 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 |------|--------------|
 | `recall` | Hybrid vector + full-text search with ranking, decay and graph boost |
 | `list_memories` | Browse memories without a query (filter, sort, page) |
+| `get_memory` | Fetch one memory by id, including hidden rows |
 | `get_entity` | Everything known about one entity |
 | `list_entities` | Browse the entities of a scope |
 | `init_context` | Session bootstrap: the most recently changed memories |
@@ -80,8 +81,8 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 | Tool | What it does |
 |------|--------------|
 | `relate` / `relate_batch` | Create relations between entities |
-| `unrelate` | Remove a relation |
-| `find_connections` | Traverse the graph from an entity |
+| `unrelate` | Remove a relation, optionally keeping its context sentence |
+| `find_connections` | Traverse the graph from an entity (paged) |
 | `find_paths` | Shortest path between two entities |
 
 **Maintenance**

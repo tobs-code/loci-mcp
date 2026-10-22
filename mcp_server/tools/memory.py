@@ -116,7 +116,14 @@ class BatchFact(BaseModel):
         default=None,
         json_schema_extra={"type": ["boolean", "null"]},
         description="Replace an active near-duplicate (similarity >= 0.75) "
-                    "instead of storing the reworded copy as a fork.")
+                    "instead of storing the reworded copy as a fork. "
+                    "Alias for on_near_duplicate='supersede'.")
+    on_near_duplicate: Any = Field(
+        default=None,
+        json_schema_extra={"type": ["string", "null"],
+                           "enum": ["warn", "supersede", "reject", None]},
+        description="'warn' stores and warns, 'supersede' replaces the "
+                    "near-duplicate, 'reject' stores nothing.")
     expires_at: Any = Field(default=None, json_schema_extra={
         "type": ["string", "null"]},
         description="Optional ISO 8601 timestamp when this memory stops "
@@ -199,6 +206,12 @@ class BatchUpdate(BaseModel):
     }, description="Duplicate check for a content change: 'exact', 'semantic' or 'off'.")
     fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                                  description="Similarity threshold 0.0-1.0 for semantic dedupe.")
+    expires_at: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="New ISO 8601 TTL timestamp.")
+    clear_expires_at: Any = Field(default=None, json_schema_extra={
+        "type": ["boolean", "null"]},
+        description="Remove the TTL (mutually exclusive with expires_at).")
 
 
 def _sanitize_batch_update(value: Any) -> Any:
@@ -274,7 +287,21 @@ def remember(
                           "active memory (near-duplicate similarity >= 0.75), "
                           "replace that memory instead of storing a "
                           "duplicate; the response lists it in "
-                          "`superseded`.")] = False,
+                          "`superseded`. Backwards-compatible alias for "
+                          "`on_near_duplicate='supersede'`.")] = False,
+    on_near_duplicate: Annotated[
+        Literal["warn", "supersede", "reject"],
+        Field(description="What to do with a near-duplicate that dedupe did "
+                          "not reject: 'warn' stores it and warns (default), "
+                          "'supersede' replaces the old memory, 'reject' "
+                          "stores nothing and answers `duplicate` with "
+                          "`duplicate_mode='near'`.")] = "warn",
+    metadata_mode: Annotated[
+        Literal["merge", "replace"],
+        Field(description="Metadata handling when this fact supersedes "
+                          "another memory: 'merge' (default) carries keys the "
+                          "new fact does not set from the old memory, "
+                          "'replace' ignores the old metadata entirely.")] = "merge",
     expires_at: Annotated[
         str | None,
         Field(description="Optional ISO 8601 timestamp (e.g. '2027-01-15' or "
@@ -296,9 +323,12 @@ def remember(
     `supersede_last` refuses to replace a fact
     that is about a different topic (it would destroy it); the new fact is
     stored additionally and the response carries a warning.
-    `auto_supersede_near_duplicate=true` turns the near-duplicate warning
-    into an action: the reworded copy replaces the old memory instead of
-    forking it.
+    `on_near_duplicate` decides what happens when dedupe did not reject a
+    reworded copy: "warn" (default) stores it and warns, "supersede" replaces
+    the old memory, "reject" stores nothing. `auto_supersede_near_duplicate`
+    is the backwards-compatible alias for "supersede".
+    `metadata_mode="merge"` (default) carries metadata keys of a replaced
+    memory that the new fact does not set; "replace" drops them.
     `dedupe` selects how duplicates are detected: "exact" (default, content
     hash), "semantic" (also vector similarity, see `fuzzy_threshold`) or "off".
     A duplicate answer names the mode that matched ("exact" or "semantic") and
@@ -329,6 +359,15 @@ def remember(
     if dedupe not in DEDUPE_MODES:
         return fail(STATUS_ERROR,
                     f"Invalid dedupe. Choose from: {', '.join(sorted(DEDUPE_MODES))}")
+    if on_near_duplicate not in ("warn", "supersede", "reject"):
+        return fail(STATUS_ERROR,
+                    "on_near_duplicate must be 'warn', 'supersede' or 'reject'")
+    if metadata_mode not in ("merge", "replace"):
+        return fail(STATUS_ERROR,
+                    "metadata_mode must be 'merge' or 'replace'")
+    near_policy = on_near_duplicate
+    if auto_supersede_near_duplicate and on_near_duplicate == "warn":
+        near_policy = "supersede"
     content = (content or "").strip()
     if not content:
         return fail(STATUS_ERROR, "content must not be empty")
@@ -413,7 +452,7 @@ def remember(
         # response can warn. dedupe='off' means "store everything", so it
         # also skips this warning.
         near_dup = (_find_near_duplicate(cur, content, store_project, emb)
-                    if (dedupe != "off" or auto_supersede_near_duplicate)
+                    if (dedupe != "off" or near_policy != "warn")
                     else None)
 
         contradictions = []
@@ -445,13 +484,26 @@ def remember(
             conn.rollback()
             return fail(STATUS_ERROR, str(e))
 
-        # `auto_supersede_near_duplicate` turns the near-duplicate warning
-        # into an action: instead of forking the old fact (old + reworded
-        # copy side by side), the new memory replaces the matching one. The
-        # near-duplicate check already ran above; the floor is the
-        # NEAR_DUPLICATE_THRESHOLD, so only a reworded copy qualifies.
+        # The near-duplicate policy turns the warning into an action. `reject`
+        # writes nothing at all - the caller explicitly asked not to fork a
+        # reworded copy and expects a duplicate answer instead.
         auto_near: dict | None = None
-        if auto_supersede_near_duplicate and near_dup \
+        if near_dup and near_policy == "reject" \
+                and near_dup["id"] not in superseded:
+            conn.rollback()
+            return ok(
+                STATUS_DUPLICATE, id=near_dup["id"],
+                duplicate_of=near_dup["id"], duplicate_mode="near",
+                similarity=near_dup["similarity"],
+                scope=effective_scope,
+                project=(store_project or "global"),
+                warnings=[
+                    f"near-duplicate rejected: active memory {near_dup['id']} "
+                    f"matches this content with similarity "
+                    f"{near_dup['similarity']}; nothing was stored (pass "
+                    f"on_near_duplicate='supersede' to replace it or 'warn' "
+                    f"to store it anyway)"])
+        if near_dup and near_policy == "supersede" \
                 and near_dup["id"] not in superseded:
             auto_near = near_dup
             superseded.append(near_dup["id"])
@@ -483,7 +535,7 @@ def remember(
         # superseding fact does not silently drop provenance (tickets, ...)
         # on the previous fact. Keys set explicitly by the caller win.
         carried_keys: list[str] = []
-        if superseded:
+        if superseded and metadata_mode == "merge":
             table = _mem_table(store_project)
             for old_id in superseded:
                 cur.execute(
@@ -765,15 +817,20 @@ def remember_batch(
         Literal["exact", "semantic", "off"],
         Field(description="Duplicate detection: 'exact' (default), 'semantic' or "
                           "'off'.")] = "exact",
+    on_near_duplicate: Annotated[
+        Literal["warn", "supersede", "reject"],
+        Field(description="Default policy for near-duplicates (per-fact "
+                          "'on_near_duplicate' wins): 'warn', 'supersede' or "
+                          "'reject'.")] = "warn",
 ) -> dict[str, Any]:
     """Store multiple facts at once. Each dict needs 'content'.
 
     Optional keys: mem_type (one of the memory types), entity, importance,
     metadata, scope ("project" or "global"), project, supersede (memory id
-    or content), supersede_content, supersede_last,
+    or content), supersede_content, supersede_last, on_near_duplicate
+    ("warn"/"supersede"/"reject"),
     auto_supersede_near_duplicate, expires_at (ISO 8601 TTL timestamp),
-    fuzzy_threshold, and dedupe ("exact",
-    "semantic", or "off").
+    fuzzy_threshold, and dedupe ("exact", "semantic", or "off").
     Set skip_duplicates=False to allow storing identical content multiple times.
     Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
     Per-fact 'fuzzy_threshold' overrides the top-level value.
@@ -805,6 +862,10 @@ def remember_batch(
         return fail(STATUS_ERROR,
                     f"invalid dedupe {dedupe!r}; choose from "
                     f"{', '.join(sorted(DEDUPE_MODES))}")
+    if on_near_duplicate not in ("warn", "supersede", "reject"):
+        return fail(STATUS_ERROR,
+                    "on_near_duplicate must be 'warn', 'supersede' or "
+                    "'reject'")
     if fuzzy_threshold is not None and not 0.0 <= fuzzy_threshold <= 1.0:
         return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
     if not isinstance(facts, list) or not facts:
@@ -863,6 +924,14 @@ def remember_batch(
         if ft is not None and not 0.0 <= ft <= 1.0:
             prepared.append((None, "fuzzy_threshold must be between 0.0 and 1.0"))
             continue
+        fact_near = fact.get("on_near_duplicate") or on_near_duplicate
+        if fact_near not in ("warn", "supersede", "reject"):
+            prepared.append((None,
+                             "on_near_duplicate must be 'warn', 'supersede' "
+                             "or 'reject'"))
+            continue
+        if fact.get("auto_supersede_near_duplicate") and fact_near == "warn":
+            fact_near = "supersede"
         meta = fact.get("metadata") or {}
         if isinstance(meta, str):
             try:
@@ -894,8 +963,7 @@ def remember_batch(
             "supersede": fact.get("supersede"),
             "supersede_content": fact.get("supersede_content"),
             "supersede_last": bool(fact.get("supersede_last")),
-            "auto_supersede_near_duplicate":
-                bool(fact.get("auto_supersede_near_duplicate")),
+            "on_near_duplicate": fact_near,
             "expires_at": fexpires,
         }, None))
 
@@ -982,9 +1050,12 @@ def remember_batch(
                     # skip_duplicates=False means "store duplicates anyway",
                     # so the whole check (and its warning) is skipped then.
                     if fact_dedupe != "off" \
-                            or spec.get("auto_supersede_near_duplicate"):
+                            or spec["on_near_duplicate"] != "warn":
                         near_dup = _find_near_duplicate(
                             cur, spec["content"], store_project, embeddings[i])
+                elif spec["on_near_duplicate"] != "warn":
+                    near_dup = _find_near_duplicate(
+                        cur, spec["content"], store_project, embeddings[i])
 
                 contradictions = []
                 contradiction_skip: str | None = None
@@ -1006,10 +1077,29 @@ def remember_batch(
                     spec["supersede_content"], spec["supersede_last"],
                     embeddings[i],
                 )
-                # Per-fact flag: a near-duplicate replaces the old memory
-                # instead of forking it (same semantics as in `remember`).
-                fact_auto_near = spec.get("auto_supersede_near_duplicate")
-                if fact_auto_near and near_dup \
+                # Per-fact near-duplicate policy (same semantics as in
+                # `remember`): reject stores nothing, supersede replaces.
+                fact_near_policy = spec["on_near_duplicate"]
+                if near_dup and fact_near_policy == "reject" \
+                        and near_dup["id"] not in superseded:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    results.append({
+                        "id": near_dup["id"],
+                        "content": spec["content"],
+                        "status": "duplicate",
+                        "duplicate_of": near_dup["id"],
+                        "duplicate_mode": "near",
+                        "similarity": near_dup["similarity"],
+                        "scope": spec["scope"],
+                        "project": (store_project or "global"),
+                        "warnings": [
+                            f"near-duplicate rejected: active memory "
+                            f"{near_dup['id']} matches this content with "
+                            f"similarity {near_dup['similarity']}; nothing "
+                            f"was stored"],
+                    })
+                    continue
+                if near_dup and fact_near_policy == "supersede" \
                         and near_dup["id"] not in superseded:
                     superseded.append(near_dup["id"])
 
@@ -1054,7 +1144,7 @@ def remember_batch(
                      "project": (store_project or "global")}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
-            if near_dup and spec.get("auto_supersede_near_duplicate"):
+            if near_dup and spec["on_near_duplicate"] == "supersede":
                 entry.setdefault("warnings", []).append(
                     f"auto-supersede: replaced near-duplicate "
                     f"{near_dup['id']} (similarity {near_dup['similarity']}) "
@@ -1136,13 +1226,22 @@ def update_memory(
         float | None,
         Field(description="Similarity threshold 0.0-1.0 for semantic dedupe "
                           "(default 0.85). Only used by dedupe='semantic'.")] = None,
+    expires_at: Annotated[
+        str | None,
+        Field(description="New ISO 8601 TTL timestamp for the memory.")] = None,
+    clear_expires_at: Annotated[
+        bool,
+        Field(description="Remove the TTL entirely (makes the memory "
+                          "open-ended again). Mutually exclusive with "
+                          "expires_at.")] = False,
 ) -> dict[str, Any]:
-    """Update an existing memory's content, importance, metadata, entity or type.
+    """Update an existing memory's content, importance, metadata, entity, type or TTL.
 
     Without `project`, the memory is looked up in every scope. A memory id is
     unique per scope, so an id that exists in several scopes (an import copies
     the id) is refused: the response names the scopes, and `project` says
     which one to update.
+    `expires_at` sets a new TTL (`clear_expires_at=True` removes it).
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
                 memory_id, content is not None, importance is not None, metadata is not None)
@@ -1156,6 +1255,18 @@ def update_memory(
                     f"Invalid dedupe. Choose from: {', '.join(sorted(DEDUPE_MODES))}")
     if fuzzy_threshold is not None and not 0.0 <= fuzzy_threshold <= 1.0:
         return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
+    if expires_at is not None and clear_expires_at:
+        return fail(STATUS_ERROR,
+                    "pass either expires_at or clear_expires_at, not both")
+    expires_value: datetime | None = None
+    if expires_at is not None:
+        try:
+            expires_value = datetime.fromisoformat(
+                str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            return fail(STATUS_ERROR,
+                        "expires_at must be an ISO 8601 timestamp "
+                        "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
     sets: list[str] = []
     params: list[Any] = []
     emb: list[float] | None = None
@@ -1195,6 +1306,11 @@ def update_memory(
                         f"{', '.join(sorted(MEMORY_TYPES))}")
         sets.append("mem_type = %s")
         params.append(mem_type)
+    if expires_at is not None:
+        sets.append("expires_at = %s")
+        params.append(expires_value)
+    elif clear_expires_at:
+        sets.append("expires_at = NULL")
 
     if sets:
         # Updated memories must also age like new ones for decay scoring.
@@ -1241,7 +1357,8 @@ def update_memory(
             conn.rollback()
             return fail(STATUS_ERROR,
                         "nothing to update: pass content, importance, metadata, "
-                        "entity or mem_type", id=memory_id)
+                        "entity, mem_type or expires_at/clear_expires_at",
+                        id=memory_id)
         scope = _scope_of_table(cur, active_table)
         near_dup = None
         if content is not None and dedupe != "off":
@@ -1290,7 +1407,8 @@ def update_batch(
         list[BatchUpdateInput],
         Field(description="Updates to apply. Each entry needs 'memory_id'; "
                           "optional 'content', 'importance', 'metadata', "
-                          "'entity', 'mem_type' and 'project'. Invalid "
+                          "'entity', 'mem_type', 'expires_at', "
+                          "'clear_expires_at' and 'project'. Invalid "
                           "entries are reported individually and the rest is "
                           "still applied.")],
     project: Annotated[
@@ -1313,8 +1431,8 @@ def update_batch(
     """Update several memories at once (savepoints per entry).
 
     Each entry works like one `update_memory` call: `content` changes
-    re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` are
-    applied as given. An unknown id answers `not_found` in its entry, an id
+    re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` and the
+    TTL (`expires_at`/`clear_expires_at`) are applied as given. An unknown id answers `not_found` in its entry, an id
     that exists in several scopes without a `project` answers `error` with
     the `scopes` - one bad entry never aborts the rest (unlike
     `relate_batch`, which is all-or-nothing).
@@ -1412,9 +1530,21 @@ def update_batch(
             else:
                 if not 0.0 <= entry_fuzzy <= 1.0:
                     error = "fuzzy_threshold must be between 0.0 and 1.0"
+        entry_expires = entry.get("expires_at")
+        entry_clear = bool(entry.get("clear_expires_at"))
+        if error is None and entry_expires is not None and entry_clear:
+            error = "pass either expires_at or clear_expires_at, not both"
+        elif error is None and entry_expires is not None:
+            try:
+                fields["expires_at"] = datetime.fromisoformat(
+                    str(entry_expires).replace("Z", "+00:00"))
+            except ValueError:
+                error = "expires_at must be an ISO 8601 timestamp"
+        elif error is None and entry_clear:
+            fields["expires_at"] = None
         if error is None and not fields:
             error = ("nothing to update: pass content, importance, metadata, "
-                     "entity or mem_type")
+                     "entity, mem_type or expires_at/clear_expires_at")
         if error:
             prepared.append((None, error))
         else:
@@ -1680,12 +1810,17 @@ def touch_memory(
 
 def restore_memory(
     memory_id: Annotated[
-        str,
-        Field(description="Id of the soft-forgotten memory to restore.")],
+        str | None,
+        Field(description="Id of the soft-forgotten memory to restore.")] = None,
     project: Annotated[
         str | None,
         Field(description="Project scope. Without it the id is looked up in "
                           "every scope.")] = None,
+    memory_ids: Annotated[
+        list[str] | None,
+        Field(description="Ids of several soft-forgotten memories to restore "
+                          "in one call. Each id is validated individually; "
+                          "mutually exclusive with `memory_id`.")] = None,
 ) -> dict[str, Any]:
     """Bring a soft-forgotten memory back.
 
@@ -1700,8 +1835,27 @@ def restore_memory(
 
     Without `project` the id is looked up in every scope. An id that exists in
     several scopes is refused; pass `project` to select one.
+    Pass `memory_ids` to restore several ids in one call; each entry is
+    validated individually and reported in `results`.
     """
-    logger.info("restore_memory id=%s project=%s", memory_id, project)
+    logger.info("restore_memory id=%s ids=%s project=%s", memory_id,
+                len(memory_ids) if isinstance(memory_ids, list) else None,
+                project)
+    if memory_id and memory_ids is not None:
+        return fail(STATUS_ERROR,
+                    "pass either memory_id or memory_ids, not both")
+    if memory_ids is not None:
+        if not isinstance(memory_ids, list) or not memory_ids:
+            return fail(STATUS_ERROR, "memory_ids must be a non-empty list")
+        results = [restore_memory(memory_id=mid, project=project)
+                   for mid in memory_ids]
+        restored = [r for r in results if r.get("ok")]
+        failed = [r for r in results if not r.get("ok")]
+        status = STATUS_RESTORED if not failed else STATUS_PARTIAL
+        warnings = ([f"{len(failed)} id(s) could not be restored"]
+                    if failed else [])
+        return ok(status, count=len(results), restored=len(restored),
+                  results=results, warnings=warnings)
     memory_id = (memory_id or "").strip()
     if not memory_id:
         return fail(STATUS_ERROR, "memory_id must not be empty")

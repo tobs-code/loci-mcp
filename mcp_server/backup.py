@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -20,6 +20,7 @@ from mcp_server.scopes import (
     _table_exists,
 )
 from mcp_server.scoring import _content_hash, _gen_id, _now
+from mcp_server.search import _extra_conditions
 from mcp_server.storage import _deduplicate
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,11 @@ logger = logging.getLogger(__name__)
 def _export_memories_json(cur, project: str | None,
                           include_superseded: bool = False,
                           include_embeddings: bool = False,
-                          only_global: bool = False) -> list[dict]:
+                          only_global: bool = False,
+                          entity: str | None = None,
+                          mem_type: str | None = None,
+                          updated_after: str | None = None,
+                          metadata_filter: dict | None = None) -> list[dict]:
     names = _project_names(cur)
     if project:
         tables = [(_mem_table(project), project)]
@@ -41,13 +46,29 @@ def _export_memories_json(cur, project: str | None,
         tables += [(t, names.get(t[len("mem_"):], t[len("mem_"):]))
                    for t in _project_tables(cur)]
     emb_col = ", embedding" if include_embeddings else ""
-    where = "" if include_superseded else "WHERE superseded_by IS NULL AND deleted_at IS NULL"
+    conditions: list[str] = []
+    params: list[Any] = []
+    if not include_superseded:
+        conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+    if entity:
+        conditions.append("entity = %s")
+        params.append(entity)
+    if mem_type:
+        conditions.append("mem_type = %s")
+        params.append(mem_type)
+    extra_conditions, extra_params = _extra_conditions(updated_after,
+                                                       metadata_filter)
+    conditions.extend(extra_conditions)
+    params.extend(extra_params)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     out: list[dict] = []
     for table, scope_name in tables:
         cur.execute(
             f"SELECT id, content, mem_type, entity, importance, metadata, "
-            f"access_count, superseded_by, deleted_at, created_at, updated_at{emb_col} "
-            f"FROM {table} {where}"
+            f"access_count, superseded_by, deleted_at, expires_at, "
+            f"created_at, updated_at{emb_col} "
+            f"FROM {table} {where}",
+            params,
         )
         colnames = [desc[0] for desc in cur.description]
         for row in cur.fetchall():
@@ -140,6 +161,21 @@ def export_memories(
     include_graph: Annotated[
         bool,
         Field(description="Include entities and relations (JSON exports only).")] = True,
+    entity: Annotated[
+        str | None,
+        Field(description="Only export memories of this entity.")] = None,
+    mem_type: Annotated[
+        str | None,
+        Field(description="Only export memories of this type.")] = None,
+    updated_after: Annotated[
+        str | None,
+        Field(description="Only export memories changed at or after this ISO "
+                          "date, e.g. '2026-10-01'.")] = None,
+    metadata_filter: Annotated[
+        dict[str, Any] | None,
+        Field(description="Only export memories whose metadata contains these "
+                          "key/value pairs (same tolerant comparison as "
+                          "`list_memories`).")] = None,
 ) -> dict[str, Any]:
     """Export memories (and optionally the graph) as JSON or JSONL.
 
@@ -168,7 +204,10 @@ def export_memories(
         cur = conn.cursor()
         rows = _export_memories_json(cur, project, include_superseded,
                                      include_embeddings,
-                                     only_global=only_global)
+                                     only_global=only_global,
+                                     entity=entity, mem_type=mem_type,
+                                     updated_after=updated_after,
+                                     metadata_filter=metadata_filter)
         graph = (_export_graph(cur, project, only_global=only_global)
                  if (include_graph and format != "jsonl") else None)
         excluded = ((0, 0) if include_superseded
@@ -198,6 +237,12 @@ def export_memories(
             "updated_at": r["updated_at"].isoformat() if isinstance(r["updated_at"], datetime) else str(r["updated_at"]),
             "access_count": r.get("access_count", 0),
             "superseded_by": r.get("superseded_by"),
+            # A backup must preserve the TTL: dropping it made an expired
+            # fact active again on import and silently removed a future TTL.
+            "expires_at": (r["expires_at"].isoformat()
+                           if isinstance(r.get("expires_at"), datetime)
+                           else (str(r["expires_at"])
+                                 if r.get("expires_at") is not None else None)),
         }
         if r.get("deleted_at") is not None:
             record["deleted_at"] = (r["deleted_at"].isoformat()
@@ -208,6 +253,16 @@ def export_memories(
         records.append(record)
 
     warnings: list[str] = []
+    now = datetime.now(timezone.utc)
+    expired_count = sum(
+        1 for r in rows
+        if isinstance(r.get("expires_at"), datetime)
+        and r["expires_at"] <= now)
+    if expired_count:
+        warnings.append(
+            f"export includes {expired_count} expired memories: they are "
+            f"backed up with their expires_at and stay inactive after an "
+            f"import")
     superseded_count, forgotten_count = excluded
     if superseded_count or forgotten_count:
         parts = []
@@ -229,7 +284,7 @@ def export_memories(
         return ok(STATUS_OK, format=format, count=len(records), data=data,
                   data_format="jsonl", graph_included=False,
                   warnings=warnings)
-    payload = {"type": "memory_export", "version": "0.2",
+    payload = {"type": "memory_export", "version": "0.3",
                "records": records, "count": len(records)}
     if graph is not None:
         payload["graph"] = graph
@@ -301,6 +356,10 @@ def import_memories(
         float | None,
         Field(description="Similarity threshold 0.0-1.0 for semantic dedup of "
                           "records without an id.")] = None,
+    dry_run: Annotated[
+        bool,
+        Field(description="True validates the payload and reports what would "
+                          "be imported without writing anything.")] = False,
 ) -> dict[str, Any]:
     """Import memories (and graph, for JSON exports).
 
@@ -417,6 +476,13 @@ def import_memories(
                 errors.append(f"record {rec.get('id') or imported + skipped}: {exc}")
                 skipped += 1
                 continue
+            expires = _parse_dt(rec.get("expires_at"))
+            if rec.get("expires_at") not in (None, "") and expires is None:
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: "
+                    f"expires_at is not a valid ISO 8601 timestamp")
+                skipped += 1
+                continue
             table = _mem_table(target)
             if target:
                 _ensure_project_table(cur, target)
@@ -453,17 +519,19 @@ def import_memories(
                 cur.execute(
                     f"INSERT INTO {table} (id, content, content_hash, embedding, "
                     f"mem_type, scope, entity, importance, metadata, access_count, "
-                    f"superseded_by, deleted_at, created_at, updated_at) "
+                    f"superseded_by, deleted_at, expires_at, created_at, updated_at) "
                     f"VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb, "
-                    f"%s, %s, %s, COALESCE(%s, NOW()), COALESCE(%s, NOW()))",
+                    f"%s, %s, %s, %s, COALESCE(%s, NOW()), "
+                    f"COALESCE(%s, COALESCE(%s, NOW())))",
                     (mid, content, _content_hash(content), emb,
                      rec.get("type") or rec.get("mem_type", "fact"),
                      "project" if target else "global",
                      rec.get("entity"), float(rec.get("importance", 1.0)),
                      json.dumps(meta), int(rec.get("access_count", 0) or 0),
                      rec.get("superseded_by"), _parse_dt(rec.get("deleted_at")),
-                     _parse_dt(rec.get("created_at")),
-                     _parse_dt(rec.get("updated_at"))),
+                     expires, _parse_dt(rec.get("created_at")),
+                     _parse_dt(rec.get("updated_at")),
+                     _parse_dt(rec.get("created_at"))),
                 )
                 imported += 1
             except Exception as exc:
@@ -512,7 +580,10 @@ def import_memories(
                 graph_relations_created += sum(
                     1 for edge in restored if edge.get("status") == "created")
 
-        conn.commit()
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
     except Exception as e:
         conn.rollback()
         return fail(STATUS_ERROR, str(e), imported=imported, skipped=skipped,
@@ -522,6 +593,8 @@ def import_memories(
 
     result = {"imported": imported, "skipped": skipped,
               "invalid": len(errors)}
+    if dry_run:
+        result["dry_run"] = True
     if graph is not None:
         # `graph_entities`/`graph_relations` count the records the import
         # processed; the `*_created` keys count what did not exist before.
@@ -566,6 +639,10 @@ def import_memories(
         skipped_parts.append(
             f"{len(errors)} record(s) were invalid (see errors)")
     warnings: list[str] = []
+    if dry_run:
+        warnings.append(
+            "dry-run: nothing was written; the counts describe what an "
+            "import would do")
     if skipped_parts:
         warnings.append("import skipped: " + "; ".join(skipped_parts))
     return ok(STATUS_OK, warnings=warnings, **result)

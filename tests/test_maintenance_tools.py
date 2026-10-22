@@ -24,7 +24,7 @@ def test_export_json_contains_records_and_graph():
     payload = exported["data"]
 
     assert payload["type"] == "memory_export"
-    assert payload["version"] == "0.2"
+    assert payload["version"] == "0.3"
     assert payload["count"] == 1
     assert payload["records"][0]["content"] == "Export me"
     assert payload["records"][0]["project"] == "alpha"

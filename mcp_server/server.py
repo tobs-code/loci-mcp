@@ -30,6 +30,7 @@ from mcp_server.tools.memory import (
 )
 from mcp_server.tools.read import (
     get_entity,
+    get_memory,
     init_context,
     list_entities,
     list_memories,
@@ -49,6 +50,7 @@ _TOOLS = (
     restore_memory,
     recall,
     list_memories,
+    get_memory,
     get_entity,
     list_entities,
     init_context,

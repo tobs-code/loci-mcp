@@ -16,19 +16,26 @@ export_memories(format="json", project="api")
 | `include_embeddings` | Include the vector of every memory (large). |
 | `include_superseded` | Include superseded (invalidated) memories. |
 | `include_graph` | Include entities and relations (JSON exports only). |
+| `entity` | Only records of this entity. |
+| `mem_type` | Only records of this type. |
+| `updated_after` | Only records changed at or after this ISO date. |
+| `metadata_filter` | Only records whose metadata contains these key/value pairs. |
 
 The payload is returned in `data` and can be passed to `import_memories`
 unchanged.
 
-The JSON format (version `0.2`, `"type": "memory_export"`) contains IDs,
-`superseded_by`, `deleted_at`, timestamps, `access_count`, the project of every
-record and — for JSON — the complete graph (entities with scope plus relations
-with weight and scope). JSONL is flat: one record per line, no graph.
+The JSON format (version `0.3`, `"type": "memory_export"`) contains IDs,
+`superseded_by`, TTL (`expires_at`), `deleted_at`, timestamps, `access_count`,
+the project of every record and — for JSON — the complete graph (entities with
+scope plus relations with weight and scope). JSONL is flat: one record per
+line, no graph.
 
-The default export is active-only and warns how many superseded/forgotten rows
-it left out. A forgotten row carries `deleted_at` and `superseded_by: null`;
-the internal `__forgotten__` sentinel is never exported (writing it back would
-make the row look superseded by a fake memory id).
+The default export leaves superseded/forgotten history out and says how many
+rows it excluded. Expired rows are included with their `expires_at` and an
+explicit warning, so they cannot silently become active again on import. A
+forgotten row carries `deleted_at` and `superseded_by: null`; the internal
+`__forgotten__` sentinel is never exported (writing it back would make the row
+look superseded by a fake memory id).
 
 ## Import
 
@@ -43,9 +50,10 @@ import_memories(data=<export data>, format="json")
 | `format` | `json` (default) or `jsonl`. |
 | `skip_duplicates` | Skip records whose content already exists when the record has **no** id (default `true`). A record whose id already exists is always skipped - that is what makes a re-import idempotent. |
 | `fuzzy_threshold` | Similarity threshold for semantic dedup of records without an id. |
+| `dry_run` | Validate and count without writing anything. |
 
-Records keep their `id`, timestamps and `superseded_by`, so a re-import is
-idempotent and restores the exact state. Project tables are recreated on
+Records keep their `id`, TTL (`expires_at`), timestamps and `superseded_by`, so
+a re-import is idempotent and restores the exact state. Project tables are recreated on
 demand, entities and relations are upserted with MERGE. `graph_entities` and
 `graph_relations` count the processed records; `graph_entities_created` and
 `graph_relations_created` count the ones that did not exist before (MERGE
@@ -73,9 +81,10 @@ import_memories(data=<the JSON string of the export payload>, format="json")
 ## A backup that keeps the history
 
 `include_superseded` defaults to `false`, so a plain export contains only the
-active memories. It also leaves soft-forgotten rows out. The answer names how
-many superseded and forgotten rows were excluded
-(`warnings`), so a backup is never silently incomplete. For a real backup take
+active memories. It also leaves soft-forgotten rows out, and it warns when it
+carries expired rows. The answer names how many superseded, forgotten and
+expired rows were excluded (`warnings`), so a backup is never silently
+incomplete. For a real backup take
 the history with it:
 
 ```text

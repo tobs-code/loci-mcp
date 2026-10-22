@@ -53,7 +53,8 @@ Graph tools use the global graph when `project` is omitted.
 ## Which tools accept `project`
 
 `remember`, `remember_batch`, `update_memory`, `update_batch`, `touch_memory`,
-`get_entity`, `list_entities`, `list_memories`, `recall`, `init_context`,
+`get_entity`, `list_entities`, `list_memories`, `get_memory`, `recall`,
+`init_context`,
 `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
 `forget`, `restore_memory`, `contradictions_report`, `export_memories`,
 `import_memories`, `drop_project`.
@@ -78,9 +79,9 @@ passed explicitly. `recall` searches the shared scope in both cases.
 A memory id is unique **per scope, not globally**: an import copies the id
 into the target scope, and then the same id exists in two scopes.
 
-`update_memory`, `touch_memory`, `restore_memory` and `forget(memory_id=...)`
-therefore refuse an id that exists in several scopes and name the scopes in the
-error:
+`update_memory`, `touch_memory`, `restore_memory`, `get_memory` and
+`forget(memory_id=...)` therefore refuse an id that exists in several scopes
+and name the scopes in the error:
 
 ```json
 {"ok": false, "status": "error",

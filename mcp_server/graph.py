@@ -432,8 +432,19 @@ def unrelate(
     project: Annotated[
         str | None,
         Field(description="Project scope of the graph.")] = None,
+    keep_context: Annotated[
+        bool,
+        Field(description="Keep the relation-context memory that `relate` "
+                          "stored for this edge. By default it is "
+                          "soft-forgotten together with the edge, so a "
+                          "deleted relation does not keep describing a "
+                          "connection that no longer exists.")] = False,
 ) -> dict[str, Any]:
-    """Delete a single directed relation between two entities."""
+    """Delete a single directed relation between two entities.
+
+    The context sentence of the edge is soft-forgotten too unless
+    `keep_context=True`: it describes an edge that no longer exists.
+    """
     logger.info("unrelate %s -[%s]-> %s project=%s",
                 from_entity, relation_type, to_entity, project)
     try:
@@ -456,6 +467,7 @@ def unrelate(
     from_json = json.dumps(from_entity)
     to_json = json.dumps(to_entity)
     conn = get_conn()
+    context_removed = 0
     try:
         cur = conn.cursor()
         cur.execute("SET search_path TO ag_catalog, public")
@@ -474,9 +486,10 @@ def unrelate(
                 "AND target_id = (SELECT id FROM entities WHERE name = %s AND project = %s)",
                 (relation_type, from_entity, scope, to_entity, scope),
             )
-            _forget_relation_context(
-                cur, project, from_entity, to_entity, relation_type,
-            )
+            if not keep_context:
+                context_removed = _forget_relation_context(
+                    cur, project, from_entity, to_entity, relation_type,
+                )
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -488,7 +501,9 @@ def unrelate(
         return fail(STATUS_NOT_FOUND,
                     f"no {relation_type} edge from {from_entity} to {to_entity}")
     return ok(STATUS_DELETED, from_entity=from_entity, to_entity=to_entity,
-              relation_type=relation_type)
+              relation_type=relation_type,
+              context_memories_removed=context_removed,
+              context_kept=keep_context)
 
 
 def find_connections(
@@ -505,6 +520,11 @@ def find_connections(
     limit: Annotated[
         int,
         Field(description="Maximum number of results (default 20).")] = 20,
+    offset: Annotated[
+        int,
+        Field(description="Skip this many connections (default 0). Use it "
+                          "with `limit` to page; the answer reports `total` "
+                          "and `has_more`.")] = 0,
     project: Annotated[
         str | None,
         Field(description="Project scope of the graph. Without it the global "
@@ -518,7 +538,9 @@ def find_connections(
     The start entity can be passed as `entity` or `entity_name`.
     `direction` is "outgoing", "incoming" or "both"; each result reports its
     own direction. `project` selects that project's graph; without it the
-    global graph is traversed.
+    global graph is traversed. `offset` pages through the connections; the
+    answer reports `total` and `has_more`, so a truncated list is never
+    mistaken for a complete neighbourhood.
     """
     if entity and entity_name and entity.strip() != entity_name.strip():
         return fail(
@@ -537,6 +559,8 @@ def find_connections(
         return fail(STATUS_ERROR, "entity is required")
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
+    if offset < 0:
+        return fail(STATUS_ERROR, "offset must be >= 0")
     if direction not in ("outgoing", "incoming", "both"):
         return fail(STATUS_ERROR,
                     "direction must be 'outgoing', 'incoming' or 'both'")
@@ -548,14 +572,22 @@ def find_connections(
     label = _scope_label(project)
     rtype_cypher = f":{relation_type}" if relation_type else ""
     name_json = json.dumps(entity_name)
-    query = f"""
-        MATCH (a:{label})-[r{rtype_cypher}]-(b)
-        WHERE a.name = {name_json}
-        RETURN b.name AS connected_entity, type(r) AS relation_type,
-               coalesce(r.weight, 1.0) AS w, startNode(r).name AS src,
-               endNode(r).name AS tgt
-        LIMIT {int(limit) * 4}
-    """
+    if direction == "outgoing":
+        pattern = f"(a:{label})-[r{rtype_cypher}]->(b)"
+    elif direction == "incoming":
+        pattern = f"(a:{label})<-[r{rtype_cypher}]-(b)"
+    else:
+        pattern = f"(a:{label})-[r{rtype_cypher}]-(b)"
+    base_query = f"MATCH {pattern} WHERE a.name = {name_json}"
+    count_query = f"{base_query} RETURN count(r)"
+    data_query = (
+        f"{base_query} "
+        f"RETURN b.name AS connected_entity, type(r) AS relation_type, "
+        f"coalesce(r.weight, 1.0) AS w, startNode(r).name AS src, "
+        f"endNode(r).name AS tgt "
+        f"ORDER BY coalesce(r.weight, 1.0) DESC, b.name, type(r) "
+        f"SKIP {int(offset)} LIMIT {int(limit)}"
+    )
 
     conn = get_conn()
     try:
@@ -571,7 +603,13 @@ def find_connections(
                         entity=entity_name, scope=_scope_key(project))
         cur.execute("SET search_path TO ag_catalog, public")
         cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ {query} $$) AS "
+            f"SELECT * FROM cypher('memory_graph', $$ {count_query} $$) AS "
+            f"(total agtype)"
+        )
+        row = cur.fetchone()
+        total = int(str(row[0])) if row else 0
+        cur.execute(
+            f"SELECT * FROM cypher('memory_graph', $$ {data_query} $$) AS "
             f"(connected_entity agtype, relation_type agtype, weight agtype, "
             f"src agtype, tgt agtype)",
         )
@@ -579,9 +617,12 @@ def find_connections(
         for row in cur.fetchall():
             src = _ag_str(row[3])
             tgt = _ag_str(row[4])
-            edge_dir = "outgoing" if src == entity_name else "incoming"
-            if direction != "both" and edge_dir != direction:
-                continue
+            if direction == "outgoing":
+                edge_dir = "outgoing"
+            elif direction == "incoming":
+                edge_dir = "incoming"
+            else:
+                edge_dir = "outgoing" if src == entity_name else "incoming"
             results.append({
                 "entity": _ag_str(row[0]),
                 "relation": _ag_str(row[1]),
@@ -590,16 +631,22 @@ def find_connections(
                 "from_entity": src,
                 "to_entity": tgt,
             })
-        # Strongest edges first, then alphabetical for stable output.
-        results.sort(key=lambda r: (-r["weight"], r["entity"], r["relation"]))
-        results = results[:limit]
         conn.commit()
     except Exception as e:
         conn.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    return ok(STATUS_OK, count=len(results), results=results)
+    has_more = total > offset + limit
+    warnings: list[str] = []
+    if offset > 0 and total > 0 and not results:
+        warnings.append(
+            f"no results on this page: offset={offset} is beyond the "
+            f"{total} connection(s); lower the offset")
+    return ok(STATUS_OK, count=len(results), total=total, offset=offset,
+              has_more=has_more,
+              next_offset=(offset + limit) if has_more else None,
+              warnings=warnings, results=results)
 
 
 def find_paths(from_entity: Annotated[

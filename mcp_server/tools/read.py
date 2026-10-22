@@ -26,12 +26,14 @@ from mcp_server.scopes import (
     _all_mem_tables,
     _count_entities,
     _is_global_scope,
+    _memory_scopes,
     _norm_entity,
     _norm_project,
     _project_names,
     _retrieval_tables,
     _scope_key,
     _scope_label,
+    _scope_of_table,
     _scopes_of_tables,
     _unknown_project_warning,
 )
@@ -53,6 +55,45 @@ _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 def _escape_like(value: str) -> str:
     """Escape the wildcards of a LIKE/ILIKE pattern."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _visibility_condition(include_deleted: bool, include_superseded: bool,
+                          include_expired: bool) -> str:
+    """SQL filter for the orthogonal visibility flags.
+
+    Active rows are always visible (unless expired); `include_superseded`
+    adds history, `include_deleted` adds forgotten rows, and `include_expired`
+    adds rows whose TTL has passed. A forgotten row stays visible through
+    `include_deleted` even when it was superseded as well, exactly like the
+    listing behaved before expired rows were separated out.
+    """
+    if include_deleted and include_superseded:
+        base = "TRUE"
+    elif include_deleted:
+        base = "(deleted_at IS NOT NULL OR superseded_by IS NULL)"
+    elif include_superseded:
+        base = "deleted_at IS NULL"
+    elif include_expired:
+        base = "superseded_by IS NULL AND deleted_at IS NULL"
+    else:
+        base = ACTIVE_ROW_SQL
+    if include_expired:
+        return base
+    # Expired rows are neither active history nor forgotten: only an explicit
+    # `include_expired` exposes them. Deleted/superseded rows stay visible
+    # through their own flag, because a TTL does not change their history.
+    return (f"({base}) AND (deleted_at IS NOT NULL OR "
+            f"superseded_by IS NOT NULL OR expires_at IS NULL OR "
+            f"expires_at > NOW())")
+
+
+def _is_expired(value: Any) -> bool:
+    """True when a stored `expires_at` timestamp is in the past."""
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value <= datetime.now(timezone.utc)
 
 
 def _normalize_metadata_filter(value: Any) -> dict | None:
@@ -522,6 +563,12 @@ def list_memories(
                           "a non-null `deleted_at`). Use it before "
                           "`restore_memory`. Superseded history stays hidden "
                           "unless `include_superseded` is also set.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Also list memories whose TTL (`expires_at`) has "
+                          "passed. They carry `expired: true` and are hidden "
+                          "from every active read otherwise. This is separate "
+                          "from `include_deleted` (soft-forgotten rows).")] = False,
     include_relation_context: Annotated[
         bool,
         Field(description="True (default) also lists the relation-context "
@@ -543,7 +590,8 @@ def list_memories(
     `limit`. Pass `memory_id` for a direct id lookup and `include_deleted=True`
     to include soft-forgotten memories (they carry `deleted_at`); superseded
     history stays hidden unless `include_superseded=True` is also passed —
-    the two flags are orthogonal.
+    the two flags are orthogonal. Expired TTL rows are separate: they stay
+    hidden until `include_expired=True` and then carry `expired: true`.
     `include_relation_context=False` hides the relation-context sentences of
     the graph edges. A project that does not exist is reported in `warnings`:
     the browse then only covered the global scope.
@@ -603,20 +651,10 @@ def list_memories(
             tables = _all_mem_tables(cur)
         if (project or all_projects) and not include_global:
             tables = [table for table in tables if table != "memories"]
-        conditions: list[str] = []
+        conditions: list[str] = [
+            _visibility_condition(include_deleted, include_superseded,
+                                  include_expired)]
         params: list[Any] = []
-        if include_deleted and include_superseded:
-            # Everything: superseded history and forgotten rows.
-            conditions.append("TRUE")
-        elif include_deleted:
-            # Active rows plus the forgotten ones (the ids a restore needs).
-            # Superseded history stays hidden unless `include_superseded`
-            # asks for it: the two flags are orthogonal.
-            conditions.append("(deleted_at IS NOT NULL OR superseded_by IS NULL)")
-        elif include_superseded:
-            conditions.append("deleted_at IS NULL")
-        else:
-            conditions.append(ACTIVE_ROW_SQL)
         if not include_relation_context:
             # The relation-context sentences live under a synthetic entity and
             # repeat what the edge already says.
@@ -714,6 +752,7 @@ def list_memories(
         elif "deleted_at" not in projection_fields:
             projection_fields = projection_fields + ["deleted_at"]
     results = []
+    expired_count = 0
     for row in window:
         item = project_row(row, projection_fields)
         # A machine-readable marker beats reading the '__forgotten__'
@@ -726,11 +765,148 @@ def list_memories(
             # Requested explicitly: report `false` instead of omitting the
             # key, so the shape stays stable for the caller.
             item["forgotten"] = False
+        if _is_expired(row.get("expires_at")):
+            expired_count += 1
+            if projection_fields is None or (fields and "expired" in fields):
+                item["expired"] = True
+        elif fields and "expired" in fields:
+            item["expired"] = False
         results.append(item)
+    if expired_count:
+        warnings.append(
+            f"{expired_count} result(s) have an expired TTL: they are not "
+            f"active memories anymore")
     return ok(STATUS_OK, count=len(results), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
               warnings=warnings, results=results)
+
+
+def get_memory(
+    memory_id: Annotated[
+        str,
+        Field(description="Id of the memory to fetch.")],
+    project: Annotated[
+        str | None,
+        Field(description="Scope to read. Without it the id is looked up in "
+                          "every scope; 'global' reads only the shared "
+                          "scope.")] = None,
+    include_superseded: Annotated[
+        bool,
+        Field(description="Also return a superseded memory.")] = False,
+    include_deleted: Annotated[
+        bool,
+        Field(description="Also return a soft-forgotten memory.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Also return a memory whose TTL has passed.")] = False,
+    fields: Annotated[
+        list[str] | None,
+        Field(description="Only return these columns, e.g. ['id', 'content'].")] = None,
+) -> dict[str, Any]:
+    """Fetch exactly one memory by id, including its history state.
+
+    `recall`/`list_memories` hide superseded, forgotten and expired rows unless
+    a flag asks for them. This tool is the direct id lookup: the answer names
+    the scope and sets the `superseded_by`/`forgotten`/`expired` markers, so
+    an agent can tell *why* a known id was missing from a search.
+    Without `project` the id is looked up in every scope; an id that exists in
+    several scopes is refused and the scopes are named.
+    """
+    logger.info("get_memory id=%s project=%s", memory_id, project)
+    memory_id = (memory_id or "").strip()
+    if not memory_id:
+        return fail(STATUS_ERROR, "memory_id must not be empty")
+    if project is not None and str(project).strip() == "*":
+        return fail(STATUS_ERROR,
+                    "get_memory describes exactly one memory: pass one "
+                    "project name (or omit project to search every scope)")
+    raw_project = project
+    global_only = _is_global_scope(raw_project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    fields_error = validate_fields(fields)
+    if fields_error:
+        return fail(STATUS_ERROR, fields_error)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if global_only:
+            tables = ["memories"]
+        elif project:
+            tables = _retrieval_tables(cur, project)
+        else:
+            scopes = _memory_scopes(cur, memory_id)
+            if len(scopes) > 1:
+                conn.rollback()
+                return fail(
+                    STATUS_ERROR,
+                    f"ambiguous memory id {memory_id}: it exists in the "
+                    f"scopes {scopes}; pass project=<name> to say which one "
+                    f"to read", id=memory_id, scopes=scopes)
+            tables = _all_mem_tables(cur)
+        where = _visibility_condition(include_deleted, include_superseded,
+                                      include_expired)
+        found = None
+        found_table = None
+        for table in tables:
+            cur.execute(f"SELECT * FROM {table} WHERE id = %s AND {where}",
+                        (memory_id,))
+            row = cur.fetchone()
+            if row is None:
+                continue
+            columns = [d[0] for d in cur.description]
+            found = dict(zip(columns, row))
+            found_table = table
+            break
+        if found is None:
+            # Explain the miss: the row may exist but be hidden by one of the
+            # visibility flags. A bare "not found" would make an agent believe
+            # the id never existed.
+            hidden = None
+            for table in tables:
+                cur.execute(f"SELECT superseded_by, deleted_at, expires_at "
+                            f"FROM {table} WHERE id = %s", (memory_id,))
+                row = cur.fetchone()
+                if row:
+                    hidden = (table, row[0], row[1], row[2])
+                    break
+            conn.rollback()
+            if hidden:
+                table, superseded_by, deleted_at, expires_at = hidden
+                reasons = []
+                if deleted_at is not None:
+                    reasons.append("soft-forgotten (pass include_deleted=true)")
+                if superseded_by is not None and superseded_by != SENTINEL_FORGOTTEN:
+                    reasons.append("superseded (pass include_superseded=true)")
+                if _is_expired(expires_at):
+                    reasons.append("expired (pass include_expired=true)")
+                return fail(
+                    STATUS_NOT_FOUND,
+                    f"memory {memory_id} exists but is not visible: "
+                    + ("; ".join(reasons) if reasons else "hidden by a filter"),
+                    id=memory_id, scope=_scope_of_table(cur, table))
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                        id=memory_id)
+        scope = _scope_of_table(cur, found_table)
+        found["_project"] = scope
+        item = project_row(found, fields)
+        if found.get("deleted_at"):
+            item["forgotten"] = True
+            if item.get("superseded_by") == SENTINEL_FORGOTTEN:
+                item["superseded_by"] = None
+        expired = _is_expired(found.get("expires_at"))
+        if expired and (fields is None or "expired" in fields):
+            item["expired"] = True
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e), id=memory_id)
+    finally:
+        conn.close()
+    return ok(STATUS_OK, id=memory_id, project=scope, memory=item)
 
 
 def _relation_context_memories(cur, target: str, tables: list[str],
@@ -874,6 +1050,7 @@ def get_entity(name: Annotated[
     entity_data = None
     warnings: list[str] = []
     total = 0
+    relation_context_count = 0
     try:
         cur = conn.cursor()
         tables = _retrieval_tables(cur, project) if project else None
@@ -896,6 +1073,7 @@ def get_entity(name: Annotated[
             known_ids.add(row.get("id"))
             memories.append(row)
             total += 1
+            relation_context_count += 1
 
         scope = _scope_key(project)
         cur.execute(
@@ -966,7 +1144,8 @@ def get_entity(name: Annotated[
         )
     return ok(STATUS_OK, entity=target, details=entity_data,
               memories=[project_row(m, fields) for m in window],
-              total=total, count=len(window), offset=offset,
+              total=total, relation_context_count=relation_context_count,
+              count=len(window), offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
               warnings=warnings)
