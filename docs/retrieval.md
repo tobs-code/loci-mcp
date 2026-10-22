@@ -172,7 +172,8 @@ Two paths, both using **vector pre-filtering** to avoid massive API calls.
 1. The new fact's embedding is computed (already available for the store).
 2. **Vector pre-filter**: pgvector `<=>` finds the 15 nearest neighbours.
 3. **NLI per candidate**: `/nli` (the configured LLM) checks each candidate for
-   a real contradiction.
+   a real contradiction. The comparison carries the entity labels of both
+   facts, so the model knows whether they describe the same subject.
 4. At a score >= 0.7 the old memory is automatically invalidated via
    `superseded_by = new_id`.
 
@@ -196,10 +197,19 @@ and warns about the broader comparison, so it is never silent.
    via `ORDER BY embedding <=>`.
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
    memory, not one call per pair.
-4. Pairs with a confidence > 0.7 count as a contradiction.
-5. `resolve="newest"` (opt-in) keeps the most recently updated memory of each
-   pair active and supersedes the older one; the pair reports `resolution` with
-   the `superseded` and `kept` ids.
+4. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
+   the entity of both facts and a `cross_entity` flag.
+5. `resolve="newest"` (opt-in) keeps the most recently updated memory of
+   each pair of the **same entity** active and supersedes the older one; the
+   pair reports `resolution` with the `superseded` and `kept` ids. Both
+   untagged facts count as the same subject. **Cross-entity pairs are never
+   auto-resolved**: recency decides nothing when the two facts belong to
+   different subjects — the newer fact is not necessarily the correct one
+   ("staging API on port 9443" vs "inference service on port 8001" was
+   reported as 0.95 by a field-by-field prompt, and an unconditional
+   resolve destroyed the innocent Inference fact). Cross-entity pairs stay
+   active, carry `cross_entity: true` and the scan warns
+   `resolve skipped for N cross-entity pair(s) ...`.
 
 The quality of the detection depends on the embedding model
 (`jina-embeddings-v5`), which provides good similarity values for semantically
@@ -207,12 +217,20 @@ similar texts. Distracting prefixes such as `Batch-X: ` in the content destroy
 the similarity and should be avoided. If necessary, increase
 `neighbors_per_fact` in `contradictions_report`.
 
-The NLI prompt asks the model to compare the two facts **field by field**: a
-differing attribute (environment, host, port, version, date/time, state) or an
-explicit negation counts as a contradiction; merely added or missing details do
-not. Vague prompts produced false negatives - a vague prompt judged
-"deploys to staging" vs "deploys to production" as neutral, because both could
-be true at the same time (Oct 2026).
+The NLI prompt first asks the model to decide whether both facts describe
+the **same subject** at all; a differing attribute (environment, host, port,
+version, date/time, state) or an explicit negation counts as a contradiction
+**only then**. Two facts about different subjects stay neutral even when
+their attribute values differ — a staging API on one port never contradicts
+a database service on another port. Merely added or missing details are not
+contradictions either. The `/nli` contract carries optional
+`query_entity`/`document_entities` labels, and both contradiction paths send
+the entity each fact is stored under, so the model knows the subjects and
+gets an explicit hint when they differ. Vague prompts produced false
+negatives - a vague prompt judged "deploys to staging" vs "deploys to
+production" as neutral, because both could be true at the same time
+(Oct 2026); the opposite extreme - attributing differing attributes blindly
+to the same subject - produced cross-entity false positives (Oct 2026).
 
 Without a usable LLM configuration `/nli` returns `0.0` for every pair; the
 contradiction tools report a warning and `nli_configured=false` instead of

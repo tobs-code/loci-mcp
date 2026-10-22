@@ -31,18 +31,29 @@ def embed(texts: list[str], mode: str = "document") -> list[list[float]]:
 
 
 def nli_detailed(query: str,
-                 documents: list[str]) -> tuple[list[float], str | None]:
+                 documents: list[str],
+                 query_entity: str | None = None,
+                 document_entities: list[str | None] | None = None,
+                 ) -> tuple[list[float], str | None]:
     """Return (scores, partial_error).
 
     Raises when no document could be judged (outage). `partial_error` is set
     when some documents failed: their score is 0.0 and must not be treated
     as a clean "neutral" judgment.
+
+    The optional entity labels tell the NLI model which subject each fact
+    belongs to (older inference containers ignore them silently).
     """
     if not documents:
         return [], None
+    body: dict = {"query": query, "documents": documents}
+    if query_entity is not None:
+        body["query_entity"] = query_entity
+    if document_entities is not None:
+        body["document_entities"] = document_entities
     resp = _get_session().post(
         f"{INFERENCE_URL}/nli",
-        json={"query": query, "documents": documents},
+        json=body,
         timeout=60,
     )
     resp.raise_for_status()
@@ -54,8 +65,11 @@ def nli_detailed(query: str,
     return payload["contradiction_scores"], payload.get("partial_error")
 
 
-def nli(query: str, documents: list[str]) -> list[float]:
-    scores, partial = nli_detailed(query, documents)
+def nli(query: str, documents: list[str],
+        query_entity: str | None = None,
+        document_entities: list[str | None] | None = None) -> list[float]:
+    scores, partial = nli_detailed(
+        query, documents, query_entity, document_entities)
     if partial:
         logger.warning("%s", partial)
     return scores

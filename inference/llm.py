@@ -9,14 +9,19 @@ import requests
 logger = logging.getLogger(__name__)
 
 NLI_SYSTEM = (
-    "You validate facts for a memory system. Both facts describe the same "
-    "subject (a service, person or system); compare them field by field."
+    "You validate facts for a memory system. The two facts may describe the "
+    "same subject (a service, person or system) or entirely different ones. "
+    "First decide whether they refer to the same subject at all; compare "
+    "attributes only after that."
 )
 NLI_INSTRUCTION = (
-    "If a concrete attribute differs (environment, host, port, version, "
-    "date/time, number, state) or one fact negates the other, that IS a "
-    "contradiction (score 0.9-1.0). Facts that merely omit details or add "
-    "new ones are NOT contradictions (neutral unless the overlap clearly "
+    "Two facts about DIFFERENT subjects remain neutral no matter how their "
+    "attributes differ: both can be true at the same time (a staging API on "
+    "one port never contradicts a database service on another). A differing "
+    "attribute (environment, host, port, version, date/time, number, state) "
+    "or an explicit negation is a contradiction (score 0.9-1.0) ONLY when "
+    "BOTH facts describe the SAME subject. Facts that merely omit details or "
+    "add new ones are NOT contradictions (neutral unless the overlap clearly "
     "contradicts). Identical facts are entailment, not contradiction. "
     "Respond in JSON with keys 'label' (one of: contradiction, entailment, "
     "neutral) and 'score' (0.0-1.0)."
@@ -256,12 +261,39 @@ def nli_score(payload: dict | None) -> float:
     return min(score, 1.0)
 
 
-def classify(config: LLMConfig, query: str, document: str) -> float:
+def nli_user_message(query: str, document: str,
+                     query_entity: str | None = None,
+                     document_entity: str | None = None) -> str:
+    """Build the user prompt for one fact comparison.
+
+    Entity labels are only a hint, not an assertion: when they differ the
+    model is asked not to read differing attribute values of two different
+    subjects as a contradiction. A mislabelled or missing entity never
+    changes the judgment - the texts themselves stay decisive.
+    """
+    qa = f" [entity: {query_entity}]" if query_entity else ""
+    da = f" [entity: {document_entity}]" if document_entity else ""
+    message = f"Fact A{qa}: {query}\nFact B{da}: {document}"
+    if (query_entity and document_entity
+            and query_entity.strip().lower() != document_entity.strip().lower()):
+        message += (
+            "\nThe entity labels differ, so the facts may describe "
+            "different subjects: answer neutral unless both texts plainly "
+            "talk about the same system, service or person. When both texts "
+            "name the exact same specific system or instance and one "
+            "negates the other, that is still a contradiction."
+        )
+    return message
+
+
+def classify(config: LLMConfig, query: str, document: str,
+             query_entity: str | None = None,
+             document_entity: str | None = None) -> float:
     if not config.configured:
         return 0.0
 
     system = f"{NLI_SYSTEM} {NLI_INSTRUCTION}"
-    user = f"Fact A: {query}\nFact B: {document}"
+    user = nli_user_message(query, document, query_entity, document_entity)
 
     if config.style == "anthropic":
         attempts = [None]

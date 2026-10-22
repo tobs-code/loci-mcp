@@ -92,7 +92,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Maintenance & Advanced
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts (LLM NLI + vector neighbor pre-filter); per entity or scope-wide without one; `resolve="newest"` keeps the newer fact and supersedes the older |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector neighbor pre-filter); per entity or scope-wide without one; each pair names the entity of both facts and `cross_entity`; `resolve="newest"` supersedes the older fact of same-entity pairs only, cross-entity pairs stay active (warning) |
 | `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved; payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore JSON/JSONL (`data` accepts object or string); explicit ids make re-import idempotent; graph is restored from JSON exports |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes); `dry_run` previews the counts |
@@ -302,10 +302,15 @@ entities", so the broader comparison is never silent.
    entities are reported too.
 2. **Vector self-join**: for each memory, the 20 nearest neighbors are fetched via `ORDER BY embedding <=>`
 3. Only the deduplicated candidate pairs are checked via `/nli` (configured LLM) – one call per memory, not per pair
-4. Pairs with confidence > 0.7 count as a contradiction
+4. Pairs with confidence over 0.7 count as a contradiction. Every pair names
+   the entity of both facts and a `cross_entity` flag.
 5. `resolve="newest"` (opt-in) keeps the most recently updated memory of each
-   pair active and marks the older one as superseded; `resolution` on the pair
-   names `superseded` and `kept`
+   **same-entity** pair active and marks the older one as superseded; both
+   untagged facts count as the same subject. Cross-entity pairs are reported
+   but **never auto-resolved** (recency cannot decide between two different
+   subjects); they carry `cross_entity: true` and the answer warns
+   `resolve skipped for N cross-entity pair(s) ...`; `resolution` names
+   `superseded` and `kept` on the resolved pairs only.
 
 → **Savings**: O(n²) → O(n × k) LLM calls (k=20).
 
@@ -326,11 +331,19 @@ then `json_object`, then a plain request. Anthropic uses `/messages`; no
 
 **Note**: The quality of contradiction detection depends heavily on the embedding model (`jina-embeddings-v5`), but that is not a problem — the model provides very good similarity values for semantically similar texts. Distracting prefixes such as `Batch-X: ` in the content should be avoided because they destroy embedding similarity. If necessary, increase `neighbors_per_fact` in `contradictions_report`.
 
-**NLI prompt**: `/nli` asks the LLM to compare the two facts **field by field**;
-a differing attribute (environment, host, port, version, date/time, state) or
-an explicit negation is a contradiction (0.9-1.0), newly added or missing
-details are not. Earlier prompts judged "deploys to staging" vs "deploys to
-production" as neutral (both could be true) — the widened prompt detects those.
+**NLI prompt**: `/nli` asks the LLM to first decide whether both facts
+describe the **same subject** at all; a differing attribute (environment,
+host, port, version, date/time, state) or an explicit negation is a
+contradiction (0.9-1.0) **only then**, newly added or missing details are
+never contradictions. Two facts about different subjects stay neutral even
+when their attribute values differ ("staging API on port 9443" vs "inference
+service on port 8001" was 0.95 under an earlier prompt that attributed every
+field difference to one subject). The `/nli` contract carries optional
+`query_entity`/`document_entities` labels that both contradiction paths send;
+mismatched labels add a "likely different subjects" hint to the user prompt.
+Earlier prompts judged "deploys to staging" vs "deploys to production" as
+neutral (both could be true) — the widened prompt detects that once the
+subject is shared.
 
 **NLI outages are surfaced, never silent**: `/nli` sets an `error` field when
 **no** score is a real judgment (provider down, not configured); the MCP client
@@ -465,7 +478,7 @@ it explicitly.
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
 | `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`) |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
-| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of each confirmed pair |
+| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of **same-entity** pairs only - cross-entity pairs stay active with `cross_entity: true` and a `resolve skipped` warning |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project`, `dry_run` | `counts` splits memories/entities/relations; `entity="*"` + `project` purges a whole scope; `dry_run=True` counts exactly what the real call removes |
 | `restore_memory` | `memory_id`, `project` | Reverses a soft delete; only rows with `deleted_at` set can be restored |
 | `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Payload is returned in `data`; graph is only included in JSON exports |

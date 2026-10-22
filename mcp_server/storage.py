@@ -238,7 +238,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
     comparison to `mem_type = 'fact'` hid most real conflicts, because the
     conflicting memory is often a decision, a pattern or a convention.
     """
-    candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, str | None]] = []
     seen: set[str] = set()
     new_hash = _content_hash(content)
     remaining = max_candidates
@@ -252,7 +252,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
                 break
             if embedding_vec is not None:
                 cur.execute(
-                    f"SELECT id, content FROM {table} "
+                    f"SELECT id, content, entity FROM {table} "
                     f"WHERE {sql_where} AND content_hash <> %s "
                     f"AND embedding IS NOT NULL "
                     f"AND superseded_by IS NULL AND deleted_at IS NULL "
@@ -261,7 +261,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
                 )
             else:
                 cur.execute(
-                    f"SELECT id, content FROM {table} "
+                    f"SELECT id, content, entity FROM {table} "
                     f"WHERE {sql_where} AND content_hash <> %s "
                     f"AND superseded_by IS NULL AND deleted_at IS NULL "
                     f"ORDER BY created_at DESC LIMIT %s",
@@ -271,7 +271,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
                 if row[0] in seen:
                     continue
                 seen.add(row[0])
-                candidates.append((row[0], row[1]))
+                candidates.append((row[0], row[1], row[2]))
                 remaining -= 1
             if remaining <= 0:
                 break
@@ -293,10 +293,15 @@ def _check_contradictions(cur, content: str, entity: str | None,
         return []
 
     candidate_contents = [c[1] for c in candidates]
-    scores = nli(content, candidate_contents)
+    candidate_entities = [c[2] for c in candidates]
+    # The entity labels are hints for the NLI model: a differing port of two
+    # different services reads very differently when the model knows that the
+    # two facts are stored under different entities.
+    scores = nli(content, candidate_contents,
+                 query_entity=entity, document_entities=candidate_entities)
 
     contradictions = []
-    for (eid, econtent), score in zip(candidates, scores):
+    for (eid, econtent, _eentity), score in zip(candidates, scores):
         if score >= 0.7:
             contradictions.append({"existing_id": eid, "existing_content": econtent,
                                     "similarity": round(score, 3)})

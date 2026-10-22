@@ -18,6 +18,19 @@ from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
 
+
+def _entities_differ(a: str | None, b: str | None) -> bool:
+    """True when two memories are tagged with different entities.
+
+    Both untagged counts as the same subject; one tagged and one untagged
+    counts as different, because a recency-based resolution between them is
+    as unsafe as between two differently tagged memories.
+    """
+    if a is None or b is None:
+        return a is not b
+    return a.strip().lower() != b.strip().lower()
+
+
 def contradictions_report(entity: Annotated[
         str | None,
         Field(description="Entity to check. Without it every active memory in "
@@ -34,8 +47,12 @@ def contradictions_report(entity: Annotated[
     resolve: Annotated[
         Literal["none", "newest"],
         Field(description="'none' (default) only reports. 'newest' keeps the "
-                          "most recently updated memory of each pair active "
-                          "and marks the older one as superseded.")] = "none",
+                          "most recently updated memory of each SAME-ENTITY "
+                          "pair active and marks the older one as superseded; "
+                          "cross-entity pairs are reported (cross_entity: "
+                          "true) but never auto-resolved, because recency "
+                          "says nothing about which fact is correct when the "
+                          "entities differ.")] = "none",
 ) -> dict[str, Any]:
     """Find potentially conflicting facts stored for the same entity.
 
@@ -44,9 +61,10 @@ def contradictions_report(entity: Annotated[
     Without `entity` the scan is scope-wide: all active memories compete for
     the candidate slots, so conflicts between differently tagged entities are
     reported too. With `resolve="newest"` the older memory of every confirmed
-    pair is superseded by the newer one (recency decides; the report names the
-    ids). An empty result says in `warnings` why it is empty: nothing to
-    compare, no similar pair, or no contradiction among the checked pairs.
+    pair of the SAME entity is superseded by the newer one (the report names
+    the ids); cross-entity pairs stay untouched. An empty result says in
+    `warnings` why it is empty: nothing to compare, no similar pair, or no
+    contradiction among the checked pairs.
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
     try:
@@ -111,7 +129,7 @@ def contradictions_report(entity: Annotated[
                     filter_sql = "AND content <> %s"
                     filter_params = [f["content"]]
                 cur.execute(
-                    f"SELECT id, content FROM {table} "
+                    f"SELECT id, content, entity FROM {table} "
                     f"WHERE id != %s {entity_sql} "
                     f"{filter_sql} "
                     f"AND embedding IS NOT NULL "
@@ -120,18 +138,19 @@ def contradictions_report(entity: Annotated[
                     [f["id"]] + entity_params + filter_params
                     + [f["embedding"], neighbors_per_fact],
                 )
-                for nid, ncontent in cur.fetchall():
+                for nid, ncontent, nentity in cur.fetchall():
                     if nid not in fact_ids:
                         continue
                     pair = tuple(sorted([f["id"], nid]))
                     if pair not in checked:
                         checked.add(pair)
-                        found.append((nid, ncontent))
+                        found.append((nid, ncontent, nentity))
             if found:
                 candidates[f["id"]] = (f, found)
 
         conn.commit()
     except Exception:
+        logger.exception("contradictions_report scan failed")
         conn.rollback()
         return fail(STATUS_ERROR, "query failed")
     finally:
@@ -145,20 +164,35 @@ def contradictions_report(entity: Annotated[
         for f, neighbours in candidates.values():
             if len(contradictions) >= limit:
                 break
-            # One LLM call per fact instead of one per pair.
-            scores, partial = nli_detailed(f["content"], [n[1] for n in neighbours])
+            # One LLM call per fact instead of one per pair. The entity
+            # labels let the NLI model judge whether both facts describe the
+            # same subject - a differing port of two different services is
+            # not a contradiction.
+            scores, partial = nli_detailed(
+                f["content"], [n[1] for n in neighbours],
+                query_entity=f.get("entity"),
+                document_entities=[n[2] for n in neighbours],
+            )
             if partial:
                 note = f"scan partially incomplete: {partial}"
                 if note not in warnings:
                     warnings.append(note)
             checked_pairs += len(neighbours)
-            for (nid, ncontent), score in zip(neighbours, scores):
+            for (nid, ncontent, nentity), score in zip(neighbours, scores):
                 if len(contradictions) >= limit:
                     break
                 if score > 0.7:
                     contradictions.append({
-                        "a": {"id": f["id"], "content": f["content"]},
-                        "b": {"id": nid, "content": ncontent},
+                        "a": {"id": f["id"], "content": f["content"],
+                              "entity": f.get("entity")},
+                        "b": {"id": nid, "content": ncontent,
+                              "entity": nentity},
+                        # Same entity (or both untagged) -> a recency-based
+                        # resolution is meaningful. Different entities ->
+                        # two different subjects, resolve="newest" must not
+                        # pick a winner (see the resolve block below).
+                        "cross_entity": _entities_differ(
+                            f.get("entity"), nentity),
                         "confidence": round(score, 3),
                     })
     except Exception as e:
@@ -188,46 +222,55 @@ def contradictions_report(entity: Annotated[
 
     resolved = 0
     if resolve == "newest" and contradictions:
-        conn = get_conn()
-        try:
-            cur = conn.cursor()
-            tables = _retrieval_tables(cur, project)
-            for pair in contradictions:
-                a_id, b_id = pair["a"]["id"], pair["b"]["id"]
-                timestamps = {}
-                for mem_id in (a_id, b_id):
+        resolvable = [p for p in contradictions if not p.get("cross_entity")]
+        skipped_cross = len(contradictions) - len(resolvable)
+        if skipped_cross:
+            warnings.append(
+                f"resolve skipped for {skipped_cross} cross-entity pair(s): "
+                f"the two facts belong to different entities, so recency does "
+                f"not decide which one survives - inspect them manually or "
+                f"re-run with an entity filter")
+        if resolvable:
+            conn = get_conn()
+            try:
+                cur = conn.cursor()
+                tables = _retrieval_tables(cur, project)
+                for pair in resolvable:
+                    a_id, b_id = pair["a"]["id"], pair["b"]["id"]
+                    timestamps = {}
+                    for mem_id in (a_id, b_id):
+                        for table in tables:
+                            cur.execute(
+                                f"SELECT updated_at FROM {table} WHERE id = %s",
+                                (mem_id,),
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                timestamps[mem_id] = row[0]
+                                break
+                    a_ts = timestamps.get(a_id)
+                    b_ts = timestamps.get(b_id)
+                    keep_a = a_ts is not None and (b_ts is None or a_ts >= b_ts)
+                    older, newer = (b_id, a_id) if keep_a else (a_id, b_id)
+                    changed = 0
                     for table in tables:
                         cur.execute(
-                            f"SELECT updated_at FROM {table} WHERE id = %s",
-                            (mem_id,),
+                            f"UPDATE {table} SET superseded_by = %s, "
+                            f"updated_at = NOW() WHERE id = %s "
+                            f"AND superseded_by IS NULL AND deleted_at IS NULL",
+                            (newer, older),
                         )
-                        row = cur.fetchone()
-                        if row:
-                            timestamps[mem_id] = row[0]
-                            break
-                a_ts = timestamps.get(a_id)
-                b_ts = timestamps.get(b_id)
-                keep_a = a_ts is not None and (b_ts is None or a_ts >= b_ts)
-                older, newer = (b_id, a_id) if keep_a else (a_id, b_id)
-                changed = 0
-                for table in tables:
-                    cur.execute(
-                        f"UPDATE {table} SET superseded_by = %s, "
-                        f"updated_at = NOW() WHERE id = %s "
-                        f"AND superseded_by IS NULL AND deleted_at IS NULL",
-                        (newer, older),
-                    )
-                    changed += cur.rowcount
-                if changed:
-                    resolved += 1
-                    pair["resolution"] = {"superseded": older, "kept": newer}
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logger.exception("contradictions_report resolve failed")
-            warnings.append(f"resolve failed: {e}")
-        finally:
-            conn.close()
+                        changed += cur.rowcount
+                    if changed:
+                        resolved += 1
+                        pair["resolution"] = {"superseded": older, "kept": newer}
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.exception("contradictions_report resolve failed")
+                warnings.append(f"resolve failed: {e}")
+            finally:
+                conn.close()
 
     return ok(STATUS_OK, count=len(contradictions), results=contradictions,
               resolved=resolved, warnings=warnings)

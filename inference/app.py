@@ -28,6 +28,12 @@ class EmbedResponse(BaseModel):
 class NliRequest(BaseModel):
     query: str
     documents: list[str]
+    # Optional subject hints: which entity each fact is stored under. They
+    # help the LLM to judge whether both facts describe the SAME subject -
+    # a differing port of two different services is not a contradiction.
+    # Omitting them keeps the comparison text-only.
+    query_entity: str | None = None
+    document_entities: list[str | None] | None = None
 
 class NliResponse(BaseModel):
     contradiction_scores: list[float]
@@ -81,9 +87,17 @@ def nli(req: NliRequest):
 
     scores: list[float] = []
     failures: list[str] = []
-    for doc in req.documents:
+    document_entities = req.document_entities or []
+    for index, doc in enumerate(req.documents):
+        document_entity = (
+            document_entities[index] if index < len(document_entities) else None
+        )
         try:
-            scores.append(classify(llm, req.query, doc))
+            scores.append(classify(
+                llm, req.query, doc,
+                query_entity=req.query_entity,
+                document_entity=document_entity,
+            ))
         except Exception as exc:
             # One malformed provider response must not throw away the
             # judgments for the other documents: record the failure, keep
