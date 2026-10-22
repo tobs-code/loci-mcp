@@ -45,6 +45,7 @@ from mcp_server.storage import (
     _check_contradictions,
     _deduplicate,
     _find_by_content,
+    _find_by_id,
     _find_last_for_entity,
     _find_superseded_match,
     _store_memory,
@@ -244,7 +245,9 @@ def remember(
             return ok(STATUS_DUPLICATE, id=existing_id,
                       warnings=[f"memory already exists; nothing stored "
                                 f"({detail})"],
-                      duplicate_mode=mode, similarity=similarity)
+                      duplicate_mode=mode, similarity=similarity,
+                      scope=effective_scope,
+                      project=(store_project or "global"))
 
         # No active duplicate, but the content may match a memory that was
         # superseded earlier. Storing it would silently re-activate an
@@ -357,7 +360,13 @@ def remember(
             warnings.append(
                 "metadata carried over from the replaced memories: "
                 + ", ".join(sorted(carried_keys)))
-        payload: dict[str, Any] = {"superseded": superseded}
+        payload: dict[str, Any] = {"superseded": superseded,
+                                   # The scope the fact really landed in. An
+                                   # agent that asked for a project but wrote
+                                   # to the shared scope has to know that:
+                                   # later reads and deletes need that name.
+                                   "scope": effective_scope,
+                                   "project": (store_project or "global")}
         if check_contradictions:
             contradictions_payload: dict[str, Any] = {
                 "found": bool(contradictions),
@@ -393,11 +402,27 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
     targets: list[str] = []
     warnings: list[str] = []
     if supersede:
-        targets.append(supersede)
+        # The id is used as given, but it must exist: reporting a
+        # replacement of a memory that is not there is a lie the caller
+        # would act on.
+        found = _find_by_id(cur, supersede, store_project)
+        if found:
+            targets.append(found)
+        else:
+            warnings.append(
+                f"supersede skipped: no memory with id {supersede!r} in the "
+                f"target scope; nothing was replaced"
+            )
     if supersede_content:
         found = _find_by_content(cur, supersede_content, store_project, entity)
         if found:
             targets.append(found)
+        else:
+            warnings.append(
+                f"supersede_content skipped: no active memory with exactly "
+                f"this content ({supersede_content[:80]!r}) in the target "
+                f"scope; nothing was replaced"
+            )
     if supersede_last:
         if not entity:
             raise ValueError("supersede_last requires an entity")
@@ -589,7 +614,9 @@ def remember_batch(
                         results.append({"id": existing[0], "content": spec["content"],
                                         "status": "duplicate",
                                         "duplicate_mode": existing[1],
-                                        "similarity": existing[2]})
+                                        "similarity": existing[2],
+                                        "scope": spec["scope"],
+                                        "project": (store_project or "global")})
                         continue
 
                 contradictions = []
@@ -632,11 +659,17 @@ def remember_batch(
             except Exception as exc:
                 cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 results.append({"id": None, "content": spec["content"],
-                                "status": "error", "error": str(exc)})
+                                "status": "error", "error": str(exc),
+                                "scope": spec["scope"],
+                                "project": (store_project or "global")})
                 continue
 
             entry = {"id": mid, "content": spec["content"], "status": "stored",
-                     "superseded": superseded}
+                     "superseded": superseded,
+                     # Where the fact really landed: a batch can mix scopes,
+                     # so the caller has to be able to see it per fact.
+                     "scope": spec["scope"],
+                     "project": (store_project or "global")}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
             if check_contradictions:
@@ -988,8 +1021,11 @@ def forget(
                 table = _mem_table(project)
                 if _table_exists(cur, table):
                     if dry_run:
-                        cur.execute(f"SELECT COUNT(*) FROM {table} "
-                                    f"WHERE deleted_at IS NULL")
+                        # The preview must count what the real call removes:
+                        # a soft forget hides the active rows, a hard delete
+                        # takes the whole table.
+                        where = ("WHERE deleted_at IS NULL" if soft else "")
+                        cur.execute(f"SELECT COUNT(*) FROM {table} {where}")
                         counts["memories"] += cur.fetchone()[0]
                     elif soft:
                         cur.execute(f"UPDATE {table} SET superseded_by = %s, "
@@ -1030,11 +1066,19 @@ def forget(
                           counts=counts, dry_run=dry_run,
                           message=(f"{'Would remove' if dry_run else 'Removed'} "
                                    f"all memories of {scope_name}"))
+            # The scope filter must match the delete path exactly: without a
+            # project the entity is removed from *every* scope, so the preview
+            # has to count every scope as well. Otherwise `dry_run` reports
+            # "NOT FOUND" for a graph node that the real call deletes.
+            scope_clause = " AND project = %s" if project else ""
+            scope_args: tuple[Any, ...] = ((entity_name, scope) if project
+                                            else (entity_name,))
             cur.execute(
-                "SELECT id FROM entities WHERE name = %s AND project = %s",
-                (entity_name, scope),
+                f"SELECT id FROM entities WHERE name = %s{scope_clause}",
+                scope_args,
             )
             entity_ids = [r[0] for r in cur.fetchall()]
+            counts["entities"] = len(entity_ids)
             if entity_ids:
                 cur.execute(
                     "SELECT COUNT(*) FROM relations "
@@ -1061,14 +1105,7 @@ def forget(
                         f"MATCH (n {{name: {en_json}}}) DETACH DELETE n $$) AS (r agtype)",
                     )
                     cur.execute("DELETE FROM entities WHERE name = %s", (entity_name,))
-            if dry_run:
-                cur.execute(
-                    "SELECT COUNT(*) FROM entities WHERE name = %s AND project = %s",
-                    (entity_name, scope),
-                )
-                counts["entities"] = cur.fetchone()[0]
-            else:
-                counts["entities"] = cur.rowcount
+
             # Only the selected scope's memories: forgetting an entity in one
             # project must not wipe the global facts of the same entity.
             tables = (_all_mem_tables(cur) if not project
@@ -1077,8 +1114,12 @@ def forget(
                 if not _table_exists(cur, tbl):
                     continue
                 if dry_run:
+                    # A soft forget hides the active rows, a hard delete also
+                    # takes the superseded and forgotten ones: the preview
+                    # counts exactly what the real call removes.
+                    where = (" AND deleted_at IS NULL" if soft else "")
                     cur.execute(f"SELECT COUNT(*) FROM {tbl} "
-                                f"WHERE entity = %s AND deleted_at IS NULL",
+                                f"WHERE entity = %s{where}",
                                 (entity_name,))
                     counts["memories"] += cur.fetchone()[0]
                 elif soft:
@@ -1094,10 +1135,12 @@ def forget(
                     "AND (metadata->>'from' = %s OR metadata->>'to' = %s)"
                 )
                 if dry_run:
+                    where = (" AND deleted_at IS NULL" if soft else "")
                     cur.execute(f"SELECT COUNT(*) FROM {tbl} "
-                                f"WHERE deleted_at IS NULL AND {relation_context_filter}",
+                                f"WHERE {relation_context_filter}{where}",
                                 (entity_name, entity_name))
                     counts["memories"] += cur.fetchone()[0]
+
                 elif soft:
                     cur.execute(
                         f"UPDATE {tbl} SET superseded_by = %s, deleted_at = NOW() "

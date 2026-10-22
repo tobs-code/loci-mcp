@@ -29,6 +29,20 @@ def _norm_project(project: str | None) -> str | None:
     return name
 
 
+def _is_global_scope(project: str | None) -> bool:
+    """True when the caller explicitly asked for the shared global scope.
+
+    `_norm_project` maps "global" to None, and None also means "no project
+    given". The two must stay distinguishable: a browse without a project
+    covers every scope, a browse of the explicit global scope covers only
+    the shared one. Without this helper `project="global"` silently widened
+    to "all scopes" in the browse tools.
+    """
+    if project is None:
+        return False
+    return str(project).strip().lower() == "global"
+
+
 def _project_slug(project: str) -> str:
     """Stable, SQL-safe suffix for a project name.
 

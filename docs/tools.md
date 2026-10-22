@@ -75,13 +75,22 @@ The answer carries `superseded` (the ids that were invalidated) and, with
 `check_contradictions`, a `contradictions` object. A duplicate answer names the
 mode that matched (`duplicate_mode`) and the measured similarity.
 
+It also reports the scope the fact really landed in (`scope` and `project`).
+That matters when `scope="global"` is combined with a project: the fact ends up
+in the shared table, and later reads and deletes have to use `project="global"`.
+
+`supersede` and `supersede_content` are checked: an id that does not exist (or
+a content without an active match) produces a warning and replaces nothing -
+the answer never claims a replacement that did not happen.
+
 ### `remember_batch`
 
 `facts` is a list of objects; only `content` is required, everything else works
 like in `remember`. Invalid facts are reported individually, the rest is still
 stored (`status: "partial"`). A fact without `content` or one that is not an
 object at all does not abort the batch - it is reported as an error entry
-next to the facts that were stored.
+next to the facts that were stored. Every entry reports the `scope` and
+`project` it landed in, so a batch that mixes scopes stays readable.
 
 ### `update_memory`
 
@@ -99,7 +108,9 @@ exists in several scopes is refused and the scopes are named (see
 - `entity="*"` plus `project` empties a whole scope; `project` is required for
   that, so a stray call cannot wipe the database. The shared scope is
   addressed with `project="global"`.
-- `dry_run=true` only reports the counts.
+- `dry_run=true` only reports the counts - and it counts exactly what the real
+  call removes: without a `project` the entity is removed from every scope, so
+  the preview counts the graph nodes and relations of every scope as well.
 - The answer carries `counts` (memories/entities/relations separately) and
   `scopes` (the scopes the id was found in).
 
@@ -116,9 +127,9 @@ memory is visible to `recall`/`list_memories` again. Find the id with
 | Tool | Description |
 |------|-------------|
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted` |
-| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"`; synthetic `A_KNOWS_B` entities are hidden |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted`, `include_relation_context` |
+| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `fields`, `limit`, `offset` |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"`; synthetic `<from>_<relation>_<to>` entities are hidden |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global`; `project="*"` lists every scope |
 | `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
@@ -147,9 +158,16 @@ The search tool. `query` is required and non-empty.
 | `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. |
 | `offset` | int | Skip this many ranked hits (default 0). The answer reports `has_more` and `next_offset`. |
 
-The answer reports `candidates` and `dropped_by_similarity` (the number of
-vector hits the filter removed), plus `fulltext_only` when a hit came only from
-the full-text leg. See [Retrieval](retrieval.md) for the score fields.
+The answer reports `candidates` (the hits that made it into the ranking),
+`dropped_by_similarity` (the number of vector hits the filter removed),
+`dropped_by_coverage` (the number of full-text hits that covered too little of
+the query), plus `fulltext_only` when a hit came only from the full-text leg.
+`scopes_searched` names the scopes the query actually covered. See
+[Retrieval](retrieval.md) for the score fields.
+
+An empty result names every filter that removed something (`min_similarity`,
+`min_decay_score`, `only_superseded`, the coverage floor) - not just the first
+one, so the caller does not debug the wrong filter.
 
 A project that does not exist is not silently ignored: the search falls back
 to the global scope and the answer says so in `warnings`.
@@ -167,15 +185,22 @@ finds an id for `restore_memory`. Forgotten rows carry the machine-readable
 `forgotten: true` flag; the `__forgotten__` sentinel is removed from
 `superseded_by` in those rows (it was overwriting the real value).
 
+Without `project` every scope is listed; `project="global"` lists only the
+shared scope. `include_relation_context=false` hides the relation-context
+sentences of the graph edges, which repeat what the edge already says.
+
 ### `get_entity`
 
 `entity` (`name` is kept as alias), `project`, `include_global`,
-`include_superseded`, `fields`. Memory-only entities have no graph node;
+`include_superseded`, `fields`, `limit` (default 100), `offset`.
+Memory-only entities have no graph node;
 `details.type` is then `memory-only`. A missing entity answers with
 `status: "not_found"`. The `memories` list is sorted by `updated_at`
 descending, newest change first. It also contains the relation-context
 sentences of the entity's edges - they are stored under the synthetic entity
-`A_REL_B`, so without this they would not show up here at all.
+`<from>_<relation>_<to>`, so without this they would not show up here at all.
+The answer reports `total`, `count`, `offset`, `has_more` and `next_offset`,
+and a truncated answer says so in `warnings` instead of looking complete.
 
 ### `list_entities`
 

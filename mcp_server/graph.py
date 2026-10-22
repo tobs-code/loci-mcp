@@ -301,7 +301,11 @@ def relate(
     conn = get_conn()
     try:
         cur = conn.cursor()
-        if context and project:
+        if project:
+            # Every project that gets a graph node also gets its memory table
+            # and its registry entry. Without that the scope existed only in
+            # the graph: invisible in `list_projects` and not removable with
+            # `drop_project`, which left its nodes behind as orphans.
             _ensure_project_table(cur, project)
         cur.execute("SET search_path TO ag_catalog, public")
         results = _relate_edges(cur, [{
@@ -354,11 +358,12 @@ def relate_batch(
     conn = get_conn()
     try:
         cur = conn.cursor()
-        if any(e.get("context") for e in edges):
-            for p in {_norm_project(e.get("project", project))
-                      for e in edges if e.get("context")}:
-                if p:
-                    _ensure_project_table(cur, p)
+        # Every project that gets a graph node also gets its memory table and
+        # its registry entry, so the scope is visible in `list_projects` and
+        # removable with `drop_project`.
+        for p in {_norm_project(e.get("project", project)) for e in edges}:
+            if p:
+                _ensure_project_table(cur, p)
         cur.execute("SET search_path TO ag_catalog, public")
         # Edges may target different scopes; keep the caller's order.
         indexed: dict[Any, list[tuple[int, dict]]] = {}

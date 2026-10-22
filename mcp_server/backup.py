@@ -349,7 +349,15 @@ def import_memories(
                     continue
             meta = rec.get("metadata", {})
             if isinstance(meta, str):
-                meta = json.loads(meta)
+                try:
+                    meta = json.loads(meta)
+                except json.JSONDecodeError as exc:
+                    # A broken metadata value must not abort the whole import:
+                    # the record is reported, the rest is restored.
+                    errors.append(
+                        f"record {mid!r}: metadata is not valid JSON ({exc})")
+                    skipped += 1
+                    continue
             try:
                 cur.execute(
                     f"INSERT INTO {table} (id, content, content_hash, embedding, "

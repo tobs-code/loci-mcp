@@ -3,7 +3,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from mcp_server.config import FTS_LANGUAGE, FTS_WEIGHT, PROJECT_SCOPE_BOOST, RRF_K
+from mcp_server.config import (
+    FTS_LANGUAGE,
+    FTS_MIN_COVERAGE,
+    FTS_WEIGHT,
+    PROJECT_SCOPE_BOOST,
+    RRF_K,
+)
+
 from mcp_server.db import get_conn
 from mcp_server.scopes import (
     _ag_str,
@@ -23,6 +30,22 @@ from mcp_server.scoring import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _fts_lexemes(cur, query_text: str | None) -> list[str]:
+    """The query lexemes after stemming and stop word removal.
+
+    They measure how much of the query a full-text hit actually covers: an
+    OR query makes a single common word look like a perfect match otherwise.
+    """
+    if not query_text:
+        return []
+    cur.execute(
+        f"SELECT tsvector_to_array(to_tsvector('{FTS_LANGUAGE}', %s))",
+        (query_text,),
+    )
+    row = cur.fetchone()
+    return list(row[0] or []) if row else []
+
 
 def _extra_conditions(
     updated_after: str | None = None,
@@ -102,14 +125,7 @@ def _search_memories_rrf(
     # Query lexemes after stemming/stopword removal. They are used to measure
     # how much of the query a full-text hit actually covers: an OR query makes
     # a single common word look like a perfect match otherwise.
-    fts_lexemes: list[str] = []
-    if fts_query and query_text:
-        cur.execute(
-            f"SELECT tsvector_to_array(to_tsvector('{FTS_LANGUAGE}', %s))",
-            (query_text,),
-        )
-        row = cur.fetchone()
-        fts_lexemes = list(row[0] or []) if row else []
+    fts_lexemes: list[str] = _fts_lexemes(cur, query_text)
     extra_conditions, extra_params = _extra_conditions(updated_after,
                                                         metadata_filter)
 
@@ -185,6 +201,7 @@ def _search_memories_rrf(
     text_results: dict[str, float] = {}
     similarities: dict[str, float] = {}
     text_scores: dict[str, float] = {}
+    coverages: dict[str, float] = {}
     table_of: dict[str, str] = {}
 
     for rank, (distance, row_id, table) in enumerate(vec_candidates[:50], 1):
@@ -205,15 +222,30 @@ def _search_memories_rrf(
         rank_norm = (ts_rank / max_text_rank) if max_text_rank else 0.0
         coverage = min(1.0, matched / lexeme_count) if fts_lexemes else 1.0
         text_scores[row_id] = rank_norm * coverage
+        coverages[row_id] = coverage
 
     fused_scores = {
         row_id: vector_results.get(row_id, 0.0) + text_results.get(row_id, 0.0)
         for row_id in set(vector_results) | set(text_results)
     }
+    # A hit that only the full-text leg found has no similarity to vouch for
+    # it. If it covers only a sliver of the query it is noise, and if it is
+    # the *only* hit it would be handed to the agent as the answer. Hits the
+    # vector retriever found are never dropped here.
+    dropped_by_coverage = 0
+    if fts_lexemes:
+        weak = [row_id for row_id in fused_scores
+                if row_id not in similarities
+                and coverages.get(row_id, 1.0) < FTS_MIN_COVERAGE]
+        for row_id in weak:
+            del fused_scores[row_id]
+        dropped_by_coverage = len(weak)
     if not fused_scores:
         if stats is not None:
             stats.update({"candidates": 0,
                           "dropped_by_similarity": dropped_by_similarity,
+                          "dropped_by_coverage": dropped_by_coverage,
+                          "min_coverage": FTS_MIN_COVERAGE,
                           "fulltext_only": 0})
         return []
 
@@ -281,6 +313,8 @@ def _search_memories_rrf(
         stats.update({
             "candidates": len(fused_scores),
             "dropped_by_similarity": dropped_by_similarity,
+            "dropped_by_coverage": dropped_by_coverage,
+            "min_coverage": FTS_MIN_COVERAGE,
             "fulltext_only": sum(1 for row_id in fused_scores
                                  if row_id not in similarities),
         })
@@ -343,12 +377,15 @@ def _search_memories(
     max_distance = None if min_similarity is None else 1.0 - min_similarity
     has_vec = query_embedding is not None
     fts_query = _fts_query(query_text)
+    fts_lexemes: list[str] = _fts_lexemes(cur, query_text)
     extra_conditions, extra_params = _extra_conditions(updated_after,
                                                         metadata_filter)
 
     rows: list[dict] = []
     seen_hashes: set[str] = set()
     dropped_by_similarity = 0
+    dropped_by_coverage = 0
+
     project_names = _project_names(cur)
     # Fetch more than the caller asked for: the similarity filter is applied
     # in Python, so the limit must not cut the candidates before filtering.
@@ -365,9 +402,14 @@ def _search_memories(
             params_vec.append(query_embedding)
         elif fts_query:
             col = (f"*, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
-                   f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS fts_rank")
+                   f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS fts_rank, "
+                   f"(SELECT COUNT(*) FROM unnest(%s::text[]) AS lex "
+                   f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
+                   f"plainto_tsquery('{FTS_LANGUAGE}', lex)) AS matched")
             params_vec.append(fts_query)
+            params_vec.append(fts_lexemes)
             order = "ORDER BY fts_rank DESC"
+
         else:
             col = "*"
             order = "ORDER BY updated_at DESC"
@@ -416,6 +458,17 @@ def _search_memories(
                 d.pop("distance", None)
             if "fts_rank" in d:
                 d["_fts_rank"] = float(d.pop("fts_rank") or 0.0)
+            if "matched" in d:
+                # The full-text-only path: a hit that covers just a sliver of
+                # the query is noise, not an answer.
+                matched = int(d.pop("matched") or 0)
+                lexeme_count = max(1, len(fts_lexemes))
+                coverage = min(1.0, matched / lexeme_count) if fts_lexemes else 1.0
+                d["_coverage"] = round(coverage, 4)
+                if coverage < FTS_MIN_COVERAGE:
+                    dropped_by_coverage += 1
+                    continue
+
             c_hash = d.get("content_hash") or ""
             if c_hash and c_hash in seen_hashes:
                 continue
@@ -453,6 +506,8 @@ def _search_memories(
         stats.update({
             "candidates": len(rows),
             "dropped_by_similarity": dropped_by_similarity,
+            "dropped_by_coverage": dropped_by_coverage,
+            "min_coverage": FTS_MIN_COVERAGE,
             "fulltext_only": 0,
         })
     if include_decay:

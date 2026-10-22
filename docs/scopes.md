@@ -62,6 +62,11 @@ A project that does not exist is never silently ignored: `recall`,
 `list_memories`, `list_entities` and `init_context` fall back to the global
 scope and say so in `warnings`.
 
+`project="global"` and "no project at all" are different things in the browse
+tools: `list_memories` and `list_entities` list **every** scope when `project`
+is omitted, but only the shared scope when `project="global"` is passed
+explicitly. `recall` searches the shared scope in both cases.
+
 ## Memory ids are unique per scope
 
 A memory id is unique **per scope, not globally**: an import copies the id
@@ -94,6 +99,11 @@ stray call cannot wipe the whole database.
 
 `drop_project` is permanent and refuses `global`. Use it when a project is
 finished and its scope should disappear from every listing.
+
+A project that only exists in the graph (a `relate` without a stored fact)
+has no memory table of its own; it is listed like every other scope and
+`drop_project` removes it as well, so its nodes cannot stay behind as
+orphans that no listing shows.
 
 ## Storing outside a project
 

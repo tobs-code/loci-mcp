@@ -132,6 +132,11 @@ def drop_project(
 
     Use `dry_run=True` first if you want to see the counts.
 
+    A scope that only exists in the graph (a project in which `relate` was
+    used but no fact was stored) has no memory table; it is removed as well,
+    otherwise its graph nodes would stay behind as orphans that no listing
+    shows and no tool can delete.
+
     'global' is the shared scope and cannot be dropped. To empty it, use
     `forget(entity="*", project="global")`.
     """
@@ -152,11 +157,10 @@ def drop_project(
     counts = {"memories": 0, "entities": 0, "relations": 0}
     try:
         cur = conn.cursor()
-        if not _table_exists(cur, table):
-            return fail(STATUS_NOT_FOUND,
-                        f"unknown project {name!r}: it has no memory table")
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
-        counts["memories"] = cur.fetchone()[0]
+        has_table = _table_exists(cur, table)
+        if has_table:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            counts["memories"] = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s", (scope,))
         counts["entities"] = cur.fetchone()[0]
         cur.execute(
@@ -166,6 +170,10 @@ def drop_project(
             (scope, scope),
         )
         counts["relations"] = cur.fetchone()[0]
+        if not has_table and not counts["entities"] and not counts["relations"]:
+            return fail(STATUS_NOT_FOUND,
+                        f"unknown project {name!r}: it has neither a memory "
+                        f"table nor graph nodes")
         if dry_run:
             conn.rollback()
             return ok(STATUS_OK, project=name, counts=counts, dry_run=True,

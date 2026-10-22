@@ -32,6 +32,9 @@ query side always match, a changed dictionary is migrated at startup.
   default.
 - `list_memories` and `list_entities` list all scopes when `project` is
   omitted, and project + global by default when it is set.
+- `project="global"` means the **shared scope** in every read tool - it is not
+  "all scopes". In the two browse tools it is stricter than omitting the
+  parameter; in `recall` it is the same (only the global scope is searched).
 - `init_context` uses the global scope when `project` is omitted, project +
   global when set, and all scopes with `project="*"`.
 - `recall` accepts `project="*"` too: it then searches every scope at once.
@@ -77,15 +80,39 @@ ranking is then `_relevance_score`, and the result is ordered by it.
 only. A full-text hit is kept even when the embedding model scores it badly —
 that is the case the full-text leg exists for.
 
-`recall` reports `candidates` and `dropped_by_similarity` (the number of vector
-hits removed) and warns when the filter removed everything, so an empty result
-is never silent.
+`recall` reports `candidates` (the hits that made it into the ranking),
+`dropped_by_similarity` (the number of vector hits the filter removed) and
+`dropped_by_coverage` (the number of full-text hits the coverage filter
+removed). When the result is empty, the warning names **every** filter that
+removed something, so the caller does not have to guess which one was
+responsible.
+
+## The full-text coverage floor
+
+The full-text leg is OR-based: a document that contains one common word of a
+six-word query is a hit. The coverage factor (matched query lexemes / all
+query lexemes) scales its score down, but a hit that only the full-text leg
+found has no similarity to vouch for it. Such a hit is therefore dropped
+when it covers less than **0.2** of the query (`FTS_MIN_COVERAGE`).
+
+This keeps a genuine keyword hit ("ZEBRAFISH_TOKEN" in a longer query) and
+removes the noise hit: the query *"totally unrelated quantum banana smoothie
+recipe"* no longer returns the one memory that happens to contain the word
+"unrelated". Hits that the vector retriever found are never dropped by this
+filter.
 
 With `min_similarity=null` the filter is disabled and near-zero hits can
 appear as "relevant". When any returned hit has `_similarity < 0.35`, the
 response warns about it (`the min_similarity filter is disabled: N of M
 result(s) ...`), so agents notice the weak hits instead of reading them as
 confident matches.
+
+## The searched scopes
+
+`recall` reports `scopes_searched`: the scopes the query actually covered.
+Without a `project` only the shared scope is searched, so an agent that finds
+nothing there is told which other scopes exist and that `project="*"` covers
+them.
 
 Measured with the current embedding model:
 

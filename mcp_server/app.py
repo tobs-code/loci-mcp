@@ -122,6 +122,11 @@ Read-scope defaults differ by tool; check each tool's description and pass
 return items in `results`; export and import payloads use `data`.
 Every call answers with the same envelope: {"ok", "status", "id", "error",
 "warnings"}. A failed call has `ok: false` and never raises.
+
+A write reports the `scope`/`project` it really used, and a read reports the
+`scopes` it searched: trust those names for the next call instead of
+guessing. An empty `recall` names every filter that emptied the result, so
+read the `warnings` before concluding that a memory does not exist.
 """,
     streamable_http_path="/",
     json_response=True,

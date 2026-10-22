@@ -145,6 +145,26 @@ def _find_superseded_match(
     return None
 
 
+def _find_by_id(cur, memory_id: str, project: str | None) -> str | None:
+    """Id of an existing memory, in the target scope or in the global one.
+
+    `supersede=<id>` names a memory directly. Without this check the id is
+    accepted blindly and the response reports a replacement that never
+    happened.
+    """
+    if not memory_id:
+        return None
+    table = _mem_table(project)
+    cur.execute(f"SELECT id FROM {table} WHERE id = %s", (memory_id,))
+    if cur.fetchone():
+        return memory_id
+    if project:
+        cur.execute("SELECT id FROM memories WHERE id = %s", (memory_id,))
+        if cur.fetchone():
+            return memory_id
+    return None
+
+
 def _find_by_content(cur, content: str, project: str | None,
                      entity: str | None = None) -> str | None:
     """Id of the active memory with exactly this content (optionally of an
