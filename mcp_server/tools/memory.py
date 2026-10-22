@@ -1633,6 +1633,9 @@ def forget(
     memory_id: Annotated[
         str | None,
         Field(description="Id of a single memory to remove.")] = None,
+    memory_ids: Annotated[
+        list[str] | None,
+        Field(description="List of memory ids to remove in one call.")] = None,
     entity_name: Annotated[
         str | None,
         Field(description="Entity whose memories (and graph node) are removed. "
@@ -1655,7 +1658,7 @@ def forget(
         Field(description="True only reports what would be removed; nothing is "
                           "deleted or hidden.")] = False,
 ) -> dict[str, Any]:
-    """Remove a fact by memory_id or delete an entity and all its memories.
+    """Remove a fact by memory_id(s) or delete an entity and all its memories.
 
     The entity can be passed as `entity` or `entity_name`.
     When soft=True (default), hides the memory by setting deleted_at and a
@@ -1667,21 +1670,28 @@ def forget(
     several scopes (an import copies the id), the call is refused and the
     scopes are named - pass `project` to say which one to remove.
 
+    `memory_ids` accepts a list of ids to remove in one call. Bulk operations
+    are more efficient than multiple single calls. Each id is validated
+    individually and the response reports which ids were found and which were
+    not. `memory_id` and `memory_ids` are mutually exclusive.
+
     `entity="*"` removes every memory of the given project (memories and
     graph nodes); `project` is required for that, so a stray call cannot wipe
     the whole database. `dry_run=True` reports the counts without changing
     anything.
     """
     entity_name = entity or entity_name
-    logger.info("forget memory_id=%s entity_name=%s soft=%s dry_run=%s",
-                memory_id, entity_name, soft, dry_run)
+    logger.info("forget memory_id=%s memory_ids=%s entity_name=%s soft=%s dry_run=%s",
+                memory_id, memory_ids, entity_name, soft, dry_run)
     raw_project = project
     try:
         project = _norm_project(project)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    if not memory_id and not entity_name:
-        return fail(STATUS_ERROR, "memory_id or entity_name is required")
+    if memory_id and memory_ids:
+        return fail(STATUS_ERROR, "memory_id and memory_ids are mutually exclusive")
+    if not memory_id and not memory_ids and not entity_name:
+        return fail(STATUS_ERROR, "memory_id, memory_ids or entity_name is required")
     scope_name = project if project else "global"
     purge_all = entity_name == "*"
     # An explicit `project` names the scope to purge — including the reserved
@@ -1697,8 +1707,70 @@ def forget(
     conn = get_conn()
     counts = {"memories": 0, "entities": 0, "relations": 0}
     scopes: list[str] = []
+    bulk_results: list[dict] = []
     try:
         cur = conn.cursor()
+        if memory_ids:
+            # Bulk forget: process multiple memory ids in one call
+            tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
+            if project and not _table_exists(cur, tables[0]):
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: project table does not exist")
+            
+            for mid in memory_ids:
+                if not mid or not isinstance(mid, str):
+                    bulk_results.append({"id": mid, "status": "error", "error": "invalid memory id"})
+                    continue
+                found = False
+                for table in tables:
+                    if soft:
+                        if dry_run:
+                            cur.execute(
+                                f"SELECT COUNT(*) FROM {table} "
+                                f"WHERE id = %s AND deleted_at IS NULL",
+                                (mid,),
+                            )
+                            count = cur.fetchone()[0]
+                            if count:
+                                found = True
+                                counts["memories"] += count
+                        else:
+                            cur.execute(
+                                f"UPDATE {table} SET superseded_by = COALESCE(superseded_by, %s), "
+                                f"deleted_at = NOW() WHERE id = %s AND deleted_at IS NULL",
+                                (SENTINEL_FORGOTTEN, mid),
+                            )
+                            if cur.rowcount:
+                                found = True
+                                counts["memories"] += cur.rowcount
+                    else:
+                        if dry_run:
+                            cur.execute(
+                                f"SELECT COUNT(*) FROM {table} WHERE id = %s",
+                                (mid,),
+                            )
+                            count = cur.fetchone()[0]
+                            if count:
+                                found = True
+                                counts["memories"] += count
+                        else:
+                            cur.execute(f"DELETE FROM {table} WHERE id = %s", (mid,))
+                            if cur.rowcount:
+                                found = True
+                                counts["memories"] += cur.rowcount
+                if found:
+                    bulk_results.append({"id": mid, "status": "deleted" if not soft else "soft_forgotten"})
+                else:
+                    bulk_results.append({"id": mid, "status": "not_found"})
+            
+            if not dry_run:
+                conn.commit()
+            else:
+                conn.rollback()
+            
+            status = STATUS_OK if dry_run else (STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED)
+            return ok(status, counts=counts, dry_run=dry_run, bulk_results=bulk_results,
+                      message=f"{'Would remove' if dry_run else ('Soft-forgotten' if soft else 'Deleted')} "
+                              f"{counts['memories']} memory/memories from {len(memory_ids)} id(s)")
         if memory_id:
             tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
             if project and not _table_exists(cur, tables[0]):
@@ -1909,10 +1981,12 @@ def forget(
     finally:
         conn.close()
     status = STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED
-    target = memory_id or entity_name
+    target = memory_id or entity_name or f"{len(memory_ids) if memory_ids else 0} ids"
     extra: dict[str, Any] = {}
     if memory_id and scopes:
         extra["scopes"] = scopes
+    if memory_ids:
+        extra["bulk_results"] = bulk_results
     if dry_run:
         return ok(STATUS_OK, id=memory_id, entity=entity_name, counts=counts,
                   dry_run=True, **extra,

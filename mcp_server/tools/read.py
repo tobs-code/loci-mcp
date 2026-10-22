@@ -79,7 +79,7 @@ def recall(
         str,
         Field(description="Search text. Non-empty; the query is embedded as a "
                           "query and matched against vector and full-text "
-                          "indexes.")],
+                          "indexes. Cannot be empty string.")],
     mem_type: Annotated[
         Literal["fact", "decision", "learning", "preference", "pattern", "incident",
                 "runbook", "context", "observation", "convention", "command", "note"]
@@ -120,9 +120,10 @@ def recall(
     graph_boost: Annotated[
         bool,
         Field(description="Add memories of entities connected in the graph. "
-                          "Needs `graph_entity` (or `entity` as fallback). "
-                          "Those hits have no similarity and are marked with "
-                          "`_graph_boost`.")] = False,
+                          "Requires `graph_entity` or `entity` to specify the "
+                          "expansion point. Without an entity, graph_boost is "
+                          "skipped and a warning is returned. Those hits have "
+                          "no similarity and are marked with `_graph_boost`.")] = False,
     graph_entity: Annotated[
         str | None,
         Field(description="Entity to expand from when `graph_boost` is used. "
@@ -256,7 +257,8 @@ def recall(
     boost_entity = graph_entity or entity
     if graph_boost and not boost_entity:
         warnings.append("graph_boost requires an entity (graph_entity or "
-                        "entity); no graph boost was applied")
+                        "entity); no graph boost was applied. Pass an entity "
+                        "parameter to enable graph expansion.")
     if only_superseded:
         include_superseded = True
     query_emb = embed([query], mode="query")[0]
