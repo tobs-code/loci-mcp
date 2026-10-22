@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Any
 
-from mcp_server.config import DEFAULT_DUPLICATE_THRESHOLD
+from mcp_server.config import DEFAULT_DUPLICATE_THRESHOLD, SENTINEL_FORGOTTEN
 from mcp_server.inference_client import nli
 from mcp_server.scopes import _mem_table, _retrieval_tables
 from mcp_server.scoring import _content_hash, _gen_id, _now
@@ -91,6 +91,57 @@ def _deduplicate(cur, content: str, project: str | None,
         if row and float(row[1]) <= max_dist:
             return row[0], "semantic", round(1.0 - float(row[1]), 4)
 
+    return None
+
+
+def _find_superseded_match(
+    cur,
+    content: str,
+    project: str | None,
+    embedding_vec: list[float] | None = None,
+    fuzzy_threshold: float | None = None,
+    dedupe: str = "exact",
+) -> dict | None:
+    """Look for a *superseded* memory that matches the new content.
+
+    A fact can be re-added after it was replaced by a newer one. That is not
+    necessarily wrong (an agent may intentionally revert a decision), so the
+    caller still stores it - but silently re-activating outdated knowledge is
+    exactly the kind of fork `dedupe` is supposed to prevent. This check
+    reports the match so `remember` can warn without blocking the write.
+    """
+    if dedupe == "off":
+        return None
+
+    c_hash = _content_hash(content)
+    table = _mem_table(project)
+    cur.execute(
+        f"SELECT id, superseded_by FROM {table} "
+        f"WHERE content_hash = %s AND superseded_by IS NOT NULL "
+        f"AND superseded_by <> %s AND deleted_at IS NULL "
+        f"ORDER BY updated_at DESC LIMIT 1",
+        (c_hash, SENTINEL_FORGOTTEN),
+    )
+    row = cur.fetchone()
+    if row:
+        return {"id": row[0], "superseded_by": row[1], "mode": "exact",
+                "similarity": None}
+
+    if embedding_vec is not None and dedupe == "semantic":
+        threshold = (fuzzy_threshold if fuzzy_threshold is not None
+                     else DEFAULT_DUPLICATE_THRESHOLD)
+        max_dist = 1.0 - threshold
+        cur.execute(
+            f"SELECT id, superseded_by, embedding <=> %s::vector AS dist "
+            f"FROM {table} WHERE superseded_by IS NOT NULL "
+            f"AND superseded_by <> %s AND deleted_at IS NULL "
+            f"AND embedding IS NOT NULL ORDER BY dist ASC LIMIT 1",
+            (embedding_vec, SENTINEL_FORGOTTEN),
+        )
+        row = cur.fetchone()
+        if row and float(row[2]) <= max_dist:
+            return {"id": row[0], "superseded_by": row[1], "mode": "semantic",
+                    "similarity": round(1.0 - float(row[2]), 4)}
     return None
 
 

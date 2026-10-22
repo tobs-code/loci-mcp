@@ -50,7 +50,8 @@ Graph tools use the global graph when `project` is omitted.
 
 `get_entity`, `list_entities`, `list_memories`, `recall`, `init_context`,
 `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
-`forget`, `export_memories`, `import_memories`, `drop_project`.
+`forget`, `restore_memory`, `export_memories`, `import_memories`,
+`drop_project`.
 
 The read defaults differ per tool and are listed in
 [Retrieval & Scoring](retrieval.md#read-scope-defaults). For `init_context`,
@@ -61,8 +62,8 @@ use `project="*"` to include all scopes.
 A memory id is unique **per scope, not globally**: an import copies the id
 into the target scope, and then the same id exists in two scopes.
 
-`update_memory` and `forget(memory_id=...)` therefore refuse an id that exists
-in several scopes and name the scopes in the error:
+`update_memory`, `restore_memory` and `forget(memory_id=...)` therefore refuse
+an id that exists in several scopes and name the scopes in the error:
 
 ```json
 {"ok": false, "status": "error",

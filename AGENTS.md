@@ -56,7 +56,7 @@ holds for an invalid call (missing argument, wrong type): the argument check
 answers with the same envelope (`error` names the argument) instead of a raw
 validation error.
 
-## MCP Tools (20 total)
+## MCP Tools (21 total)
 
 ### Write
 | Tool | Description |
@@ -65,6 +65,7 @@ validation error.
 | `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, `dedupe`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`, optional `check_contradictions` |
 | `update_memory` | Update content, importance, or metadata (re-embeds on content change) |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `entity="*"` purges a whole project; `dry_run` previews; `counts` reports memories/entities/relations separately |
+| `restore_memory` | Bring a soft-forgotten memory back (clears `deleted_at` and the forgotten sentinel); only soft-forgotten rows can be restored |
 
 Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 `pattern`, `incident`, `runbook`, `context`, `observation`, `convention`,
@@ -73,11 +74,11 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak vector matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `graph_entity`) to include connected entities; `fields` to narrow columns; logs `access_count`; reports `candidates` / `filtered_by_similarity` |
-| `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `include_global`, `fields`, `contains`; `offset` pages through a scope |
+| `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak vector matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `graph_entity`) to include connected entities; `fields` to narrow columns; `offset` pages through ranked hits; logs `access_count`; reports `candidates` / `dropped_by_similarity` |
+| `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `include_global`, `fields`, `contains`, `memory_id` (direct id lookup), `include_deleted` (soft-forgotten rows), `updated_after`, `metadata_filter`, `order_by`; `offset` pages through a scope |
 | `get_entity` | Get entity details + all linked memories + graph connections; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities; filters: `entity_type`, `project`, `include_global`; `offset` pages through the list |
-| `init_context` | Bootstrap: recent memories + entity count + health; global by default, project + global when `project` is set, all scopes with `project="*"`; `detail="slim"` (default, deduped) or `"full"` |
+| `list_entities` | Browse entities; filters: `entity_type`, `project`, `include_global`; `offset` pages through the list; synthetic relation-context entities (`A_KNOWS_B`) are hidden |
+| `init_context` | Bootstrap: recent memories + entity count + health; global by default, project + global when `project` is set, all scopes with `project="*"` (`projects` then includes `"global"`); `detail="slim"` (default, deduped) or `"full"` |
 | `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
 ### Graph (Apache AGE)
@@ -92,8 +93,8 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Maintenance & Advanced
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts per entity (LLM NLI + vector neighbor pre-filter) |
-| `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved; payload in `data` |
+| `contradictions_report` | Detect conflicting facts per entity (LLM NLI + vector neighbor pre-filter); `resolve="newest"` keeps the newer fact and supersedes the older |
+| `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved; payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore JSON/JSONL (`data` accepts object or string); explicit ids make re-import idempotent; graph is restored from JSON exports |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes); `dry_run` previews the counts |
 | `server_health` | Check Postgres + Inference connectivity |
@@ -116,8 +117,12 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   uses global scope when `project` is omitted, project + global when it is set,
   and all scopes with `project="*"`; `include_global=false` excludes globals.
 - FTS is OR-based (`_fts_query`): a multi-term query matches documents that
-  contain any term. FTS rank contributions are weighted at `FTS_WEIGHT = 0.6`
-  so a single common word cannot outrank the best semantic hit.
+  contain any term. The normalized text score is multiplied by **query
+  coverage** (matched query lexemes / all query lexemes after stemming and
+  stopword removal), so a document that matched one common word of a three-word
+  query cannot look like a perfect full-text match. FTS rank contributions are
+  weighted at `FTS_WEIGHT = 0.6`, so a single common word cannot outrank the
+  best semantic hit.
 - RRF scores are normalized to `_rrf_norm` (0..1, best hit = 1.0);
   `_rrf_score` keeps the raw fusion value. RRF ranks by position, so it
   barely separates hits (`_rrf_norm` 1.00 / 0.98 / 0.97 for similarities
@@ -131,8 +136,9 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 - `min_similarity` filters the **vector** retriever only. A full-text hit is
   kept even when the embedding model scores it badly — that is the case the
   full-text leg exists for (identifiers, file names, foreign words).
-  `recall` reports `candidates` and `filtered_by_similarity` and warns when
-  the filter removed everything, so an empty result is never silent.
+  `recall` reports `candidates` and `dropped_by_similarity` (the number of
+  vector hits removed, not the number kept) and warns when the filter removed
+  everything, so an empty result is never silent.
 - `_relevance_score` is normalized to 0..1 and combines both signals: the
   cosine similarity of the vector hit and the rank of the full-text hit
   (`_text_score`). A memory that both retrievers found scores higher than
@@ -158,9 +164,12 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 - `recall`/`list_memories` accept `updated_after` (ISO date) and
   `metadata_filter` (key/value pairs the metadata must contain);
   `list_memories` additionally accepts `order_by`
-  (`updated_at`, `created_at`, `access_count`, `importance`) and `contains`
+  (`updated_at`, `created_at`, `access_count`, `importance`), `contains`
   (case-insensitive literal substring — the right tool for "which memory
-  contains exactly X", where the semantic ranking of `recall` is not needed).
+  contains exactly X", where the semantic ranking of `recall` is not needed),
+  `memory_id` (direct id lookup in the selected scope(s)) and
+  `include_deleted` (lists soft-forgotten rows, which then carry `deleted_at`).
+  `recall` accepts `offset` (`has_more`/`next_offset` in the answer).
 - `init_context` returns the **most recently changed** memories of the scope
   (never a decay-ranked mix): a freshly stored fact always shows up, even if
   it was never read before. `limit` controls how many (default 10).
@@ -179,16 +188,28 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   Without `project` everything is global. `remember_batch` accepts the same
   top-level `scope` (per-fact `scope` wins); invalid facts are reported in
   their result entry without aborting the rest of the batch.
-- `update_memory`/`forget` locate a `memory_id` in every table when `project`
-  is omitted. `forget(entity=...)` removes the entity's memories from all
-  scopes and deletes its graph node; with `project` it touches only that
-  scope's memories and node. Unknown ids/entities return `NOT FOUND`.
+- `update_memory`/`restore_memory`/`forget` locate a `memory_id` in every
+  table when `project` is omitted. `forget(entity=...)` removes the entity's
+  memories from all scopes and deletes its graph node; with `project` it
+  touches only that scope's memories and node. Unknown ids/entities return
+  `NOT FOUND`.
+- A soft-forgotten memory can be recovered with `restore_memory`: it clears
+  `deleted_at` and the forgotten sentinel. `list_memories(include_deleted=true)`
+  shows the forgotten rows (with `deleted_at`) so an agent can find the id.
+  Hard-deleted rows cannot be restored.
+- `remember` warns when the new content matches a **superseded** memory: the
+  fact is still stored as active (an intentional revert is legitimate), but the
+  response names the old id and its replacement so the fork is visible.
 - `include_superseded=true` exposes superseded history but never rows that were
-  forgotten (`deleted_at` is set), so soft deletion stays invisible.
-  `only_superseded=true` in `recall` returns the invalidated facts only.
+  forgotten (`deleted_at` is set), so soft deletion stays invisible to normal
+  reads. `only_superseded=true` in `recall` returns the invalidated facts only.
+- `list_entities` hides synthetic relation-context entities (`A_KNOWS_B`) that
+  exist only to make an edge context searchable; an entity that also has a
+  real memory stays listed.
 - Results are projected: by default a row shows the public fields plus the
   score annotations, never `content_hash`, `deleted_at` or the embedding.
-  `fields=["id", "content"]` returns exactly the named columns.
+  `fields=["id", "content"]` returns exactly the named columns; `deleted_at`
+  can be requested explicitly and is included by `include_deleted=true`.
 
 ## Cognitive Decay
 
@@ -229,6 +250,9 @@ candidate count (15) is unchanged, so the number of NLI calls stays the same.
 2. **Vector self-join**: for each memory, the 20 nearest neighbors are fetched via `ORDER BY embedding <=>`
 3. Only the deduplicated candidate pairs are checked via `/nli` (configured LLM) – one call per memory, not per pair
 4. Pairs with confidence > 0.7 count as a contradiction
+5. `resolve="newest"` (opt-in) keeps the most recently updated memory of each
+   pair active and marks the older one as superseded; `resolution` on the pair
+   names `superseded` and `kept`
 
 → **Savings**: O(n²) → O(n × k) LLM calls (k=20).
 
@@ -278,7 +302,8 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
   name without collisions, and global facts stay visible inside a project.
 - `get_entity`, `list_entities`, `list_memories`, `recall`, `init_context`,
   `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
-  `forget`, `export_memories` and `import_memories` accept `project`. Read
+  `forget`, `restore_memory`, `export_memories` and `import_memories` accept
+  `project`. Read
   defaults are described above. Graph tools use the global graph when
   `project` is omitted. `export_memories` exports all scopes when omitted;
   `import_memories` restores each record to its exported scope. For
@@ -286,7 +311,8 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
   project=...)` deletes only that scope's node and memories; without `project`
   it removes every scope.
 - A **memory id is unique per scope, not globally**: an import copies the id
-  into the target scope. `update_memory` and `forget(memory_id=...)` refuse an
+  into the target scope. `update_memory`, `restore_memory` and
+  `forget(memory_id=...)` refuse an
   id that exists in several scopes and name the scopes in the error
   (`scopes`); `project` says which one to use. `forget(entity=...)` keeps
   removing the entity from every scope.
@@ -300,8 +326,11 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
   `deleted_at`, timestamps, `access_count`, the project of every record and —
   for JSON — the full graph (entities with scope plus relations with weight and
   scope). JSONL is flat: one record per line, no graph. `include_embeddings=true`
-  exports the vectors, `include_superseded=true` the history,
-  `include_graph=false` omits the graph. The payload is returned in `data`.
+  exports the vectors, `include_superseded=true` the history (superseded and
+  soft-forgotten rows), `include_graph=false` omits the graph. The payload is
+  returned in `data`. The default export is active-only and **warns** how many
+  superseded/forgotten rows it left out, so a backup is never silently
+  incomplete.
 - `import_memories` restores ids and timestamps, recreates per-project tables
   on demand and upserts entities/relations with MERGE (idempotent). Without
   `project` every record keeps its export scope; with `project` all records go
@@ -345,18 +374,19 @@ it explicitly.
 | `relate` | `from_entity`, `to_entity` (not `from`, `to`), `weight` (0..1) | Source and target entity names; `weight` is the edge strength |
 | `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent) |
 | `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
-| `recall` | `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`) |
-| `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `contains` | Browse without a query; `contains` is a case-insensitive literal substring; `offset` pages, the response reports `total`/`has_more`/`next_offset` |
-| `list_entities` | `entity_type`, `project`, `include_global`, `limit`, `offset` | Without `project`, lists all scopes; memory-only rows carry `type="memory-only"`; sorted by name so `offset` is stable |
-| `init_context` | `project`, `include_global`, `detail`, `limit` | `project="*"` includes all projects; every memory reports its `project`; the list holds the most recently changed memories |
+| `recall` | `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `offset` pages (`has_more`/`next_offset`) |
+| `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `contains`, `memory_id`, `include_deleted` | Browse without a query; `contains` is a case-insensitive literal substring; `memory_id` is a direct lookup; `include_deleted` lists forgotten rows with `deleted_at`; `offset` pages, the response reports `total`/`has_more`/`next_offset` |
+| `list_entities` | `entity_type`, `project`, `include_global`, `limit`, `offset` | Without `project`, lists all scopes; memory-only rows carry `type="memory-only"`; synthetic `A_KNOWS_B` entities are hidden; sorted by name so `offset` is stable |
+| `init_context` | `project`, `include_global`, `detail`, `limit` | `project="*"` includes all projects (and `"global"` in `projects`); every memory reports its `project`; the list holds the most recently changed memories |
 | `list_projects` | `include_empty` | Lists every scope with memories/entities/relations counts |
 | `drop_project` | `project`, `dry_run` | Removes the scope completely (table, registry, graph nodes, mirror rows); `global` is refused |
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set |
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts are reported individually |
 | `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`) |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
-| `contradictions_report` | `entity` | Required; checks one entity at a time |
+| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Required; checks one entity at a time; `newest` supersedes the older fact of each confirmed pair |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project`, `dry_run` | `counts` splits memories/entities/relations; `entity="*"` + `project` purges a whole scope; `dry_run=True` only reports what would be removed |
+| `restore_memory` | `memory_id`, `project` | Reverses a soft delete; only rows with `deleted_at` set can be restored |
 | `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Payload is returned in `data`; graph is only included in JSON exports |
 | `import_memories` | `data` (object or string), `project`, `format`, `skip_duplicates`, `fuzzy_threshold` | Without `project` records keep their export scope |
 
@@ -384,6 +414,7 @@ carries a warning - replacing an unrelated fact would destroy it silently.
 - **Explore relationships** → `find_connections` or `find_paths`
 - **Check for stale/wrong facts** → `contradictions_report`
 - **Remove stale data** → `forget` with `soft=true`
+- **Undo a soft delete** → `restore_memory` (find the id with `list_memories(include_deleted=true)`)
 - **Remove a whole project** → `drop_project` (after `forget(entity="*")` emptied it)
 - **Which projects exist** → `list_projects`
 - **Backup** → `export_memories`

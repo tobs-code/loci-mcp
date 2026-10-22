@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
@@ -28,11 +28,19 @@ def contradictions_report(entity: Annotated[
     limit: Annotated[
         int,
         Field(description="Maximum number of candidate pairs to report "
-                          "(default 20).")] = 20) -> dict[str, Any]:
+                          "(default 20).")] = 20,
+    resolve: Annotated[
+        Literal["none", "newest"],
+        Field(description="'none' (default) only reports. 'newest' keeps the "
+                          "most recently updated memory of each pair active "
+                          "and marks the older one as superseded.")] = "none",
+) -> dict[str, Any]:
     """Find potentially conflicting facts stored for the same entity.
 
     Uses vector similarity to find candidate pairs, then NLI to confirm.
     Returns pairs with confidence scores in [0, 1] (higher = more likely contradictory).
+    With `resolve="newest"` the older memory of every confirmed pair is
+    superseded by the newer one (recency decides; the report names the ids).
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
     project = _norm_project(project)
@@ -122,7 +130,53 @@ def contradictions_report(entity: Annotated[
                 })
 
     contradictions = contradictions[:limit]
-    return ok(STATUS_OK, count=len(contradictions), results=contradictions)
+
+    warnings: list[str] = []
+    resolved = 0
+    if resolve == "newest" and contradictions:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            tables = _retrieval_tables(cur, project)
+            for pair in contradictions:
+                a_id, b_id = pair["a"]["id"], pair["b"]["id"]
+                timestamps = {}
+                for mem_id in (a_id, b_id):
+                    for table in tables:
+                        cur.execute(
+                            f"SELECT updated_at FROM {table} WHERE id = %s",
+                            (mem_id,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            timestamps[mem_id] = row[0]
+                            break
+                a_ts = timestamps.get(a_id)
+                b_ts = timestamps.get(b_id)
+                keep_a = a_ts is not None and (b_ts is None or a_ts >= b_ts)
+                older, newer = (b_id, a_id) if keep_a else (a_id, b_id)
+                changed = 0
+                for table in tables:
+                    cur.execute(
+                        f"UPDATE {table} SET superseded_by = %s, "
+                        f"updated_at = NOW() WHERE id = %s "
+                        f"AND superseded_by IS NULL AND deleted_at IS NULL",
+                        (newer, older),
+                    )
+                    changed += cur.rowcount
+                if changed:
+                    resolved += 1
+                    pair["resolution"] = {"superseded": older, "kept": newer}
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.exception("contradictions_report resolve failed")
+            warnings.append(f"resolve failed: {e}")
+        finally:
+            conn.close()
+
+    return ok(STATUS_OK, count=len(contradictions), results=contradictions,
+              resolved=resolved, warnings=warnings)
 
 
 def server_health() -> dict[str, Any]:

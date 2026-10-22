@@ -40,7 +40,8 @@ SCORE_FIELDS = (
     "_graph_weight",
 )
 
-SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS + ("_project",))
+SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS
+                              + ("_project", "deleted_at"))
 
 
 def validate_fields(fields: list[str] | None) -> str | None:

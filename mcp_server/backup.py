@@ -15,6 +15,7 @@ from mcp_server.scopes import (
     _norm_project,
     _project_names,
     _project_tables,
+    _table_exists,
 )
 from mcp_server.scoring import _content_hash, _gen_id, _now
 from mcp_server.storage import _deduplicate
@@ -49,6 +50,28 @@ def _export_memories_json(cur, project: str | None,
             out.append(rec)
     out.sort(key=lambda r: r["created_at"] or _now())
     return out
+
+
+def _export_excluded_counts(cur, project: str | None) -> tuple[int, int]:
+    """Count rows a default export leaves out: (superseded, forgotten)."""
+    if project:
+        tables = [_mem_table(project)]
+    else:
+        tables = ["memories"] + list(_project_tables(cur))
+    superseded = 0
+    forgotten = 0
+    for table in tables:
+        if not _table_exists(cur, table):
+            continue
+        cur.execute(
+            f"SELECT COUNT(*) FILTER (WHERE deleted_at IS NULL "
+            f"AND superseded_by IS NOT NULL), "
+            f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) FROM {table}"
+        )
+        row = cur.fetchone()
+        superseded += int(row[0] or 0)
+        forgotten += int(row[1] or 0)
+    return superseded, forgotten
 
 
 def _export_graph(cur, project: str | None) -> dict:
@@ -119,6 +142,8 @@ def export_memories(
         rows = _export_memories_json(cur, project, include_superseded,
                                      include_embeddings)
         graph = _export_graph(cur, project) if (include_graph and format != "jsonl") else None
+        excluded = ((0, 0) if include_superseded
+                    else _export_excluded_counts(cur, project))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -153,16 +178,29 @@ def export_memories(
             record["embedding"] = r["embedding"]
         records.append(record)
 
+    warnings: list[str] = []
+    superseded_count, forgotten_count = excluded
+    if superseded_count or forgotten_count:
+        parts = []
+        if superseded_count:
+            parts.append(f"{superseded_count} superseded")
+        if forgotten_count:
+            parts.append(f"{forgotten_count} forgotten")
+        warnings.append(
+            "export excludes " + " and ".join(parts) + " memories of this "
+            "scope; pass include_superseded=true for a complete backup")
     if format == "jsonl":
         data = "\n".join(json.dumps(r) for r in records)
         return ok(STATUS_OK, format=format, count=len(records), data=data,
-                  data_format="jsonl", graph_included=False)
+                  data_format="jsonl", graph_included=False,
+                  warnings=warnings)
     payload = {"type": "memory_export", "version": "0.2",
                "records": records, "count": len(records)}
     if graph is not None:
         payload["graph"] = graph
     return ok(STATUS_OK, format=format, count=len(records), data=payload,
-              data_format="json", graph_included=graph is not None)
+              data_format="json", graph_included=graph is not None,
+              warnings=warnings)
 
 
 def _parse_dt(value) -> datetime | None:

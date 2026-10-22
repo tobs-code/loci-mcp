@@ -19,7 +19,10 @@ scores 0.30-0.61, while a natural-language question that matches scores
 
 The full-text query is OR-based (`_fts_query`) and weighted with
 `FTS_WEIGHT = 0.6`, so a single common word cannot outrank the best semantic
-hit. The retriever uses the English dictionary (`FTS_LANGUAGE`); index and
+hit. The normalized text score is multiplied by **query coverage** (matched
+query lexemes / all query lexemes after stemming and stopword removal), so a
+document that matched one of three words cannot look like a perfect full-text
+match. The retriever uses the English dictionary (`FTS_LANGUAGE`); index and
 query side always match, a changed dictionary is migrated at startup.
 
 ## Read scope defaults
@@ -63,8 +66,9 @@ ranks by position, so the third hit is almost as good as the first (0.97 vs
 only. A full-text hit is kept even when the embedding model scores it badly —
 that is the case the full-text leg exists for.
 
-`recall` reports `candidates` and `filtered_by_similarity` and warns when the
-filter removed everything, so an empty result is never silent.
+`recall` reports `candidates` and `dropped_by_similarity` (the number of vector
+hits removed) and warns when the filter removed everything, so an empty result
+is never silent.
 
 With `min_similarity=null` the filter is disabled and near-zero hits can
 appear as "relevant". When any returned hit has `_similarity < 0.35`, the
@@ -144,6 +148,9 @@ comparison to `fact` hid most real conflicts.
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
    memory, not one call per pair.
 4. Pairs with a confidence > 0.7 count as a contradiction.
+5. `resolve="newest"` (opt-in) keeps the most recently updated memory of each
+   pair active and supersedes the older one; the pair reports `resolution` with
+   the `superseded` and `kept` ids.
 
 The quality of the detection depends on the embedding model
 (`jina-embeddings-v5`), which provides good similarity values for semantically
@@ -169,6 +176,11 @@ Metadata of replaced memories is not lost: keys the new fact does not set are
 merged into the new memory (explicitly passed metadata always wins). The
 response lists the carried keys in a warning (`metadata carried over from
 the replaced memories: ...`).
+
+`remember` also warns when the new content matches a **superseded** memory: the
+fact is still stored as active (an intentional revert is legitimate), but the
+response names the old id and its replacement, so the fork is visible instead
+of silently reintroducing an invalidated fact.
 
 ## Dedupe modes
 

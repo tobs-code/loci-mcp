@@ -20,6 +20,7 @@ from mcp_server.envelope import (
     STATUS_NOT_FOUND,
     STATUS_OK,
     STATUS_PARTIAL,
+    STATUS_RESTORED,
     STATUS_SOFT_FORGOTTEN,
     STATUS_STORED,
     STATUS_UPDATED,
@@ -45,6 +46,7 @@ from mcp_server.storage import (
     _deduplicate,
     _find_by_content,
     _find_last_for_entity,
+    _find_superseded_match,
     _store_memory,
     _supersede,
 )
@@ -212,6 +214,12 @@ def remember(
                                 f"({detail})"],
                       duplicate_mode=mode, similarity=similarity)
 
+        # No active duplicate, but the content may match a memory that was
+        # superseded earlier. Storing it would silently re-activate an
+        # outdated fact, so report the match (without blocking the write).
+        superseded_match = _find_superseded_match(
+            cur, content, store_project, emb, fuzzy_threshold, dedupe=dedupe)
+
         contradictions = []
         nli_unavailable = check_contradictions and nli_configured() is False
         if check_contradictions and entity and not nli_unavailable:
@@ -280,6 +288,18 @@ def remember(
 
         warnings: list[str] = []
         warnings.extend(guard_warnings)
+        if superseded_match:
+            mode = superseded_match["mode"]
+            detail = ("the same content" if mode == "exact"
+                      else f"a similar content (similarity "
+                           f"{superseded_match['similarity']})")
+            warnings.append(
+                f"this fact matches a superseded memory "
+                f"({superseded_match['id']}) that was replaced by "
+                f"{superseded_match['superseded_by']} ({detail} was already "
+                f"invalidated). The new fact was stored as active, so both "
+                f"versions are reachable now; verify this revert is intended"
+            )
         if check_contradictions and entity and contradictions:
             warnings.append(
                 f"superseded {len(contradictions)} contradicting memory/facts"
@@ -704,6 +724,76 @@ def update_memory(
     finally:
         conn.close()
     return ok(STATUS_UPDATED, id=memory_id, project=scope)
+
+
+def restore_memory(
+    memory_id: Annotated[
+        str,
+        Field(description="Id of the soft-forgotten memory to restore.")],
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. Without it the id is looked up in "
+                          "every scope.")] = None,
+) -> dict[str, Any]:
+    """Bring a soft-forgotten memory back.
+
+    `forget(soft=True)` hides a memory without deleting it. This tool reverses
+    that: it clears `deleted_at` (and the forgotten sentinel) so the memory is
+    visible to `recall`/`list_memories` again. Only soft-forgotten memories can
+    be restored; hard-deleted rows and active memories are reported as
+    `not_found`.
+
+    Without `project` the id is looked up in every scope. An id that exists in
+    several scopes is refused; pass `project` to select one.
+    """
+    logger.info("restore_memory id=%s project=%s", memory_id, project)
+    memory_id = (memory_id or "").strip()
+    if not memory_id:
+        return fail(STATUS_ERROR, "memory_id must not be empty")
+    project = _norm_project(project)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if project:
+            tables = [_mem_table(project)]
+            if not _table_exists(cur, tables[0]):
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                            id=memory_id)
+        else:
+            scopes = _memory_scopes(cur, memory_id)
+            if len(scopes) > 1:
+                conn.rollback()
+                return fail(STATUS_ERROR,
+                            f"ambiguous memory id {memory_id}: it exists in "
+                            f"the scopes {scopes}; pass project=<name> to say "
+                            f"which one to restore",
+                            id=memory_id, scopes=scopes)
+            tables = _all_mem_tables(cur)
+        restored = 0
+        restored_table = None
+        for table in tables:
+            cur.execute(
+                f"UPDATE {table} SET deleted_at = NULL, superseded_by = NULL, "
+                f"updated_at = NOW() WHERE id = %s AND deleted_at IS NOT NULL",
+                (memory_id,),
+            )
+            if cur.rowcount:
+                restored += cur.rowcount
+                restored_table = table
+                break
+        conn.commit()
+        if not restored:
+            return fail(
+                STATUS_NOT_FOUND,
+                f"NOT FOUND: {memory_id} (not soft-forgotten or does not exist)",
+                id=memory_id)
+        scope = _scope_of_table(cur, restored_table) if restored_table else None
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e), id=memory_id)
+    finally:
+        conn.close()
+    return ok(STATUS_RESTORED, id=memory_id, project=scope)
 
 
 def forget(

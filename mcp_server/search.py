@@ -93,12 +93,24 @@ def _search_memories_rrf(
 
     max_distance = None if min_similarity is None else 1.0 - min_similarity
     fts_query = _fts_query(query_text)
+    # Query lexemes after stemming/stopword removal. They are used to measure
+    # how much of the query a full-text hit actually covers: an OR query makes
+    # a single common word look like a perfect match otherwise.
+    fts_lexemes: list[str] = []
+    if fts_query and query_text:
+        cur.execute(
+            f"SELECT tsvector_to_array(to_tsvector('{FTS_LANGUAGE}', %s))",
+            (query_text,),
+        )
+        row = cur.fetchone()
+        fts_lexemes = list(row[0] or []) if row else []
     extra_conditions, extra_params = _extra_conditions(updated_after,
                                                         metadata_filter)
 
     # (score, id, table) tuples, merged across tables before ranking
     vec_candidates: list[tuple[float, str, str]] = []
-    text_candidates: list[tuple[float, str, str]] = []
+    # (rank, matched_lexemes, id, table)
+    text_candidates: list[tuple[float, int, str, str]] = []
     dropped_by_similarity = 0
 
     for table in tables:
@@ -141,17 +153,22 @@ def _search_memories_rrf(
         if fts_query:
             sql = (
                 f"SELECT id, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
-                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS rank FROM {table} "
+                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS rank, "
+                f"(SELECT COUNT(*) FROM unnest(%s::text[]) AS lex "
+                f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
+                f"plainto_tsquery('{FTS_LANGUAGE}', lex)) AS matched "
+                f"FROM {table} "
                 f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
                 f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)"
             )
-            fts_params: list[Any] = [fts_query, fts_query]
+            fts_params: list[Any] = [fts_query, fts_lexemes, fts_query]
             # No similarity filter here: a full-text hit stays a hit even when
             # the embedding model scores it poorly.
             sql += f" AND {where} ORDER BY rank DESC LIMIT 50"
             cur.execute(sql, fts_params + params)
             text_candidates.extend(
-                (float(rank), row_id, table) for row_id, rank in cur.fetchall()
+                (float(rank), int(matched or 0), row_id, table)
+                for row_id, rank, matched in cur.fetchall()
             )
 
     vec_candidates.sort(key=lambda c: c[0])
@@ -168,15 +185,20 @@ def _search_memories_rrf(
         vector_results[row_id] = 1.0 / (k + rank)
         similarities[row_id] = 1.0 - distance
         table_of.setdefault(row_id, table)
-    for rank, (_, row_id, table) in enumerate(text_candidates[:50], 1):
+    for rank, (_, _, row_id, table) in enumerate(text_candidates[:50], 1):
         text_results[row_id] = FTS_WEIGHT / (k + rank)
         table_of.setdefault(row_id, table)
 
-    max_text_rank = max((r for r, _, _ in text_candidates[:50]), default=0.0)
-    for rank, (ts_rank, row_id, _table) in enumerate(text_candidates[:50], 1):
+    max_text_rank = max((r for r, _, _, _ in text_candidates[:50]), default=0.0)
+    lexeme_count = max(1, len(fts_lexemes))
+    for rank, (ts_rank, matched, row_id, _table) in enumerate(text_candidates[:50], 1):
         # Normalized full-text evidence: the best text hit is 1.0, weaker
-        # hits fall off with their text rank.
-        text_scores[row_id] = (ts_rank / max_text_rank) if max_text_rank else 0.0
+        # hits fall off with their text rank. Multiply by query coverage so a
+        # hit that matched only one word of a multi-word query cannot look
+        # like a perfect match.
+        rank_norm = (ts_rank / max_text_rank) if max_text_rank else 0.0
+        coverage = min(1.0, matched / lexeme_count) if fts_lexemes else 1.0
+        text_scores[row_id] = rank_norm * coverage
 
     fused_scores = {
         row_id: vector_results.get(row_id, 0.0) + text_results.get(row_id, 0.0)
@@ -185,7 +207,7 @@ def _search_memories_rrf(
     if not fused_scores:
         if stats is not None:
             stats.update({"candidates": 0,
-                          "filtered_by_similarity": dropped_by_similarity,
+                          "dropped_by_similarity": dropped_by_similarity,
                           "fulltext_only": 0})
         return []
 
@@ -249,7 +271,7 @@ def _search_memories_rrf(
     if stats is not None:
         stats.update({
             "candidates": len(fused_scores),
-            "filtered_by_similarity": dropped_by_similarity,
+            "dropped_by_similarity": dropped_by_similarity,
             "fulltext_only": sum(1 for row_id in fused_scores
                                  if row_id not in similarities),
         })
@@ -421,7 +443,7 @@ def _search_memories(
     if stats is not None:
         stats.update({
             "candidates": len(rows),
-            "filtered_by_similarity": dropped_by_similarity,
+            "dropped_by_similarity": dropped_by_similarity,
             "fulltext_only": 0,
         })
     if include_decay:

@@ -19,7 +19,13 @@ from mcp_server.tools.maintenance import (
     server_health,
     stats_resource,
 )
-from mcp_server.tools.memory import forget, remember, remember_batch, update_memory
+from mcp_server.tools.memory import (
+    forget,
+    remember,
+    remember_batch,
+    restore_memory,
+    update_memory,
+)
 from mcp_server.tools.read import (
     get_entity,
     init_context,
@@ -36,6 +42,7 @@ _TOOLS = (
     remember_batch,
     update_memory,
     forget,
+    restore_memory,
     recall,
     list_memories,
     get_entity,

@@ -60,7 +60,10 @@ import_memories(data=<the JSON string of the export payload>, format="json")
 ## A backup that keeps the history
 
 `include_superseded` defaults to `false`, so a plain export contains only the
-active memories. For a real backup take the history with it:
+active memories. It also leaves soft-forgotten rows out. The answer names how
+many superseded and forgotten rows were excluded
+(`warnings`), so a backup is never silently incomplete. For a real backup take
+the history with it:
 
 ```text
 export_memories(format="json", include_superseded=true, include_embeddings=true)

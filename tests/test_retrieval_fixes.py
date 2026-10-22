@@ -49,7 +49,7 @@ def test_recall_reports_the_candidates_it_filtered():
 
     assert result["ok"] is True
     assert "candidates" in result
-    assert "filtered_by_similarity" in result
+    assert "dropped_by_similarity" in result
 
 
 def test_recall_warns_when_the_filter_removed_everything():

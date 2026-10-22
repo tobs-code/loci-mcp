@@ -10,6 +10,7 @@ from mcp_server.config import DEFAULT_MIN_SIMILARITY, MEMORY_TYPE_HELP
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
 from mcp_server.projection import (
+    PUBLIC_FIELDS,
     dedupe_near_duplicates,
     project_bootstrap,
     project_full,
@@ -82,6 +83,11 @@ def recall(
     limit: Annotated[
         int,
         Field(description="Maximum number of results (default 10).")] = 10,
+    offset: Annotated[
+        int,
+        Field(description="Skip this many ranked matches (default 0). Use it "
+                          "with `limit` to page through a result set; the "
+                          "response reports `has_more`.")] = 0,
     project: Annotated[
         str | None,
         Field(description="Project scope. Without it only global memories are "
@@ -157,7 +163,7 @@ def recall(
     a full-text hit is kept even when its embedding is a poor match, so an
     exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
     handles that word badly. Pass `None` to disable the filter. The response
-    reports `candidates` and `filtered_by_similarity`, and warns when the
+    reports `candidates` and `dropped_by_similarity`, and warns when the
     filter removed everything.
     `_relevance_score` is normalized to 0..1 and combines both signals: the
     cosine similarity of the vector hit and the rank of the full-text hit.
@@ -174,6 +180,8 @@ def recall(
     Set fields=["id", "content"] to receive only the named columns.
     Set include_global=False to restrict a project search to project memories.
     `updated_after` and `metadata_filter` narrow the result set.
+    `offset` pages through the ranked results (with `limit`); the response
+    reports `has_more` and `next_offset`.
     """
     logger.info("recall query='%s' entity=%s hybrid=%s include_decay=%s graph_boost=%s min_similarity=%s",
                 query[:80], entity, hybrid, include_decay, graph_boost, min_similarity)
@@ -190,6 +198,8 @@ def recall(
         return fail(STATUS_ERROR, "min_decay_score must be between 0.0 and 1.0")
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
+    if offset < 0:
+        return fail(STATUS_ERROR, "offset must be >= 0")
     if metadata_filter is not None and not isinstance(metadata_filter, dict):
         try:
             metadata_filter = _normalize_metadata_filter(metadata_filter)
@@ -218,9 +228,13 @@ def recall(
         if project and not include_global:
             tables = [table for table in tables if table != "memories"]
         stats: dict[str, Any] = {}
+        # The page needs `offset + limit` candidates, plus one to know whether
+        # a further page exists. Slicing happens after the optional filters so
+        # `offset` counts real returned rows.
+        fetch_limit = limit + offset + 1
         results = _search_memories(
             cur, query_emb, query if (hybrid or query_emb is None) else None,
-            mem_type, entity, limit, project,
+            mem_type, entity, fetch_limit, project,
             include_decay, include_superseded=include_superseded,
             min_similarity=min_similarity,
             hybrid=hybrid, tables=tables,
@@ -231,7 +245,7 @@ def recall(
         # Graph-enhanced retrieval when enabled
         if graph_boost and boost_entity:
             results = _search_memories_graph_boost(
-                results, boost_entity, limit, project, include_decay,
+                results, boost_entity, fetch_limit, project, include_decay,
                 include_global=include_global,
                 updated_after=updated_after, metadata_filter=metadata_filter,
             )
@@ -263,7 +277,15 @@ def recall(
                     kept.append(r)
             results = kept
 
-        # Update access counters (decay frequency)
+        if only_superseded:
+            results = [r for r in results
+                       if isinstance(r, dict) and r.get("superseded_by")]
+
+        has_more = len(results) > offset + limit
+        results = results[offset:offset + limit]
+
+        # Update access counters (decay frequency) only for the rows this
+        # page actually returns: skipped matches were not read.
         hit_ids = [r.get("id") for r in results if isinstance(r, dict) and r.get("id")]
         _log_access(cur, hit_ids, project)
         for r in results:
@@ -278,18 +300,18 @@ def recall(
     finally:
         conn.close()
 
-    if only_superseded:
-        results = [r for r in results
-                   if isinstance(r, dict) and r.get("superseded_by")]
-
-    results = results[:limit]
     rows = [project_row(r, fields) for r in results if isinstance(r, dict)]
 
     # An empty result set is ambiguous: the memory may simply not exist, or
     # a filter may have dropped it. Say which one it was.
-    filtered_out = stats.get("filtered_by_similarity", 0)
+    filtered_out = stats.get("dropped_by_similarity", 0)
     candidates = stats.get("candidates", 0)
-    if not rows and filtered_out:
+    if not rows and offset > 0 and candidates:
+        warnings.append(
+            f"no results on this page: offset={offset} is beyond the "
+            f"{candidates} ranked candidate(s); lower the offset"
+        )
+    elif not rows and filtered_out:
         warnings.append(
             f"no results: {filtered_out} candidate(s) were below "
             f"min_similarity={min_similarity}; pass min_similarity=null or a "
@@ -314,7 +336,10 @@ def recall(
                 f"only marginally relevant to the query")
     payload: dict[str, Any] = {
         "candidates": candidates,
-        "filtered_by_similarity": filtered_out,
+        "dropped_by_similarity": filtered_out,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": (offset + limit) if has_more else None,
     }
     if stats.get("fulltext_only"):
         payload["fulltext_only"] = stats["fulltext_only"]
@@ -369,6 +394,15 @@ def list_memories(
         Field(description="Skip this many matches (default 0). Use it together "
                           "with `limit` to page through a large scope; the "
                           "response reports `total` and `has_more`.")] = 0,
+    memory_id: Annotated[
+        str | None,
+        Field(description="Only list the memory with this id. Use it as a "
+                          "direct id lookup across the selected scope(s).")] = None,
+    include_deleted: Annotated[
+        bool,
+        Field(description="Also list soft-forgotten memories (recognizable by "
+                          "a non-null `deleted_at`). Use it before "
+                          "`restore_memory`.")] = False,
 ) -> dict[str, Any]:
     """Browse stored memories without a search query.
 
@@ -378,6 +412,8 @@ def list_memories(
     `metadata_filter` narrow the result set, `order_by` changes the sorting
     and `contains` filters on a literal substring of the content.
     `offset` pages through a scope that has more matches than `limit`.
+    Pass `memory_id` for a direct id lookup and `include_deleted=True` to
+    include soft-forgotten memories (they carry `deleted_at`).
     """
     logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
                 entity, mem_type, limit, offset, project)
@@ -419,10 +455,16 @@ def list_memories(
             tables = [table for table in tables if table != "memories"]
         conditions: list[str] = []
         params: list[Any] = []
-        if include_superseded:
+        if include_deleted:
+            # Everything, including superseded history and forgotten rows.
+            conditions.append("TRUE")
+        elif include_superseded:
             conditions.append("deleted_at IS NULL")
         else:
             conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+        if memory_id:
+            conditions.append("id = %s")
+            params.append(memory_id)
         if entity:
             conditions.append("entity = %s")
             params.append(entity)
@@ -489,10 +531,15 @@ def list_memories(
                                 r.get(order_column)), reverse=True)
     window = unique[offset:offset + limit]
     has_more = len(unique) > offset + limit
+    projection_fields = fields
+    if include_deleted and projection_fields is None:
+        # Without this the caller could not tell a forgotten row from an
+        # active one.
+        projection_fields = list(PUBLIC_FIELDS) + ["deleted_at"]
     return ok(STATUS_OK, count=len(window), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
-              results=[project_row(r, fields) for r in window])
+              results=[project_row(r, projection_fields) for r in window])
 
 
 def get_entity(name: Annotated[
@@ -625,7 +672,8 @@ def list_entities(entity_type: Annotated[
     exist on memories. With `project`, that project and global scope are
     listed by default; set `include_global=False` for strict project
     isolation. Without `project` every scope is listed. Each row carries its
-    `project`; `graph_node` is false for memory-only entities. The list is
+    `project`; `graph_node` is false for memory-only entities. Synthetic
+    relation-context entities (`A_KNOWS_B`) are not listed. The list is
     sorted by name; `offset` pages through it.
     """
     logger.info("list_entities entity_type=%s limit=%s offset=%s project=%s",
@@ -673,19 +721,25 @@ def list_entities(entity_type: Annotated[
         for table in tables:
             scope = scope_of[table]
             # Memory-only entities: a name that occurs in the memories of this
-            # scope but has no graph node there.
+            # scope but has no graph node there. Synthetic relation-context
+            # entities (e.g. "A_KNOWS_B") are excluded: they exist only to make
+            # the edge context searchable, not as browsable knowledge. An
+            # entity that also has a real memory stays visible.
+            context_flag = "COALESCE(metadata->>'relation_context', 'false') <> 'true'"
             cur.execute(
-                f"SELECT COUNT(*) FROM (SELECT DISTINCT entity FROM {table} "
+                f"SELECT COUNT(*) FROM (SELECT entity FROM {table} "
                 f"WHERE entity IS NOT NULL AND superseded_by IS NULL "
-                f"AND deleted_at IS NULL) e "
+                f"AND deleted_at IS NULL "
+                f"GROUP BY entity HAVING bool_or({context_flag})) e "
                 f"WHERE NOT EXISTS (SELECT 1 FROM entities en "
                 f"WHERE en.name = e.entity AND en.project = %s)",
                 (scope,),
             )
             total += cur.fetchone()[0]
             cur.execute(
-                f"SELECT DISTINCT entity FROM {table} "
-                f"WHERE entity IS NOT NULL AND superseded_by IS NULL AND deleted_at IS NULL"
+                f"SELECT entity FROM {table} "
+                f"WHERE entity IS NOT NULL AND superseded_by IS NULL AND deleted_at IS NULL "
+                f"GROUP BY entity HAVING bool_or({context_flag})"
             )
             for (ent,) in cur.fetchall():
                 if (ent, scope) in seen:
@@ -770,6 +824,10 @@ def init_context(project: Annotated[
         names = _project_names(cur)
         projects = [names.get(t[len("mem_"):], t[len("mem_"):])
                     for t in tables if t != "memories"]
+        if all_projects and include_global and "memories" in tables:
+            # The bootstrap covers every scope, so the shared one is a project
+            # entry too - otherwise the caller cannot see that it was included.
+            projects.insert(0, "global")
         for table in tables:
             cur.execute(
                 f"SELECT COUNT(*), "

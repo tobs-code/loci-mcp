@@ -29,7 +29,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | Key | Meaning |
 |-----|---------|
 | `ok` | `false` when the call failed, `true` otherwise |
-| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok` |
+| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `restored`, `not_found`, `partial`, `error`, `ok` |
 | `id` | Id of the affected memory (`null` for collections and for failures) |
 | `error` | Error message, `null` on success |
 | `warnings` | Non-fatal notes (skipped checks, superseded facts) |
@@ -51,6 +51,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance or metadata |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
+| `restore_memory` | Bring a soft-forgotten memory back; only rows with `deleted_at` set can be restored |
 
 ### `remember`
 
@@ -99,15 +100,23 @@ exists in several scopes is refused and the scopes are named (see
 - The answer carries `counts` (memories/entities/relations separately) and
   `scopes` (the scopes the id was found in).
 
+### `restore_memory`
+
+`memory_id`, `project`. Clears `deleted_at` and the forgotten sentinel, so the
+memory is visible to `recall`/`list_memories` again. Find the id with
+`list_memories(include_deleted=true)`; active or hard-deleted ids answer with
+`not_found`. Without `project` an id that exists in several scopes is refused
+(`scopes` names them).
+
 ## Read tools
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted` |
 | `get_entity` | Entity details (including graph connections) + all linked memories; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"` |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"`; synthetic `A_KNOWS_B` entities are hidden |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global`; `project="*"` lists `"global"` in `projects` |
 | `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
 ### `recall`
@@ -133,18 +142,22 @@ The search tool. `query` is required and non-empty.
 | `fields` | list? | Only return these columns, e.g. `["id", "content"]`. |
 | `updated_after` | string? | Only memories changed at or after this ISO date. |
 | `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. |
+| `offset` | int | Skip this many ranked hits (default 0). The answer reports `has_more` and `next_offset`. |
 
-The answer reports `candidates` and `filtered_by_similarity`, plus
-`fulltext_only` when a hit came only from the full-text leg. See
-[Retrieval](retrieval.md) for the score fields.
+The answer reports `candidates` and `dropped_by_similarity` (the number of
+vector hits the filter removed), plus `fulltext_only` when a hit came only from
+the full-text leg. See [Retrieval](retrieval.md) for the score fields.
 
 ### `list_memories`
 
 Browse without a search. `order_by` is `updated_at` (default), `created_at`,
 `access_count` or `importance`. `contains` filters on a case-insensitive
 literal substring - the right tool for "which memory contains exactly X",
-where the semantic ranking of `recall` is not needed. `offset` pages through a
-scope; the answer reports `total`, `has_more` and `next_offset`.
+where the semantic ranking of `recall` is not needed. `memory_id` looks a single
+id up directly in the selected scope(s). `offset` pages through a scope; the
+answer reports `total`, `has_more` and `next_offset`. `include_deleted=true`
+lists soft-forgotten rows and includes their `deleted_at`, which is how an agent
+finds an id for `restore_memory`.
 
 ### `get_entity`
 
@@ -156,13 +169,15 @@ scope; the answer reports `total`, `has_more` and `next_offset`.
 ### `list_entities`
 
 `entity_type`, `project`, `include_global`, `limit`, `offset`. The list is
-sorted by name, so `offset` is stable.
+sorted by name, so `offset` is stable. Synthetic relation-context entities
+(`A_KNOWS_B`) are hidden unless the name also carries a real memory.
 
 ### `init_context`
 
-The session bootstrap. `project="*"` includes all projects, `detail="full"`
-returns every column except the internal ones and the search score
-annotations, `include_global=false` excludes global memories.
+The session bootstrap. `project="*"` includes all projects (and `"global"` in
+the `projects` list), `detail="full"` returns every column except the internal
+ones and the search score annotations, `include_global=false` excludes global
+memories.
 
 ### `list_projects`
 
@@ -191,8 +206,8 @@ Lists every scope with `memories`, `total_memories`, `entities` and
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required |
-| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data` |
+| `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required; `resolve="newest"` keeps the newer fact and supersedes the older |
+| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews |
 | `server_health` | Check Postgres + Inference connectivity |
