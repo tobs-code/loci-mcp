@@ -120,10 +120,14 @@ def project_full(row: dict) -> dict:
     """Full column view for `detail="full"`, minus internal bookkeeping.
 
     Internal fields (content hash, embedding, deletion marker) are never
-    exposed, not even in the full bootstrap. The scope is reported as
-    `project`, like everywhere else.
+    exposed, not even in the full bootstrap. The search score annotations
+    (`_decay_score`, `_final_score`, ...) are dropped as well: they describe
+    a ranking that the bootstrap does not use - the list is sorted by the
+    last update, not by a score.
+    The scope is reported as `project`, like everywhere else.
     """
-    out = {k: v for k, v in row.items() if k not in INTERNAL_FIELDS}
+    out = {k: v for k, v in row.items()
+           if k not in INTERNAL_FIELDS and k not in SCORE_FIELDS}
     if "project" not in out:
         scope = row.get("_project") or row.get("scope")
         if scope is not None:

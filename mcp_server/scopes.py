@@ -271,6 +271,31 @@ def _mem_table(project: str | None) -> str:
     return "memories"
 
 
+def _scope_of_table(cur, table: str) -> str:
+    """Readable scope name of a memory table ('global' or the project name)."""
+    if table == "memories":
+        return "global"
+    names = _project_names(cur)
+    suffix = table[len("mem_"):]
+    return names.get(suffix, suffix)
+
+
+def _memory_scopes(cur, memory_id: str) -> list[str]:
+    """Scopes that hold a memory with this id.
+
+    A memory id is only unique inside a scope: an import can copy a memory
+    into another project, and then the same id exists twice. Callers use
+    this to tell the agent which scope a memory belongs to (or that the id
+    is ambiguous).
+    """
+    found: list[str] = []
+    for table in _all_mem_tables(cur):
+        cur.execute(f"SELECT 1 FROM {table} WHERE id = %s", (memory_id,))
+        if cur.fetchone():
+            found.append(_scope_of_table(cur, table))
+    return found
+
+
 def _count_entities() -> int:
     conn = get_conn()
     try:

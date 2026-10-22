@@ -4,18 +4,7 @@ import os
 
 from mcp_server.app import app
 from mcp_server.backup import export_memories, import_memories
-from mcp_server.config import (
-    CACHE_ACCESS_BOOST_DAYS,
-    DECAY_ACCESS_CAP,
-    DECAY_HALF_LIFE_DAYS,
-    DECAY_RAW_MAX,
-    DECAY_WEIGHT,
-    FTS_WEIGHT,
-    MEMORY_TYPES,
-    RRF_K,
-    SENTINEL_FORGOTTEN,
-    VALID_SCOPES,
-)
+from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.db import ensure_schema, get_conn
 from mcp_server.graph import (
     find_connections,
@@ -38,6 +27,7 @@ from mcp_server.tools.read import (
     list_memories,
     recall,
 )
+from mcp_server.tools.scopes import drop_project, list_projects
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +50,8 @@ _TOOLS = (
     server_health,
     export_memories,
     import_memories,
+    list_projects,
+    drop_project,
 )
 
 for _tool in _TOOLS:

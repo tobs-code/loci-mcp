@@ -7,6 +7,27 @@ MEMORY_TYPES = {
 }
 
 
+# The kind of a memory decides how it is used later: a `decision` is read
+# when "why did we do it?" is asked, a `convention` when "how do we work
+# here?" is asked. The names alone do not tell an agent that, so the tool
+# descriptions spell out the difference.
+MEMORY_TYPE_HELP = (
+    "Kind of the memory (default: fact). "
+    "fact: a verifiable statement about the system. "
+    "decision: a choice that was made, ideally with its reason. "
+    "learning: a lesson drawn from experience. "
+    "preference: what the user wants. "
+    "pattern: a recurring practice or behaviour. "
+    "incident: something that happened, usually a failure. "
+    "runbook: step-by-step instructions for a task. "
+    "context: background that explains the surroundings. "
+    "observation: a noticed or measured fact. "
+    "convention: a rule the team follows. "
+    "command: a command to run. "
+    "note: anything that does not fit the others."
+)
+
+
 VALID_SCOPES = {"global", "project"}
 
 
@@ -14,9 +35,6 @@ DECAY_HALF_LIFE_DAYS = 90
 
 
 DECAY_ACCESS_CAP = 20
-
-
-DECAY_RAW_MAX = 1.5
 
 
 DECAY_WEIGHT = 0.3
@@ -45,7 +63,9 @@ DEFAULT_DUPLICATE_THRESHOLD = 0.9
 # verbatim in the fact only scores 0.30-0.61 (single tokens dilute the query
 # vector). 0.4 therefore cut off roughly every third true keyword hit, so the
 # default sits lower; full-text matches are never filtered by this value.
-DEFAULT_MIN_SIMILARITY = 0.3
+# 0.35 is the compromise: the bottom tail of the keyword range (0.30-0.35) is
+# mostly noise, everything above it is kept.
+DEFAULT_MIN_SIMILARITY = 0.35
 
 
 PROJECT_SCOPE_BOOST = 0.05

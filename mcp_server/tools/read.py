@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from mcp_server.db import get_conn
-from mcp_server.config import DEFAULT_MIN_SIMILARITY
+from mcp_server.config import DEFAULT_MIN_SIMILARITY, MEMORY_TYPE_HELP
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
 from mcp_server.projection import (
@@ -74,11 +74,11 @@ def recall(
         Literal["fact", "decision", "learning", "preference", "pattern", "incident",
                 "runbook", "context", "observation", "convention", "command", "note"]
         | None,
-        Field(description="Only return memories of this type.")] = None,
+        Field(description="Only return memories of this type. " + MEMORY_TYPE_HELP)] = None,
     entity: Annotated[
         str | None,
         Field(description="Only return memories of this entity. Required for "
-                          "graph_boost.")] = None,
+                          "graph_boost if `graph_entity` is not given.")] = None,
     limit: Annotated[
         int,
         Field(description="Maximum number of results (default 10).")] = 10,
@@ -104,13 +104,21 @@ def recall(
                           "memories stay hidden.")] = False,
     graph_boost: Annotated[
         bool,
-        Field(description="Add memories of entities connected to `entity` in the "
-                          "graph. Requires `entity`; those hits have no "
-                          "similarity and are marked with `_graph_boost`.")] = False,
+        Field(description="Add memories of entities connected in the graph. "
+                          "Needs `graph_entity` (or `entity` as fallback). "
+                          "Those hits have no similarity and are marked with "
+                          "`_graph_boost`.")] = False,
+    graph_entity: Annotated[
+        str | None,
+        Field(description="Entity to expand from when `graph_boost` is used. "
+                          "With it the query search stays unfiltered, so the "
+                          "result is 'query hits + graph neighbourhood'. "
+                          "Without it `entity` is used for both the filter "
+                          "and the expansion.")] = None,
     min_similarity: Annotated[
         float | None,
         Field(description="Drop vector hits below this cosine similarity "
-                          "(0.0-1.0, default 0.3). Full-text hits are never "
+                          "(0.0-1.0, default 0.35). Full-text hits are never "
                           "dropped by this filter: an exact keyword match "
                           "survives even when the embedding model scores it "
                           "low. Use null to disable the filter.")] = DEFAULT_MIN_SIMILARITY,
@@ -139,11 +147,13 @@ def recall(
     """Search memories using hybrid vector + fulltext search (RRF fusion).
 
     Project searches also see global memories; global searches see only global ones.
-    Set graph_boost=True to include related entities in search via graph traversal
-    (requires `entity`, otherwise a warning is returned). Graph hits have no
-    similarity: their `_similarity` and `_relevance_score` are null and they
-    carry `_graph_boost` instead.
-    `min_similarity` defaults to 0.3 and only applies to the vector retriever;
+    Set graph_boost=True to add the memories of entities connected in the graph.
+    `graph_entity` names the entity to expand from and leaves the query search
+    unfiltered ("query hits + graph neighbourhood"); without it `entity` is
+    used for the expansion *and* filters the search, so unrelated hits are
+    dropped. Graph hits have no similarity: their `_similarity` and
+    `_relevance_score` are null and they carry `_graph_boost` instead.
+    `min_similarity` defaults to 0.35 and only applies to the vector retriever;
     a full-text hit is kept even when its embedding is a poor match, so an
     exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
     handles that word badly. Pass `None` to disable the filter. The response
@@ -189,8 +199,13 @@ def recall(
         _extra_conditions(updated_after, metadata_filter)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    if graph_boost and not entity:
-        warnings.append("graph_boost requires an entity; no graph boost was applied")
+    # The graph expansion needs a starting entity. `graph_entity` names it
+    # explicitly, so the query search can stay unfiltered; `entity` is the
+    # fallback and then also filters the search.
+    boost_entity = graph_entity or entity
+    if graph_boost and not boost_entity:
+        warnings.append("graph_boost requires an entity (graph_entity or "
+                        "entity); no graph boost was applied")
     if only_superseded:
         include_superseded = True
     query_emb = embed([query], mode="query")[0]
@@ -214,9 +229,9 @@ def recall(
         )
 
         # Graph-enhanced retrieval when enabled
-        if graph_boost and entity:
+        if graph_boost and boost_entity:
             results = _search_memories_graph_boost(
-                results, entity, limit, project, include_decay,
+                results, boost_entity, limit, project, include_decay,
                 include_global=include_global,
                 updated_after=updated_after, metadata_filter=metadata_filter,
             )
@@ -306,7 +321,7 @@ def list_memories(
         Literal["fact", "decision", "learning", "preference", "pattern", "incident",
                 "runbook", "context", "observation", "convention", "command", "note"]
         | None,
-        Field(description="Only list memories of this type.")] = None,
+        Field(description="Only list memories of this type. " + MEMORY_TYPE_HELP)] = None,
     limit: Annotated[
         int,
         Field(description="Maximum number of results (default 20).")] = 20,
@@ -340,6 +355,11 @@ def list_memories(
                           "(case-insensitive substring). Use it to look for a "
                           "literal string without the semantic ranking of "
                           "`recall`.")] = None,
+    offset: Annotated[
+        int,
+        Field(description="Skip this many matches (default 0). Use it together "
+                          "with `limit` to page through a large scope; the "
+                          "response reports `total` and `has_more`.")] = 0,
 ) -> dict[str, Any]:
     """Browse stored memories without a search query.
 
@@ -348,12 +368,15 @@ def list_memories(
     to restrict a project browse to project memories. `updated_after` and
     `metadata_filter` narrow the result set, `order_by` changes the sorting
     and `contains` filters on a literal substring of the content.
+    `offset` pages through a scope that has more matches than `limit`.
     """
-    logger.info("list_memories entity=%s mem_type=%s limit=%s project=%s",
-                entity, mem_type, limit, project)
+    logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
+                entity, mem_type, limit, offset, project)
     project = _norm_project(project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
+    if offset < 0:
+        return fail(STATUS_ERROR, "offset must be >= 0")
     fields_error = validate_fields(fields)
     if fields_error:
         return fail(STATUS_ERROR, fields_error)
@@ -403,12 +426,19 @@ def list_memories(
         conditions.extend(extra_conditions)
         params.extend(extra_params)
         where = " AND ".join(conditions)
+        # Oversample: the same content can live in several scopes and the
+        # cross-scope dedup below removes the copies again. Without the
+        # reserve a page could come back short.
+        fetch = (offset + limit) * 2
+        total = 0
         for table in tables:
+            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
+            total += cur.fetchone()[0]
             project_names = None if table == "memories" else _project_names(cur)
             cur.execute(
                 f"SELECT * FROM {table} WHERE {where} "
                 f"ORDER BY {order_column} DESC, id LIMIT %s",
-                params + [limit],
+                params + [fetch],
             )
             columns = [d[0] for d in cur.description]
             table_rows = cur.fetchall()
@@ -448,9 +478,12 @@ def list_memories(
     unique = list(by_hash.values()) + without_hash
     unique.sort(key=lambda r: (r.get(order_column) is not None,
                                 r.get(order_column)), reverse=True)
-    unique = unique[:limit]
-    return ok(STATUS_OK, count=len(unique),
-              results=[project_row(r, fields) for r in unique])
+    window = unique[offset:offset + limit]
+    has_more = len(unique) > offset + limit
+    return ok(STATUS_OK, count=len(window), total=total, offset=offset,
+              has_more=has_more,
+              next_offset=(offset + limit) if has_more else None,
+              results=[project_row(r, fields) for r in window])
 
 
 def get_entity(name: Annotated[
@@ -571,6 +604,11 @@ def list_entities(entity_type: Annotated[
         bool,
         Field(description="True (default) lists global entities as well; False "
                           "restricts a project browse to project entities.")] = True,
+    offset: Annotated[
+        int,
+        Field(description="Skip this many matches (default 0). Use it together "
+                          "with `limit` to page through a long entity list; the "
+                          "response reports `has_more`.")] = 0,
 ) -> dict[str, Any]:
     """Browse entities.
 
@@ -578,13 +616,16 @@ def list_entities(entity_type: Annotated[
     exist on memories. With `project`, that project and global scope are
     listed by default; set `include_global=False` for strict project
     isolation. Without `project` every scope is listed. Each row carries its
-    `project`; `graph_node` is false for memory-only entities.
+    `project`; `graph_node` is false for memory-only entities. The list is
+    sorted by name; `offset` pages through it.
     """
-    logger.info("list_entities entity_type=%s limit=%s project=%s",
-                entity_type, limit, project)
+    logger.info("list_entities entity_type=%s limit=%s offset=%s project=%s",
+                entity_type, limit, offset, project)
     project = _norm_project(project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
+    if offset < 0:
+        return fail(STATUS_ERROR, "offset must be >= 0")
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -608,10 +649,13 @@ def list_entities(entity_type: Annotated[
         if entity_type:
             conditions.append("type = %s")
             params.append(entity_type)
+        where = " AND ".join(conditions)
+        cur.execute(f"SELECT COUNT(*) FROM entities WHERE {where}", params)
+        total = cur.fetchone()[0]
         cur.execute(
             f"SELECT id, name, type, project FROM entities "
-            f"WHERE {' AND '.join(conditions)} ORDER BY name LIMIT %s",
-            params + [limit],
+            f"WHERE {where} ORDER BY name LIMIT %s",
+            params + [limit * 2 + offset],
         )
         rows = [{"id": r[0], "name": r[1], "type": r[2], "project": r[3],
                  "graph_node": True} for r in cur.fetchall()]
@@ -619,6 +663,17 @@ def list_entities(entity_type: Annotated[
         seen = {(r["name"], r["project"]) for r in rows}
         for table in tables:
             scope = scope_of[table]
+            # Memory-only entities: a name that occurs in the memories of this
+            # scope but has no graph node there.
+            cur.execute(
+                f"SELECT COUNT(*) FROM (SELECT DISTINCT entity FROM {table} "
+                f"WHERE entity IS NOT NULL AND superseded_by IS NULL "
+                f"AND deleted_at IS NULL) e "
+                f"WHERE NOT EXISTS (SELECT 1 FROM entities en "
+                f"WHERE en.name = e.entity AND en.project = %s)",
+                (scope,),
+            )
+            total += cur.fetchone()[0]
             cur.execute(
                 f"SELECT DISTINCT entity FROM {table} "
                 f"WHERE entity IS NOT NULL AND superseded_by IS NULL AND deleted_at IS NULL"
@@ -637,8 +692,14 @@ def list_entities(entity_type: Annotated[
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    rows = rows[:limit]
-    return ok(STATUS_OK, count=len(rows), results=rows)
+    # A stable order is what makes `offset` usable.
+    rows.sort(key=lambda r: (str(r.get("name") or ""), str(r.get("project") or "")))
+    window = rows[offset:offset + limit]
+    has_more = total > offset + limit
+    return ok(STATUS_OK, count=len(window), total=total, offset=offset,
+              has_more=has_more,
+              next_offset=(offset + limit) if has_more else None,
+              results=window)
 
 
 def init_context(project: Annotated[
@@ -650,7 +711,8 @@ def init_context(project: Annotated[
         Literal["slim", "full"],
         Field(description="'slim' (default) returns only what a session needs "
                           "and removes near-duplicates; 'full' returns every "
-                          "column (never internal ones).")] = "slim",
+                          "column (never internal ones, never the search "
+                          "score annotations).")] = "slim",
     include_global: Annotated[
         bool,
         Field(description="True (default) includes global memories; False "
@@ -668,8 +730,8 @@ def init_context(project: Annotated[
     only global memories are summarized; pass `project="*"` for all projects.
     `detail="slim"` (default) returns only the fields a session needs and
     removes near-duplicates; `detail="full"` returns every column except the
-    internal ones. Every memory carries the `project` it belongs to, and the
-    list is sorted by the last update.
+    internal ones and the search score annotations. Every memory carries the
+    `project` it belongs to, and the list is sorted by the last update.
 
     The memories are the most recently changed ones of the scope - a freshly
     stored fact always shows up, even if it was never read before.

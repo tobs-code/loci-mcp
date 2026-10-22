@@ -16,7 +16,7 @@ from mcp_server.scopes import (
     _project_names,
     _project_tables,
 )
-from mcp_server.scoring import _content_hash, _gen_id
+from mcp_server.scoring import _content_hash, _gen_id, _now
 from mcp_server.storage import _deduplicate
 
 logger = logging.getLogger(__name__)
@@ -176,12 +176,39 @@ def _parse_dt(value) -> datetime | None:
         return None
 
 
+def _as_list(value):
+    """Return a list, even if the caller packed the array into an object.
+
+    Some MCP clients serialize a free-form JSON array as `{"item": ...}` -
+    the array itself for multi-element arrays, the single element for
+    one-element arrays. The payload is then structurally valid JSON but no
+    longer a list, which would make an otherwise correct import fail with a
+    confusing message.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("item", "items"):
+            if key in value:
+                inner = value[key]
+                if isinstance(inner, list):
+                    return inner
+                if isinstance(inner, dict):
+                    return [inner]
+        lists = [v for v in value.values() if isinstance(v, list)]
+        if len(lists) == 1:
+            return lists[0]
+    return value
+
+
 def import_memories(
     data: Annotated[
         str | dict,
         Field(description="Payload of `export_memories`, either as the object "
                           "or as its JSON string. JSONL payloads are one "
-                          "record per line.")],
+                          "record per line. Passing the payload as a JSON "
+                          "string is the most reliable form: some clients "
+                          "repack the arrays inside a free-form object.")],
     project: Annotated[
         str | None,
         Field(description="Target scope for all records. Without it every "
@@ -225,7 +252,7 @@ def import_memories(
         else:
             parsed = json.loads(data)
         if isinstance(parsed, dict) and "records" in parsed:
-            records = parsed["records"]
+            records = _as_list(parsed["records"])
             graph = parsed.get("graph")
         elif isinstance(parsed, list):
             records = parsed
@@ -236,7 +263,9 @@ def import_memories(
         return fail(STATUS_ERROR, f"invalid {format} data: {e}",
                     imported=0, skipped=0)
     if not isinstance(records, list):
-        return fail(STATUS_ERROR, "'records' must be a list", imported=0, skipped=0)
+        return fail(STATUS_ERROR,
+                    f"'records' must be a list of objects, got {type(records).__name__}",
+                    imported=0, skipped=0)
 
     conn = get_conn()
     imported = 0
@@ -300,6 +329,8 @@ def import_memories(
                 errors.append(f"row {imported + skipped}: {exc}")
                 skipped += 1
 
+        if graph is not None and not isinstance(graph, dict):
+            graph = None
         if graph:
             cur.execute("SET search_path TO ag_catalog, public")
 
@@ -307,15 +338,17 @@ def import_memories(
                 scope = project if project is not None else _norm_project(value)
                 return _norm_project(scope)
 
-            for ent in graph.get("entities", []):
-                if not ent.get("name"):
+            for ent in _as_list(graph.get("entities", [])):
+                if not isinstance(ent, dict) or not ent.get("name"):
                     continue
                 _ensure_graph_entity(cur, ent["name"], _resolve(ent.get("project")),
                                      ent.get("type"))
                 graph_entities += 1
 
             grouped: dict[Any, list[dict]] = {}
-            for rel in graph.get("relations", []):
+            for rel in _as_list(graph.get("relations", [])):
+                if not isinstance(rel, dict):
+                    continue
                 if not rel.get("from_entity") or not rel.get("to_entity"):
                     continue
                 grouped.setdefault(_resolve(rel.get("project")), []).append({

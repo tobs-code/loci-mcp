@@ -150,34 +150,40 @@ def _check_contradictions(cur, content: str, entity: str | None,
                           project: str | None,
                           embedding_vec: list[float] | None = None,
                           max_candidates: int = 15) -> list[dict]:
-    """NLI-check the new fact against active facts of the same entity.
+    """NLI-check the new fact against active memories of the same entity.
 
     Checks the project table *and* the global one, so a contradiction between
     a project fact and a global fact is detected (previously only the store
     table was read and cross-scope conflicts were silently missed).
+
+    Every memory type is a candidate: a decision that contradicts a pattern
+    is just as harmful as a fact that contradicts a fact. Restricting the
+    comparison to `mem_type = 'fact'` hid most real conflicts, because the
+    conflicting memory is often a decision, a pattern or a convention.
     """
     if not entity:
         return []
 
     candidates: list[tuple[str, str]] = []
     seen: set[str] = set()
+    new_hash = _content_hash(content)
     for table in _retrieval_tables(cur, project):
         if embedding_vec is not None:
             cur.execute(
                 f"SELECT id, content FROM {table} "
-                f"WHERE entity = %s AND mem_type = 'fact' AND content != %s "
+                f"WHERE entity = %s AND content_hash <> %s "
                 f"AND embedding IS NOT NULL "
                 f"AND superseded_by IS NULL AND deleted_at IS NULL "
                 f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
-                (entity, content, embedding_vec, max_candidates),
+                (entity, new_hash, embedding_vec, max_candidates),
             )
         else:
             cur.execute(
                 f"SELECT id, content FROM {table} "
-                f"WHERE entity = %s AND mem_type = 'fact' AND content != %s "
+                f"WHERE entity = %s AND content_hash <> %s "
                 f"AND superseded_by IS NULL AND deleted_at IS NULL "
                 f"ORDER BY created_at DESC LIMIT %s",
-                (entity, content, max_candidates),
+                (entity, new_hash, max_candidates),
             )
         for row in cur.fetchall():
             if row[0] in seen:

@@ -4,7 +4,6 @@ unrelate (delete a single edge) and list_memories (browse without a query)."""
 from mcp_server.server import (
     find_connections,
     list_memories,
-    recall,
     relate,
     remember,
     unrelate,

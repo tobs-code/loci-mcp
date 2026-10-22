@@ -6,10 +6,9 @@ from pydantic import Field
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
-from mcp_server.inference_client import health as _inference_health, health_details, nli
+from mcp_server.inference_client import health_details, nli
 from mcp_server.scopes import (
     _all_mem_tables,
-    _count_entities,
     _norm_project,
     _project_names,
     _retrieval_tables,
@@ -48,9 +47,10 @@ def contradictions_report(entity: Annotated[
     conn = get_conn()
     try:
         cur = conn.cursor()
-        # Only active facts are seeds: already superseded pairs are resolved
-        # and must not be reported again.
-        facts = _search_memories(cur, None, None, "fact", entity, 200, project,
+        # Only active memories are seeds: already superseded pairs are resolved
+        # and must not be reported again. Every type is a candidate - a
+        # decision that contradicts a pattern is a conflict too.
+        facts = _search_memories(cur, None, None, None, entity, 200, project,
                                   include_embedding=True, include_superseded=False)
         if len(facts) < 2:
             conn.commit()
@@ -58,24 +58,35 @@ def contradictions_report(entity: Annotated[
 
         tables = _retrieval_tables(cur, project)
         neighbors_per_fact = 20
-        candidates: list[tuple[dict, str, str]] = []
+        # fact id -> list of (neighbour id, neighbour content)
+        candidates: dict[str, tuple[dict, list[tuple[str, str]]]] = {}
         checked: set[tuple[str, str]] = set()
         fact_ids = {f["id"] for f in facts}
 
         for f in facts:
             if not f.get("embedding"):
                 continue
-            if len(candidates) >= limit * 2:
+            if len(candidates) >= limit:
                 break
             found: list[tuple[str, str]] = []
             for table in tables:
+                # Identical content is not a contradiction, but the same fact
+                # may live in the project and in the global scope.
+                if f.get("content_hash"):
+                    filter_sql = "AND content_hash <> %s"
+                    filter_params: list[Any] = [f["content_hash"]]
+                else:
+                    filter_sql = "AND content <> %s"
+                    filter_params = [f["content"]]
                 cur.execute(
                     f"SELECT id, content FROM {table} "
-                    f"WHERE id != %s AND entity = %s AND mem_type = 'fact' "
+                    f"WHERE id != %s AND entity = %s "
+                    f"{filter_sql} "
                     f"AND embedding IS NOT NULL "
                     f"AND superseded_by IS NULL AND deleted_at IS NULL "
                     f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
-                    (f["id"], entity, f["embedding"], neighbors_per_fact),
+                    [f["id"], entity] + filter_params
+                    + [f["embedding"], neighbors_per_fact],
                 )
                 for nid, ncontent in cur.fetchall():
                     if nid not in fact_ids:
@@ -84,7 +95,8 @@ def contradictions_report(entity: Annotated[
                     if pair not in checked:
                         checked.add(pair)
                         found.append((nid, ncontent))
-            candidates.extend((f, nid, ncontent) for nid, ncontent in found)
+            if found:
+                candidates[f["id"]] = (f, found)
 
         conn.commit()
     except Exception:
@@ -94,16 +106,20 @@ def contradictions_report(entity: Annotated[
         conn.close()
 
     contradictions: list[dict] = []
-    for f, nid, ncontent in candidates:
+    for f, neighbours in candidates.values():
         if len(contradictions) >= limit:
             break
-        scores = nli(f["content"], [ncontent])
-        if len(scores) >= 1 and scores[0] > 0.7:
-            contradictions.append({
-                "a": {"id": f["id"], "content": f["content"]},
-                "b": {"id": nid, "content": ncontent},
-                "confidence": round(scores[0], 3),
-            })
+        # One LLM call per fact instead of one per pair.
+        scores = nli(f["content"], [n[1] for n in neighbours])
+        for (nid, ncontent), score in zip(neighbours, scores):
+            if len(contradictions) >= limit:
+                break
+            if score > 0.7:
+                contradictions.append({
+                    "a": {"id": f["id"], "content": f["content"]},
+                    "b": {"id": nid, "content": ncontent},
+                    "confidence": round(score, 3),
+                })
 
     contradictions = contradictions[:limit]
     return ok(STATUS_OK, count=len(contradictions), results=contradictions)

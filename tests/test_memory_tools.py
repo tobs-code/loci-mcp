@@ -1,5 +1,3 @@
-import json
-
 from mcp_server.server import (
     get_entity,
     init_context,

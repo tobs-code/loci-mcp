@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from mcp_server.config import (
     DECAY_ACCESS_CAP,
     DECAY_HALF_LIFE_DAYS,
-    DECAY_RAW_MAX,
     DECAY_WEIGHT,
     FTS_WEIGHT,
 )
@@ -36,11 +35,11 @@ def _recency_factor(created_at: datetime, updated_at: datetime | None) -> float:
 
 def _decay_score(created_at: datetime, updated_at: datetime | None,
                  access_count: int, importance: float) -> float:
-    """Raw recency/frequency score in [0, DECAY_RAW_MAX].
+    """Raw recency/frequency score, uncapped.
 
-    Unbounded above DECAY_RAW_MAX is possible (importance 1.0 with a fully
-    used access budget), so the raw value is only meaningful together with
-    `_decay_norm`.
+    The value can exceed 1.0 (importance 1.0 with a fully used access
+    budget), so it is only meaningful together with `_decay_norm`, which is
+    the normalized score that is compared and published.
     """
     recency = _recency_factor(created_at, updated_at)
     access_boost = 1.0 + min(access_count, DECAY_ACCESS_CAP) * 1.5 / DECAY_ACCESS_CAP

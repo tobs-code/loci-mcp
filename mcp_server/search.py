@@ -12,6 +12,7 @@ from mcp_server.scoring import (
     _decay_norm,
     _decay_score,
     _fts_query,
+    _now,
     _relevance_score,
 )
 
@@ -487,6 +488,7 @@ def _search_memories_graph_boost(
         extra_conditions, extra_params = _extra_conditions(updated_after,
                                                             metadata_filter)
         existing_ids = {r["id"] for r in existing_results}
+        project_names = _project_names(cur)
         for entity_name, weight in graph_entities:
             for table in tables:
                 cur.execute(
@@ -502,6 +504,10 @@ def _search_memories_graph_boost(
                     d.pop("embedding", None)
                     if d["id"] in existing_ids:
                         continue
+                    # Report the project name (not the scope kind), like every
+                    # other read path does.
+                    d["_project"] = ("global" if table == "memories"
+                                     else project_names.get(table[4:], table[4:]))
                     d["_graph_weight"] = weight
                     d["_graph_source"] = entity_name
                     # Graph candidates are not retrieved by relevance: they have

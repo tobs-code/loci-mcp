@@ -99,7 +99,7 @@ Then in the Claude Code MCP config:
 
 ---
 
-## MCP Tools (18 Tools + 1 Resource)
+## MCP Tools (20 Tools + 1 Resource)
 
 ### Response Envelope
 
@@ -114,7 +114,8 @@ Every tool answers with the same shape, so an agent never has to guess:
 `updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok`,
 `id` is the affected memory id (`null` for collections), `error` carries the
 message, `warnings` collects non-fatal notes. Collection tools add `count` and
-`results`; failed calls never raise.
+`results`; failed calls never raise — an invalid call (missing argument, wrong
+type) answers with the same envelope instead of a raw validation error.
 
 ### Write
 | Tool | Description |
@@ -127,11 +128,12 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`, `fields`, `updated_after`, `metadata_filter` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset` |
 | `get_entity` | Entity details (including graph connections) + all linked memories; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`); memory-only entities carry `type="memory-only"` |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global` |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"` |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"` (full = every column, never internal ones and never the search score annotations), `include_global` |
+| `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
 ### Graph (Apache AGE)
 | Tool | Description |
@@ -148,6 +150,7 @@ message, `warnings` collects non-fatal notes. Collection tools add `count` and
 | `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data` |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
+| `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews |
 | `server_health` | Check Postgres + Inference connectivity |
 
 ### Typical Workflows
@@ -205,7 +208,7 @@ import_memories(data=<export data>, format="json")
   common word cannot outrank the best semantic hit. The retriever uses the
   English dictionary (`FTS_LANGUAGE`); index and query side always match.
 - `_similarity` = `1 - cosine distance` (0..1), the same scale as `min_similarity`.
-  `recall` defaults to `min_similarity=0.4`; pass `null` to opt out.
+  `recall` defaults to `min_similarity=0.35`; pass `null` to opt out.
 - `_relevance_score` is normalized to 0..1: RRF in hybrid mode, cosine
   similarity in vector-only mode, and text rank when FTS is the fallback.
   It is `null` for graph-only hits.
@@ -213,16 +216,24 @@ import_memories(data=<export data>, format="json")
   `_graph_boost`, `_graph_source` and `_graph_weight` describe graph hits.
 - Edge weights are limited to 0.0-1.0, so one edge cannot dominate a ranking.
 - `updated_after` (ISO date) and `metadata_filter` (key/value pairs) narrow
-  `recall` and `list_memories`; `list_memories` can also sort with `order_by`.
+  `recall` and `list_memories`; `list_memories` can also sort with `order_by`
+  and page with `offset` (the response reports `total`, `has_more` and
+  `next_offset`). `list_entities` pages the same way and is sorted by name.
 - Embeddings are prompt-aware: queries use `mode="query"`, stored content uses
   `mode="document"`. After changing the model or prompts, re-embed:
   `docker compose exec loci-mcp python -m mcp_server.reembed`.
 - `remember(scope="global")` writes to `memories` even inside a project.
-- `graph_boost=true` (only in combination with `entity`) pulls in memories from
-  directly connected graph entities and weights them with `_graph_boost`
-  (30% of the edge weight); RRF remains the basis of the score.
+- `graph_boost=true` pulls in memories from directly connected graph entities
+  and weights them with `_graph_boost` (30% of the edge weight); RRF remains
+  the basis of the score. `graph_entity` names the entity to expand from and
+  leaves the query search unfiltered; without it `entity` is used for the
+  expansion *and* filters the search.
 - `include_superseded=true` shows superseded history, but never deleted rows
   (`deleted_at` is set) — soft delete stays invisible.
+- `init_context` returns the **most recently changed** memories of the scope, not
+  a decay-ranked mix: a freshly stored fact always shows up. `detail="full"`
+  returns every column except the internal ones and the search score
+  annotations — the bootstrap is not a search result.
 - Every tool parameter is documented in its JSON schema description.
 
 ## Memory Types
@@ -311,6 +322,13 @@ contradiction detection; `/nli` then returns `0.0` for every pair.
   graph when it is omitted; `export_memories` exports all scopes when omitted,
   and `import_memories` restores each record to its exported scope. For
   `init_context`, use `project="*"` to include all scopes.
+- A memory ID is unique per scope, not globally: an import copies the ID into
+  the target scope. `update_memory` and `forget(memory_id=...)` refuse an ID
+  that exists in several scopes and name the scopes in the error; pass
+  `project` to say which one to change.
+- `list_projects` shows every scope with its sizes. `drop_project` removes a
+  scope completely (memory table, registry entry, graph nodes, mirror rows);
+  `forget(entity="*")` only empties it, the scope itself survives.
 
 ## Backup & Restore
 
@@ -340,14 +358,17 @@ contradiction detection; `/nli` then returns `0.0` for every pair.
 ## Contradiction Detection
 
 With `remember(check_contradictions=true)`, the 15 semantically nearest active
-facts of the same entity (`mem_type='fact'`) are pre-filtered per pgvector —
-separately for the project and global tables — and then checked for a real
-contradiction via the configured LLM (`/nli`, Groq by default). From a score
-of ≥ 0.7, the old fact is automatically superseded.
+memories of the same entity are pre-filtered per pgvector — separately for the
+project and global tables — and then checked for a real contradiction via the
+configured LLM (`/nli`, Groq by default). From a score of ≥ 0.7, the old memory
+is automatically superseded. Every memory type is a candidate: a decision that
+contradicts a pattern is a conflict too, and restricting the comparison to
+`fact` hid most real conflicts.
 
-`contradictions_report(entity=...)` works only on **active** facts of an entity:
-for each fact, the 20 nearest vector neighbors are fetched and only the
-deduplicated pairs are checked via NLI (`confidence > 0.7`).
+`contradictions_report(entity=...)` works only on **active** memories of an
+entity: for each memory, the 20 nearest vector neighbors are fetched and only
+the deduplicated pairs are checked via NLI (`confidence > 0.7`). One LLM call
+covers all neighbours of a memory, not one call per pair.
 
 ## Schema
 

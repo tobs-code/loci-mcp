@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mcp_server.config import (
     DEDUPE_MODES,
+    MEMORY_TYPE_HELP,
     MEMORY_TYPES,
     SENTINEL_FORGOTTEN,
     SUPERSEDE_SIMILARITY_MIN,
@@ -31,9 +32,11 @@ from mcp_server.scopes import (
     _all_mem_tables,
     _ensure_project_table,
     _mem_table,
+    _memory_scopes,
     _norm_project,
     _scope_key,
     _scope_label,
+    _scope_of_table,
     _table_exists,
 )
 from mcp_server.scoring import _content_hash
@@ -61,7 +64,7 @@ class BatchFact(BaseModel):
         "enum": ["fact", "decision", "learning", "preference", "pattern",
                  "incident", "runbook", "context", "observation", "convention",
                  "command", "note"],
-    }, description="Kind of memory (default: fact).")
+    }, description=MEMORY_TYPE_HELP)
     entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                          description="Entity this memory belongs to; links it in the graph.")
     importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
@@ -94,7 +97,7 @@ def remember(
     mem_type: Annotated[
         Literal["fact", "decision", "learning", "preference", "pattern", "incident",
                 "runbook", "context", "observation", "convention", "command", "note"],
-        Field(description="Kind of memory (default: fact).")] = "fact",
+        Field(description=MEMORY_TYPE_HELP)] = "fact",
     entity: Annotated[
         str | None,
         Field(description="Entity this memory belongs to; connects it in the graph "
@@ -565,13 +568,14 @@ def update_memory(
         Field(description="New entity the memory belongs to.")] = None,
     mem_type: Annotated[
         str | None,
-        Field(description="New memory type (fact, decision, learning, "
-                          "preference, pattern, incident, runbook, context, "
-                          "observation, convention, command, note).")] = None,
+        Field(description="New memory type. " + MEMORY_TYPE_HELP)] = None,
 ) -> dict[str, Any]:
     """Update an existing memory's content, importance, metadata, entity or type.
 
-    Without `project`, the memory is looked up in every table.
+    Without `project`, the memory is looked up in every scope. A memory id is
+    unique per scope, so an id that exists in several scopes (an import copies
+    the id) is refused: the response names the scopes, and `project` says
+    which one to update.
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
                 memory_id, content is not None, importance is not None, metadata is not None)
@@ -626,9 +630,25 @@ def update_memory(
     conn = get_conn()
     try:
         cur = conn.cursor()
-        tables = ([_mem_table(project), "memories"] if project
-                  else _all_mem_tables(cur))
+        if project:
+            # The project copy and its global twin are updated together.
+            tables = [_mem_table(project), "memories"]
+        else:
+            # A memory id is unique per scope, not globally: an import can
+            # copy a memory into another project. Without a project an id
+            # that exists in several scopes is ambiguous, and updating an
+            # arbitrary one of them would be a coin flip.
+            scopes = _memory_scopes(cur, memory_id)
+            if len(scopes) > 1:
+                conn.rollback()
+                return fail(STATUS_ERROR,
+                            f"ambiguous memory id {memory_id}: it exists in "
+                            f"the scopes {scopes}; pass project=<name> to say "
+                            f"which one to update",
+                            id=memory_id, scopes=scopes)
+            tables = _all_mem_tables(cur)
         updated = 0
+        updated_table = None
         for table in tables:
             cur.execute(
                 f"UPDATE {table} SET {', '.join(sets)} "
@@ -637,16 +657,18 @@ def update_memory(
             )
             if cur.rowcount:
                 updated += cur.rowcount
+                updated_table = table
                 break
         conn.commit()
         if not updated:
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+        scope = _scope_of_table(cur, updated_table) if updated_table else None
     except Exception as e:
         conn.rollback()
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
         conn.close()
-    return ok(STATUS_UPDATED, id=memory_id)
+    return ok(STATUS_UPDATED, id=memory_id, project=scope)
 
 
 def forget(
@@ -683,6 +705,10 @@ def forget(
     Without `project`, the id/entity is looked up in every table; deleting an
     entity also removes its memories from all scopes and its graph node.
 
+    A `memory_id` is unique per scope, not globally: if the same id exists in
+    several scopes (an import copies the id), the call is refused and the
+    scopes are named - pass `project` to say which one to remove.
+
     `entity="*"` removes every memory of the given project (memories and
     graph nodes); `project` is required for that, so a stray call cannot wipe
     the whole database. `dry_run=True` reports the counts without changing
@@ -700,12 +726,24 @@ def forget(
                     "entity='*' removes a whole scope: pass project=<name>")
     conn = get_conn()
     counts = {"memories": 0, "entities": 0, "relations": 0}
+    scopes: list[str] = []
     try:
         cur = conn.cursor()
         if memory_id:
             tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
             if project and not _table_exists(cur, tables[0]):
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+            scopes = _memory_scopes(cur, memory_id)
+            if not project and len(scopes) > 1:
+                # The same id can live in several scopes (an import copies
+                # the id). Removing it from all of them at once would
+                # delete more than the caller asked for.
+                conn.rollback()
+                return fail(STATUS_ERROR,
+                            f"ambiguous memory id {memory_id}: it exists in "
+                            f"the scopes {scopes}; pass project=<name> to say "
+                            f"which one to remove",
+                            id=memory_id, scopes=scopes)
             for table in tables:
                 if soft:
                     if dry_run:
@@ -883,10 +921,13 @@ def forget(
         conn.close()
     status = STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED
     target = memory_id or entity_name
+    extra: dict[str, Any] = {}
+    if memory_id and scopes:
+        extra["scopes"] = scopes
     if dry_run:
         return ok(STATUS_OK, id=memory_id, entity=entity_name, counts=counts,
-                  dry_run=True,
+                  dry_run=True, **extra,
                   message=f"Would remove {target} (nothing was changed)")
     return ok(status, id=memory_id, entity=entity_name, counts=counts,
-              dry_run=False,
+              dry_run=False, **extra,
               message=f"{'Soft-forgotten' if soft else 'Deleted'} {target}")
