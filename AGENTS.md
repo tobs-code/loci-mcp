@@ -3,6 +3,12 @@
 This project provides a persistent memory MCP server for AI agents,
 backed by PostgreSQL + pgvector (vector search) + Apache AGE (graph/Cypher).
 
+> This file is the machine-facing contract. The human documentation lives in
+> [`docs/`](docs/): [tools](docs/tools.md), [retrieval](docs/retrieval.md),
+> [scopes](docs/scopes.md), [backup](docs/backup.md),
+> [configuration](docs/configuration.md), [clients](docs/clients.md),
+> [architecture](docs/architecture.md).
+
 ## Architecture
 
 ```

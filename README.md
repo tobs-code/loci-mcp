@@ -1,6 +1,17 @@
-# Loci — PostgreSQL Vector + Graph MCP Server
+# Loci — Memory Server for AI Agents
 
-PostgreSQL 17 with **pgvector** (vector similarity search), **Apache AGE** (Cypher graph queries) and a **Loci MCP Server** for AI agents.
+An MCP server that gives an agent a **persistent memory**: vector search over
+PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 20 tools to write,
+read, connect and forget.
+
+- **Hybrid retrieval** — vector similarity *and* full-text search, so both
+  paraphrases and exact identifiers are found.
+- **Scoped** — a global scope for what is true everywhere, a project scope per
+  codebase.
+- **Self-cleaning** — contradictions are detected and the outdated fact is
+  superseded automatically.
+- **One answer shape** — every tool returns the same envelope, so an agent
+  never has to guess.
 
 ## Quick Start
 
@@ -9,39 +20,20 @@ cp .env.example .env   # configure an LLM provider (Groq by default)
 docker compose up -d
 ```
 
+That starts three services:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **PostgreSQL** | `5432` | User/DB: `memory`, password: `geheim` |
+| **Inference API** | `8001` | Embeddings (local, CPU) + NLI (configurable LLM) |
+| **Loci MCP** | `8766` | The MCP server (Streamable HTTP) |
+
 > Contradiction detection needs an LLM key. Groq is the default; set
 > `LLM_PROVIDER` to `openai`, `anthropic`, `ollama`, `openai-compatible` or
 > `auto` to use another provider, or `none` to disable NLI. Embeddings always
 > run locally on CPU.
 
-After that, these services are running:
-| Service | Port | Description |
-|---------|------|-------------|
-| **PostgreSQL** | `5432` | User/DB: `memory`, password: `geheim` |
-| **Inference API** | `8001` | Embeddings (Jina v5 nano) + NLI (configurable LLM) |
-| **Loci MCP** | `8766` | MCP server (Streamable HTTP) for AI agents |
-
-## MCP Server — Client Connection
-
-The Loci MCP server uses the **Streamable HTTP transport** and is reachable at `http://localhost:8766/`.
-
-### Zed
-
-Open `settings.json` (`~/.config/zed/settings.json` or `Cmd+Shift+P` → `zed: open settings file`) and add:
-
-```json
-{
-  "context_servers": {
-    "loci": {
-      "url": "http://localhost:8766"
-    }
-  }
-}
-```
-
-### VS Code (with Cline / Roo Code / Continue)
-
-Add the following to your MCP configuration (`cline_mcp_settings.json` or `mcp.json`):
+## Connect your agent
 
 ```json
 {
@@ -54,193 +46,94 @@ Add the following to your MCP configuration (`cline_mcp_settings.json` or `mcp.j
 }
 ```
 
-> **Note:** Port `8766` is already exposed by `docker-compose.yml`. From another machine, use the host IP instead of `localhost`.
+Works with Cursor, Windsurf, Copilot, VS Code (Cline / Roo Code / Continue)
+and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
+**[docs/clients.md](docs/clients.md)**.
 
-### Claude Code (stdio mode, local development)
+## The tools
 
-```bash
-# Terminal 1: start Postgres + Inference
-docker compose up -d postgres inference
+**Write**
 
-# Terminal 2: start the MCP server in stdio mode
-pip install -r mcp_server/requirements.txt
-python -m mcp_server
-```
+| Tool | What it does |
+|------|--------------|
+| `remember` | Store a fact, decision or learning (auto-embedded, deduplicated) |
+| `remember_batch` | Store many facts at once |
+| `update_memory` | Change content, importance or metadata |
+| `forget` | Soft delete or hard delete, by id or by entity |
 
-Then in the Claude Code MCP config:
+**Read**
 
-```json
-{
-  "mcpServers": {
-    "loci": {
-      "command": "python",
-      "args": ["-m", "mcp_server"],
-      "env": {
-        "MEMORY_DATABASE_URL": "postgresql://memory:geheim@localhost:5432/memory",
-        "MEMORY_INFERENCE_URL": "http://localhost:8001"
-      }
-    }
-  }
-}
-```
+| Tool | What it does |
+|------|--------------|
+| `recall` | Hybrid vector + full-text search with ranking, decay and graph boost |
+| `list_memories` | Browse memories without a query (filter, sort, page) |
+| `get_entity` | Everything known about one entity |
+| `list_entities` | Browse the entities of a scope |
+| `init_context` | Session bootstrap: the most recently changed memories |
+| `list_projects` | The known project scopes and their sizes |
 
-### Cursor / Windsurf / Copilot
+**Graph**
 
-```json
-{
-  "mcpServers": {
-    "loci": {
-      "type": "streamable-http",
-      "url": "http://localhost:8766"
-    }
-  }
-}
-```
+| Tool | What it does |
+|------|--------------|
+| `relate` / `relate_batch` | Create relations between entities |
+| `unrelate` | Remove a relation |
+| `find_connections` | Traverse the graph from an entity |
+| `find_paths` | Shortest path between two entities |
 
----
+**Maintenance**
 
-## MCP Tools (20 Tools + 1 Resource)
+| Tool | What it does |
+|------|--------------|
+| `contradictions_report` | Find conflicting memories of one entity |
+| `export_memories` / `import_memories` | Backup and restore, including the graph |
+| `drop_project` | Remove a project scope completely |
+| `server_health` | Check Postgres and the inference API |
 
-### Response Envelope
+There is also one resource, `memory://stats`, with the memory, entity and
+relation counts plus the health of the services.
 
-Every tool answers with the same shape, so an agent never has to guess:
+Every parameter is documented in the tool's own JSON schema. The full
+reference is in **[docs/tools.md](docs/tools.md)**; for agents there is
+**[AGENTS.md](AGENTS.md)**.
 
-```json
-{"ok": true, "status": "stored", "id": "6dd84bf5092a4850",
- "error": null, "warnings": []}
-```
+**Memory types.** `remember` takes a `mem_type` that decides how a fact is
+used later: `fact` (default), `decision`, `learning`, `preference`, `pattern`,
+`incident`, `runbook`, `context`, `observation`, `convention`, `command` or
+`note`. Other values are rejected (`MEMORY_TYPES` in `config.py`).
 
-`ok` is `false` on failure, `status` is one of `stored`, `created`, `duplicate`,
-`updated`, `deleted`, `soft_forgotten`, `not_found`, `partial`, `error`, `ok`,
-`id` is the affected memory id (`null` for collections), `error` carries the
-message, `warnings` collects non-fatal notes. Collection tools add `count` and
-`results`; failed calls never raise — an invalid call (missing argument, wrong
-type) answers with the same envelope instead of a raw validation error.
+## How it behaves
 
-### Write
-| Tool | Description |
-|------|-------------|
-| `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, optional contradiction check, `scope` global/project) |
-| `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
-| `update_memory` | Update content (re-embedding), importance or metadata |
-| `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
+**One envelope.** Every tool answers with
+`{"ok", "status", "id", "error", "warnings"}` plus `count`/`results` for
+collections. A failed call never raises — it returns `ok: false` with the
+reason, even for an invalid argument.
 
-### Read / Search
-| Tool | Description |
-|------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset` |
-| `get_entity` | Entity details (including graph connections) + all linked memories; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"` |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"` (full = every column, never internal ones and never the search score annotations), `include_global` |
-| `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
+**Two scopes.** Facts live either in the global scope (true everywhere) or in
+a project scope. A project search sees both, so global facts stay visible
+inside a project. See [docs/scopes.md](docs/scopes.md).
 
-### Graph (Apache AGE)
-| Tool | Description |
-|------|-------------|
-| `relate` | Directed relation via Cypher (auto-creates entities); `project` selects the project graph |
-| `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
-| `unrelate` | Delete a single directed relation |
-| `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
-| `find_paths` | Shortest paths between two existing entities (`project`-scoped); missing entities return `not_found` |
+**Recency without forgetting.** Memories fade with a 90-day half-life, but
+recency may only take 30% of the ranking score — semantics always win.
+`min_decay_score` filters for "only fresh and important".
 
-### Maintenance
-| Tool | Description |
-|------|-------------|
-| `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required |
-| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data` |
-| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
-| `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews |
-| `server_health` | Check Postgres + Inference connectivity |
+**Contradictions clean themselves up.** With `check_contradictions=true` a new
+fact is compared against the existing memories of the same entity; a
+contradiction supersedes the old one automatically.
 
-### Typical Workflows
+**The bootstrap is not a search.** `init_context` returns the *most recently
+changed* memories, so a fact the agent just stored is always there.
 
-Use `init_context` at session start. With a project set, it loads that project
-and global context; follow it with targeted `recall` when you need a specific
-past decision:
+How a query becomes a ranked list — and what every score field means — is
+documented in **[docs/retrieval.md](docs/retrieval.md)**.
+
+A three-line example:
 
 ```text
 init_context(project="api")
 recall(query="deployment rollback procedure", project="api", include_decay=true)
-```
-
-Store a fact with an entity when it should be discoverable by both search and
-entity lookup. Add graph relations when you need explicit traversable links:
-
-```text
 remember(content="The API runs on Postgres", entity="API", project="api")
-relate(from_entity="API", to_entity="Postgres", relation_type="USES", project="api")
-find_connections(entity="API", project="api")
 ```
-
-Use the returned memory `id` to update or forget that exact record. For backup,
-pass the JSON export's `data` payload directly into import; re-import is
-idempotent by default:
-
-```text
-update_memory(memory_id="<id>", content="Updated fact", project="api")
-forget(memory_id="<id>", project="api", soft=true)
-export_memories(format="json", project="api")
-import_memories(data=<export data>, format="json")
-```
-
-### Resource
-| Resource | Description |
-|----------|-------------|
-| `memory://stats` | Memory/entity/relation counts + health |
-
----
-
-## Retrieval
-
-- **Read scope defaults:** `recall` and `get_entity` use global scope when
-  `project` is omitted; with a project they include that project's and global
-  memories by default. `list_memories` and `list_entities` list all scopes when
-  `project` is omitted, and project + global by default when it is set. Pass
-  `include_global=false` for project-only reads. `init_context` uses global
-  scope when `project` is omitted, project + global when set, and all scopes
-  with `project="*"`; `include_global=false` excludes global memories.
-- `recall` searches the project table (if `project` is set) **and** the
-  global `memories` table; global facts remain visible inside a project.
-  Project hits receive a small scope tie-breaker. Set `include_global=false`
-  for a project-only search.
-- FTS is OR-based (`_fts_query`), weighted with `FTS_WEIGHT = 0.6` so a single
-  common word cannot outrank the best semantic hit. The retriever uses the
-  English dictionary (`FTS_LANGUAGE`); index and query side always match.
-- `_similarity` = `1 - cosine distance` (0..1), the same scale as `min_similarity`.
-  `recall` defaults to `min_similarity=0.35`; pass `null` to opt out.
-- `_relevance_score` is normalized to 0..1: RRF in hybrid mode, cosine
-  similarity in vector-only mode, and text rank when FTS is the fallback.
-  It is `null` for graph-only hits.
-- `_final_score` is the ranking score (relevance + decay + graph boost);
-  `_graph_boost`, `_graph_source` and `_graph_weight` describe graph hits.
-- Edge weights are limited to 0.0-1.0, so one edge cannot dominate a ranking.
-- `updated_after` (ISO date) and `metadata_filter` (key/value pairs) narrow
-  `recall` and `list_memories`; `list_memories` can also sort with `order_by`
-  and page with `offset` (the response reports `total`, `has_more` and
-  `next_offset`). `list_entities` pages the same way and is sorted by name.
-- Embeddings are prompt-aware: queries use `mode="query"`, stored content uses
-  `mode="document"`. After changing the model or prompts, re-embed:
-  `docker compose exec loci-mcp python -m mcp_server.reembed`.
-- `remember(scope="global")` writes to `memories` even inside a project.
-- `graph_boost=true` pulls in memories from directly connected graph entities
-  and weights them with `_graph_boost` (30% of the edge weight); RRF remains
-  the basis of the score. `graph_entity` names the entity to expand from and
-  leaves the query search unfiltered; without it `entity` is used for the
-  expansion *and* filters the search.
-- `include_superseded=true` shows superseded history, but never deleted rows
-  (`deleted_at` is set) — soft delete stays invisible.
-- `init_context` returns the **most recently changed** memories of the scope, not
-  a decay-ranked mix: a freshly stored fact always shows up. `detail="full"`
-  returns every column except the internal ones and the search score
-  annotations — the bootstrap is not a search result.
-- Every tool parameter is documented in its JSON schema description.
-
-## Memory Types
-
-Allowed values: `fact`, `decision`, `learning`, `preference`, `pattern`,
-`incident`, `runbook`, `context`, `observation`, `convention`, `command`,
-`note`. Other values are rejected (`MEMORY_TYPES` in `config.py`).
 
 ## Configuration
 
@@ -252,228 +145,41 @@ Allowed values: `fact`, `decision`, `learning`, `preference`, `pattern`,
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
-| `LLM_MODEL` | provider default | NLI model (empty = provider default) |
+| `LLM_MODEL` | provider default | NLI model |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
 | `LLM_BASE_URL` | provider default | Base URL for OpenAI-compatible or Ollama endpoints |
-| `GROQ_API_KEY` | – | Groq key (backwards compatible) |
-| `GROQ_MODEL` | `openai/gpt-oss-20b` (compose) | Groq model (backwards compatible) |
+| `GROQ_API_KEY` / `GROQ_MODEL` | – | Groq key and model (backwards compatible) |
 | `OPENAI_API_KEY` | – | Used when `LLM_PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | – | Used when `LLM_PROVIDER=anthropic` |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
 
-### LLM Providers
+All providers, the scoring constants and the inference API are documented in
+**[docs/configuration.md](docs/configuration.md)**.
 
-`/nli` uses one provider at a time. The default is Groq; the legacy
-`GROQ_API_KEY`/`GROQ_MODEL` variables keep working.
+## Documentation
 
-| Provider | Default model | Default endpoint |
-|----------|---------------|------------------|
-| `groq` | `openai/gpt-oss-20b` | `https://api.groq.com/openai/v1` |
-| `openai` | `gpt-4o-mini` | `https://api.openai.com/v1` |
-| `anthropic` | `claude-3-5-haiku-latest` | `https://api.anthropic.com/v1` |
-| `ollama` | `llama3.2` | `http://host.docker.internal:11434/v1` |
-| `openai-compatible` | – (set `LLM_MODEL`) | – (set `LLM_BASE_URL`) |
+| Page | Content |
+|------|---------|
+| [docs/tools.md](docs/tools.md) | Every tool, every parameter, the envelope, typical workflows |
+| [docs/retrieval.md](docs/retrieval.md) | How a query becomes a ranked list; scores, decay, contradictions |
+| [docs/scopes.md](docs/scopes.md) | Global vs. project scopes, project names, project lifecycle |
+| [docs/backup.md](docs/backup.md) | Export and import, including the graph |
+| [docs/configuration.md](docs/configuration.md) | Env vars, LLM providers, Docker, inference API, constants |
+| [docs/clients.md](docs/clients.md) | Editor and agent client setups |
+| [docs/architecture.md](docs/architecture.md) | Schema, direct SQL, module map, request flow |
+| [AGENTS.md](AGENTS.md) | The dense machine-facing contract for agents |
 
-Examples:
-
-```dotenv
-# OpenAI
-LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-
-# Anthropic
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Ollama on the host
-LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
-
-# Any OpenAI-compatible endpoint (LM Studio, vLLM, OpenRouter, ...)
-LLM_PROVIDER=openai-compatible
-LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_API_KEY=...
-LLM_MODEL=...
-```
-
-`LLM_PROVIDER=auto` picks the first configured key (Groq, OpenAI, Anthropic),
-then `LLM_BASE_URL`, then `OLLAMA_BASE_URL`. `LLM_PROVIDER=none` disables
-contradiction detection; `/nli` then returns `0.0` for every pair.
-
-## Scopes & Project Names
-
-- Every fact belongs to exactly one scope: the global `memories` table or a
-  project table `mem_<suffix>`.
-- Project names may contain any characters. Plain lowercase identifiers up to
-  40 characters are used verbatim as the suffix; all other names are
-  lowercased, truncated and get a short SHA-1 of the original name appended
-  (`Project Alpha-2` → `project_alpha_2_e6a52393`; `Team` and `team` get
-  different suffixes). This keeps table and index names below the 63-character
-  limit and prevents case variants from colliding.
-- `global` is reserved: `project="global"` means "no project" and never creates
-  a project with that name.
-- The `projects` table maps suffix → original name, so results show the name
-  that was passed in.
-- The graph has one AGE label per scope (`Entity` for global,
-  `Project_<slug>` for a project) plus a `project` property; `entities` has
-  `UNIQUE(name, project)`. Identical entity names therefore do not collide
-  across projects.
-- `project` is accepted by reads and graph tools. Graph tools use the global
-  graph when it is omitted; `export_memories` exports all scopes when omitted,
-  and `import_memories` restores each record to its exported scope. For
-  `init_context`, use `project="*"` to include all scopes.
-- A memory ID is unique per scope, not globally: an import copies the ID into
-  the target scope. `update_memory` and `forget(memory_id=...)` refuse an ID
-  that exists in several scopes and name the scopes in the error; pass
-  `project` to say which one to change.
-- `list_projects` shows every scope with its sizes. `drop_project` removes a
-  scope completely (memory table, registry entry, graph nodes, mirror rows);
-  `forget(entity="*")` only empties it, the scope itself survives.
-
-## Backup & Restore
-
-- `export_memories` (JSON, version `0.2`) contains IDs, `superseded_by`,
-  `deleted_at`, timestamps, `access_count`, the project of each record and the
-  complete graph (entities with scope, relations with weight/scope). JSONL is
-  flat (one record per line, no graph). `include_embeddings=true` includes the
-  vectors, `include_superseded=true` the history; `include_graph=false` omits
-  the graph.
-- `import_memories` restores IDs and timestamps, creates project tables on
-  demand and upserts entities/relations via MERGE (idempotent). Without
-  `project`, each record lands in its export scope; with `project`, all records
-  are written to that project. Re-importing the same file reports existing IDs
-  as `skipped`; `skip_duplicates=false` allows duplicates.
-
-## Cognitive Decay
-
-- Memories age with a half-life of 90 days
-- `importance` (0.0–1.0) and `access_count` (max. 20) slow down decay
-- `include_decay=true` in `recall` weights by recency + frequency
-- Decay contributes at most 30% to the score (`DECAY_WEIGHT = 0.3`), 70% stays relevance
-- `min_decay_score` (0..1) filters on normalized decay (`_decay_norm`):
-  `importance × recency` plus at most 10% access-frequency bonus. A brand-new
-  memory with `importance=1.0` scores ~0.9, a 90-day-old one ~0.5 — so
-  `min_decay_score=0.9` keeps fresh, important facts.
-
-## Contradiction Detection
-
-With `remember(check_contradictions=true)`, the 15 semantically nearest active
-memories of the same entity are pre-filtered per pgvector — separately for the
-project and global tables — and then checked for a real contradiction via the
-configured LLM (`/nli`, Groq by default). From a score of ≥ 0.7, the old memory
-is automatically superseded. Every memory type is a candidate: a decision that
-contradicts a pattern is a conflict too, and restricting the comparison to
-`fact` hid most real conflicts.
-
-`contradictions_report(entity=...)` works only on **active** memories of an
-entity: for each memory, the 20 nearest vector neighbors are fetched and only
-the deduplicated pairs are checked via NLI (`confidence > 0.7`). One LLM call
-covers all neighbours of a memory, not one call per pair.
-
-## Schema
-
-| Table | Purpose |
-|-------|---------|
-| `memories` | Global text content with vector embedding (768d) + FTS + decay |
-| `mem_<suffix>` | Project-specific memories (created dynamically on demand) |
-| `projects` | Registry suffix → original project name |
-| `entities` | Graph nodes (people, concepts, places...) with `project` scope |
-| `relations` | Graph edges between entities (with `project` scope) |
-
-The AGE graph `memory_graph` is created automatically via `create_graph()`.
-
-## Vector Search (pgvector)
-
-```sql
-SELECT id, content, metadata
-FROM memories
-ORDER BY embedding <=> '[0.1, 0.2, ...]'
-LIMIT 5;
-```
-
-## Graph Queries (Apache AGE)
-
-```sql
-SELECT * FROM cypher('memory_graph', $$
-    MATCH (p:Person)-[:KNOWS]->(friend)
-    RETURN p.name, friend.name
-$$) AS (name agtype, friend_name agtype);
-```
-
-## Docker Configuration
-
-- **Postgres**: `postgres:17-bookworm` + pgvector v0.8.1 + Apache AGE 1.7.0
-- **`shm_size: 1g`**: AGE needs more shared memory
-- **Inference**: FastAPI + sentence-transformers (CPU)
-- **Loci MCP**: Python FastMCP server with uvicorn (Streamable HTTP transport)
-
-After changing the embedding model or prompts, rebuild both images and then
-re-embed:
-
-```bash
-docker compose build inference loci-mcp && docker compose up -d
-docker compose exec loci-mcp python -m mcp_server.reembed
-```
-
-On startup, the MCP server runs idempotent migrations
-(`deleted_at` backfill, sentinel migration, dedup of duplicate AGE edges).
-
-## Inference API
-
-```python
-import requests
-
-# Embedding (Jina v5 nano, 239M) → 768d normalized vector
-# mode: "query" (search query) or "document" (stored content, default)
-r = requests.post("http://localhost:8001/embed", json={
-    "texts": ["This is a test", "Another text"],
-    "mode": "document"
-})
-vectors = r.json()["embeddings"]
-
-# NLI / contradiction detection (configured LLM provider)
-r = requests.post("http://localhost:8001/nli", json={
-    "query": "Max lives in Berlin",
-    "documents": ["Max lives in Hamburg"]
-})
-contradiction_scores = r.json()["contradiction_scores"]
-```
-
-## Testing
-
-Tests run against an isolated `loci_test` database (created and dropped
-automatically) and a local fake inference server, so no LLM key is needed.
+## Development
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest
+python -m pytest          # integration tests against an isolated test database
 ```
 
-## Files
+The tests create and drop a `loci_test` database and run a local fake
+inference server, so no LLM key is needed. The module map is in
+[docs/architecture.md](docs/architecture.md).
 
-| File | Purpose |
-|------|---------|
-| `Dockerfile` | Custom Postgres image with pgvector + AGE |
-| `docker-compose.yml` | Container orchestration |
-| `init.sql` | Schema + extensions + AGE graph |
-| `mcp_server/` | Python MCP server (FastMCP + pgvector + AGE) |
-| `mcp_server/server.py` | Public facade: registers the tools and starts the transports |
-| `mcp_server/app.py` | FastMCP instance and server instructions |
-| `mcp_server/config.py` | Memory types, scopes and scoring constants |
-| `mcp_server/envelope.py` | Uniform response envelope shared by all tools |
-| `mcp_server/projection.py` | Row projection (`fields`) and near-duplicate detection |
-| `mcp_server/db.py` | Schema, migrations, connection handling |
-| `mcp_server/scopes.py` | Project slugs, scope labels and per-project tables |
-| `mcp_server/scoring.py` | Decay, RRF helpers and ID/content hashing |
-| `mcp_server/storage.py` | Store, supersede, dedup, contradiction and access helpers |
-| `mcp_server/search.py` | Vector + FTS RRF search and graph boost |
-| `mcp_server/graph.py` | Apache AGE relations and traversal tools |
-| `mcp_server/backup.py` | Export/import of memories and the graph |
-| `mcp_server/tools/` | Write, read and maintenance MCP tools |
-| `mcp_server/inference_client.py` | HTTP client for `/embed`, `/nli`, `/health` |
-| `mcp_server/reembed.py` | Re-embed all memories after a model/prompt change |
-| `tests/` | Integration tests against an isolated `loci_test` database |
-| `inference/Dockerfile` | Inference service with sentence-transformers |
-| `inference/app.py` | FastAPI server (`/embed`, `/nli`, `/health`) |
-| `inference/llm.py` | Provider abstraction for Groq, OpenAI, Anthropic, Ollama and OpenAI-compatible APIs |
-| `AGENTS.md` | Full tool documentation for AI agents |
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
