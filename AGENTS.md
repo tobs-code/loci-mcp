@@ -255,6 +255,8 @@ If `_check_contradictions` detects a contradiction, the old fact is automaticall
 
 With `include_superseded=true` in `recall` or `get_entity`, superseded facts can be retrieved again (recognizable by the set `superseded_by` field).
 
+Metadata of replaced memories is not lost: keys the new fact does not set are merged into the new memory (explicitly passed metadata always wins); the response lists the carried keys as a warning.
+
 ## Scope Isolation
 
 - Every fact belongs to exactly one scope: the global `memories` table or a

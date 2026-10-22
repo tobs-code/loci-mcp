@@ -257,8 +257,12 @@ def import_memories(
         elif isinstance(parsed, list):
             records = parsed
         else:
-            return fail(STATUS_ERROR, "unsupported format",
-                        imported=0, skipped=0)
+            return fail(
+                STATUS_ERROR,
+                "payload must be the object of `export_memories` "
+                "(a dict with a 'records' list) or a list of record objects; "
+                f"got a dict with keys {sorted(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__}",
+                imported=0, skipped=0)
     except (json.JSONDecodeError, AttributeError) as e:
         return fail(STATUS_ERROR, f"invalid {format} data: {e}",
                     imported=0, skipped=0)

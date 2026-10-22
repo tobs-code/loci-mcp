@@ -245,6 +245,37 @@ def remember(
                 _supersede(cur, store_project, mem_id, eid)
                 superseded.append(eid)
 
+        # Keep context when a replaced fact is superseded: keys of the old
+        # metadata that the new memory does not set are merged into it, so a
+        # superseding fact does not silently drop provenance (tickets, ...)
+        # on the previous fact. Keys set explicitly by the caller win.
+        carried_keys: list[str] = []
+        if superseded:
+            table = _mem_table(store_project)
+            for old_id in superseded:
+                cur.execute(
+                    f"SELECT metadata FROM {table} "
+                    f"WHERE id = %s AND deleted_at IS NULL",
+                    (old_id,))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                try:
+                    old_meta = (row[0] if isinstance(row[0], dict)
+                                else json.loads(row[0] or "{}"))
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(old_meta, dict):
+                    continue
+                for key, value in old_meta.items():
+                    if key not in meta and key not in carried_keys:
+                        meta[key] = value
+                        carried_keys.append(key)
+            if carried_keys:
+                cur.execute(
+                    f"UPDATE {table} SET metadata = %s::jsonb WHERE id = %s",
+                    (json.dumps(meta), mem_id))
+
         conn.commit()
 
         warnings: list[str] = []
@@ -259,6 +290,10 @@ def remember(
             warnings.append("contradiction check skipped: entity required")
         if superseded and not check_contradictions:
             warnings.append(f"superseded {len(superseded)} memory/facts")
+        if carried_keys:
+            warnings.append(
+                "metadata carried over from the replaced memories: "
+                + ", ".join(sorted(carried_keys)))
         payload: dict[str, Any] = {"superseded": superseded}
         if check_contradictions:
             payload["contradictions"] = {"found": bool(contradictions),
@@ -717,13 +752,22 @@ def forget(
     entity_name = entity or entity_name
     logger.info("forget memory_id=%s entity_name=%s soft=%s dry_run=%s",
                 memory_id, entity_name, soft, dry_run)
+    raw_project = project
     project = _norm_project(project)
     if not memory_id and not entity_name:
         return fail(STATUS_ERROR, "memory_id or entity_name is required")
+    scope_name = project if project else "global"
     purge_all = entity_name == "*"
-    if purge_all and not project:
+    # An explicit `project` names the scope to purge — including the reserved
+    # name "global", which _norm_project maps to None (the shared table).
+    # Only a call without any scope is refused, so a stray call cannot wipe
+    # the whole database.
+    explicit_scope = (raw_project is not None
+                      and str(raw_project).strip() != "")
+    if purge_all and not explicit_scope:
         return fail(STATUS_ERROR,
-                    "entity='*' removes a whole scope: pass project=<name>")
+                    "entity='*' removes a whole scope: pass project=<name> "
+                    "(the shared scope is addressed with project=\"global\")")
     conn = get_conn()
     counts = {"memories": 0, "entities": 0, "relations": 0}
     scopes: list[str] = []
@@ -819,13 +863,13 @@ def forget(
                         or counts["relations"]):
                     conn.rollback()
                     return fail(STATUS_NOT_FOUND,
-                                f"no memories in project {project}")
+                                f"no memories in scope {scope_name}")
                 status = STATUS_OK if dry_run else (
                     STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED)
-                return ok(status, id=None, entity="*", project=project,
+                return ok(status, id=None, entity="*", project=scope_name,
                           counts=counts, dry_run=dry_run,
                           message=(f"{'Would remove' if dry_run else 'Removed'} "
-                                   f"all memories of project {project}"))
+                                   f"all memories of {scope_name}"))
             cur.execute(
                 "SELECT id FROM entities WHERE name = %s AND project = %s",
                 (entity_name, scope),

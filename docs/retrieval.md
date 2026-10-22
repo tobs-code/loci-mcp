@@ -66,6 +66,12 @@ that is the case the full-text leg exists for.
 `recall` reports `candidates` and `filtered_by_similarity` and warns when the
 filter removed everything, so an empty result is never silent.
 
+With `min_similarity=null` the filter is disabled and near-zero hits can
+appear as "relevant". When any returned hit has `_similarity < 0.35`, the
+response warns about it (`the min_similarity filter is disabled: N of M
+result(s) ...`), so agents notice the weak hits instead of reading them as
+confident matches.
+
 Measured with the current embedding model:
 
 | Query | Similarity |
@@ -158,6 +164,11 @@ presenting that as a clean contradiction scan.
   old memory stays active, the new fact is stored additionally and the
   response carries a warning — replacing an unrelated fact would destroy it
   silently.
+
+Metadata of replaced memories is not lost: keys the new fact does not set are
+merged into the new memory (explicitly passed metadata always wins). The
+response lists the carried keys in a warning (`metadata carried over from
+the replaced memories: ...`).
 
 ## Dedupe modes
 

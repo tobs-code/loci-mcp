@@ -82,6 +82,10 @@ was changed. `forget(entity=...)` keeps removing the entity from every scope.
 | `forget(entity="*", project=…)` | **Empties** the scope: memories, graph nodes and mirror rows are removed, the scope itself survives. |
 | `drop_project(project=…)` | **Removes** the scope completely: memory table, registry entry, graph nodes and mirror rows. `dry_run=true` previews the counts. |
 
+`forget(entity="*", project="global")` empties the shared global scope the
+same way (soft or hard); the wildcard without any `project` is refused, so a
+stray call cannot wipe the whole database.
+
 `drop_project` is permanent and refuses `global`. Use it when a project is
 finished and its scope should disappear from every listing.
 

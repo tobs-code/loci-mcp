@@ -303,6 +303,15 @@ def recall(
         )
     elif not rows:
         warnings.append("no results: nothing in this scope matches the query")
+    if min_similarity is None and rows:
+        weak = [r for r in rows
+                if (r.get("_similarity") is not None
+                    and r["_similarity"] < 0.35)]
+        if weak:
+            warnings.append(
+                f"the min_similarity filter is disabled: {len(weak)} of "
+                f"{len(rows)} result(s) have _similarity < 0.35 and may be "
+                f"only marginally relevant to the query")
     payload: dict[str, Any] = {
         "candidates": candidates,
         "filtered_by_similarity": filtered_out,
