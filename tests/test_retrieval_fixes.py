@@ -140,6 +140,22 @@ def test_relevance_score_separates_a_strong_hit_from_a_weak_one():
 # supersede_last does not destroy unrelated facts
 # --------------------------------------------------------------------------
 
+def test_decay_filter_reports_dropped_hits_on_non_empty_results():
+    # The decay filter used to be silent while hits survived: an agent saw
+    # fewer results without learning that min_decay_score removed candidates.
+    remember("Decay drop probe: fresh and important side of the topic",
+             importance=1.0)
+    remember("Decay drop probe: barely weighted low-importance side note",
+             importance=0.1)
+
+    result = recall("Decay drop probe", limit=5, include_decay=True,
+                    min_similarity=None, min_decay_score=0.7)
+
+    assert result["ok"] is True
+    assert len(result["results"]) >= 1
+    assert result.get("dropped_by_decay", 0) >= 1
+
+
 def test_supersede_last_refuses_an_unrelated_replacement():
     remember("the deployment pipeline runs on friday", entity="Guard")
     unrelated = remember("coffee tastes better with oat milk",
@@ -156,6 +172,19 @@ def test_supersede_last_refuses_an_unrelated_replacement():
                for h in hits)
 
 
+def test_supersede_last_replaces_the_most_similar_fact_not_the_newest():
+    similar = remember("the build runs on friday", entity="Build4")["id"]
+    # A newer, unrelated fact of the same entity used to BLOCK the
+    # replacement: only the newest memory was measured against the new one.
+    remember("coffee tastes better with oat milk", entity="Build4")
+
+    result = remember("the build runs on saturday", entity="Build4",
+                      supersede_last=True)
+
+    assert result["ok"] is True
+    assert result["superseded"] == [similar]
+
+
 def test_supersede_last_still_replaces_a_related_fact():
     first = remember("the build runs on friday", entity="Build2")["id"]
     second = remember("the build runs on saturday", entity="Build2")["id"]
@@ -163,7 +192,11 @@ def test_supersede_last_still_replaces_a_related_fact():
     result = remember("the build runs on sunday", entity="Build2",
                       supersede_last=True)
 
-    assert result["superseded"] == [second]
+    assert result["ok"] is True
+    # Both memory ids are about the same topic, so either may win the
+    # most-similar race - but exactly one of them must be replaced.
+    assert len(result["superseded"]) == 1
+    assert result["superseded"][0] in (first, second)
     history = recall("build runs on", include_superseded=True, limit=10)["results"]
     assert {r["id"] for r in history} == {first, second, result["id"]}
 

@@ -410,8 +410,9 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
     """Resolve which existing memories a new fact replaces.
 
     Returns the list of target ids and a list of warnings. `supersede_last`
-    only replaces the newest memory of the entity when the new fact is about
-    the same topic: replacing an unrelated fact would destroy it silently.
+    only replaces the most similar memory of the entity when the new fact is
+    about the same topic: replacing an unrelated fact would destroy it
+    silently.
     """
     targets: list[str] = []
     warnings: list[str] = []
@@ -446,10 +447,11 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
             if (similarity is not None
                     and similarity < SUPERSEDE_SIMILARITY_MIN):
                 warnings.append(
-                    f"supersede_last skipped: the newest memory of entity "
-                    f"{entity!r} ({old_content!r}) is about a different topic "
-                    f"(similarity {similarity} < {SUPERSEDE_SIMILARITY_MIN}); "
-                    f"the new fact was stored as an additional memory"
+                    f"supersede_last skipped: no memory of entity {entity!r} "
+                    f"is about the same topic (best match {old_content!r} "
+                    f"with similarity {similarity} < "
+                    f"{SUPERSEDE_SIMILARITY_MIN}); the new fact was stored "
+                    f"as an additional memory"
                 )
             else:
                 targets.append(target_id)
@@ -809,12 +811,9 @@ def update_memory(
         sets.append("mem_type = %s")
         params.append(mem_type)
 
-    if not sets:
-        return fail(STATUS_ERROR,
-                    "nothing to update: pass content, importance, metadata, "
-                    "entity or mem_type", id=memory_id)
-    # Updated memories must also age like new ones for decay scoring.
-    sets.append("updated_at = NOW()")
+    if sets:
+        # Updated memories must also age like new ones for decay scoring.
+        sets.append("updated_at = NOW()")
 
     conn = get_conn()
     try:
@@ -836,6 +835,27 @@ def update_memory(
                             f"which one to update",
                             id=memory_id, scopes=scopes)
             tables = _all_mem_tables(cur)
+        # Locate the memory BEFORE the "nothing to update" check: an unknown
+        # id must answer NOT FOUND even when no field was passed, otherwise
+        # the validation message suggests the id was seen and is valid.
+        active = False
+        for table in tables:
+            cur.execute(
+                f"SELECT 1 FROM {table} WHERE id = %s "
+                "AND superseded_by IS NULL AND deleted_at IS NULL",
+                (memory_id,),
+            )
+            if cur.fetchone():
+                active = True
+                break
+        if not active:
+            conn.rollback()
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+        if not sets:
+            conn.rollback()
+            return fail(STATUS_ERROR,
+                        "nothing to update: pass content, importance, metadata, "
+                        "entity or mem_type", id=memory_id)
         updated = 0
         updated_table = None
         for table in tables:

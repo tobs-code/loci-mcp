@@ -58,7 +58,7 @@ def test_supersede_content_replaces_the_fact_with_the_same_text():
     assert old["superseded_by"] == result["id"]
 
 
-def test_supersede_last_replaces_the_newest_fact_of_the_entity():
+def test_supersede_last_replaces_the_most_similar_fact_of_the_entity():
     first = remember("Supersede last probe: the build runs on friday",
                      entity="Build")["id"]
     second = remember("Supersede last probe: the build runs on saturday",

@@ -89,9 +89,11 @@ that is the case the full-text leg exists for.
 `recall` reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed) and
 `dropped_by_coverage` (the number of full-text hits the coverage filter
-removed). When the result is empty, the warning names **every** filter that
-removed something, so the caller does not have to guess which one was
-responsible.
+removed). `dropped_by_decay` and `dropped_by_superseded` are reported
+whenever the `min_decay_score` / `only_superseded` filter removed hits — also
+when other hits survived, so a non-empty result is never quietly short. When
+the result is empty, the warning names **every** filter that removed
+something, so the caller does not have to guess which one was responsible.
 
 ## The full-text coverage floor
 
@@ -255,11 +257,11 @@ scan"]`) when the loop aborts mid-way.
 
 - `supersede` replaces a memory by id.
 - `supersede_content` replaces the memory with the same wording.
-- `supersede_last` replaces the newest memory of an entity, but only when the
-  new fact is about the same topic (cosine similarity >= 0.5). Otherwise the
-  old memory stays active, the new fact is stored additionally and the
-  response carries a warning — replacing an unrelated fact would destroy it
-  silently.
+- `supersede_last` replaces the memory of an entity that matches the new fact
+  best (most similar, not the newest), but only when the new fact is about the
+  same topic (cosine similarity >= 0.5). Otherwise the old memory stays
+  active, the new fact is stored additionally and the response carries a
+  warning — replacing an unrelated fact would destroy it silently.
 
 Metadata of replaced memories is not lost: keys the new fact does not set are
 merged into the new memory (explicitly passed metadata always wins). The

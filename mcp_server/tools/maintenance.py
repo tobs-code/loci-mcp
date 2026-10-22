@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Literal
 
@@ -18,6 +19,52 @@ from mcp_server.search import _search_memories
 from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
+
+# `partial_error` of the /nli endpoint:
+# "NLI unavailable for <failed> of <total> document(s): <reason>"
+_NLI_PARTIAL_RE = re.compile(
+    r"NLI unavailable for (?P<failed>\d+) of (?P<total>\d+) document\(s\): "
+    r"(?P<reason>.*)", re.DOTALL)
+
+
+def _aggregate_nli_partials(partials: list[str]) -> str | None:
+    """Fold per-call partial-error messages into one summary line.
+
+    Each /nli call reports its own failures ("1 of 16", "1 of 15", ...), so a
+    scope-wide scan can collect several nearly identical warnings. The
+    aggregated line keeps the failures per distinct reason countable; messages
+    that do not match the endpoint format are kept verbatim (deduplicated).
+    """
+    failed_by_reason: dict[str, int] = {}
+    total_docs = 0
+    for partial in partials:
+        match = _NLI_PARTIAL_RE.fullmatch(partial)
+        if not match:
+            return None
+        reason = match.group("reason").strip()
+        failed = int(match.group("failed"))
+        total_docs += int(match.group("total"))
+        failed_by_reason[reason] = failed_by_reason.get(reason, 0) + failed
+    total_failed = sum(failed_by_reason.values())
+    parts = [f"{count} document(s): {reason}"
+             for reason, count in failed_by_reason.items()]
+    return (f"NLI unavailable for {total_failed} of {total_docs} "
+            f"document(s) in total: " + " | ".join(parts))
+
+
+def _append_partial_warning(warnings: list[str], partials: list[str]) -> None:
+    """Append one aggregated (or, as fallback, the raw deduped) warnings."""
+    if not partials:
+        return
+    summary = _aggregate_nli_partials(partials)
+    if summary is not None:
+        warnings.append(
+            f"scan partially incomplete: {summary}; the gaps are not a "
+            f"clean contradiction scan")
+    else:
+        warnings.extend(
+            f"scan partially incomplete: {p}"
+            for p in dict.fromkeys(partials))
 
 
 def _entities_differ(a: str | None, b: str | None) -> bool:
@@ -183,6 +230,7 @@ def contradictions_report(entity: Annotated[
         # report deterministic.
         scores_by_fact: dict[str, tuple[list[float], str | None]] = {}
         nli_errors: list[str] = []
+        partials: list[str] = []
         if candidate_list:
             workers = min(8, len(candidate_list))
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -210,9 +258,11 @@ def contradictions_report(entity: Annotated[
                 continue
             scores, partial = scored
             if partial:
-                note = f"scan partially incomplete: {partial}"
-                if note not in warnings:
-                    warnings.append(note)
+                # Collected here, aggregated into ONE warning after the
+                # loop: a scope-wide check makes one /nli call per fact, and
+                # three identical partial lines are harder to read than a
+                # qualifying summary.
+                partials.append(partial)
             checked_pairs += len(neighbours)
             for (nid, ncontent, nentity), score in zip(neighbours, scores):
                 if len(contradictions) >= limit:
@@ -231,6 +281,7 @@ def contradictions_report(entity: Annotated[
                             f.get("entity"), nentity),
                         "confidence": round(score, 3),
                     })
+        _append_partial_warning(warnings, partials)
     except Exception as e:
         # An NLI outage must not crash the tool outside the envelope: the
         # pairs seen so far stay in the result, the rest is skipped loudly.

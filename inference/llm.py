@@ -23,6 +23,12 @@ NLI_INSTRUCTION = (
     "BOTH facts describe the SAME subject. Facts that merely omit details or "
     "add new ones are NOT contradictions (neutral unless the overlap clearly "
     "contradicts). Identical facts are entailment, not contradiction. "
+    "Almost identical wording alone does NOT make two facts the same "
+    "subject: facts that describe different instances of the same pattern "
+    "(two different test facts, tickets, incidents or examples - each "
+    "referring to its own item) name no shared concrete object and stay "
+    "neutral even when only one word differs. Answer contradiction only "
+    "when both facts clearly refer to the very same item or object. "
     "Respond in JSON with keys 'label' (one of: contradiction, entailment, "
     "neutral) and 'score' (0.0-1.0)."
 )

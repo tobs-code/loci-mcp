@@ -440,6 +440,13 @@ def recall(
     }
     if dropped_by_coverage:
         payload["dropped_by_coverage"] = dropped_by_coverage
+    # Filter counters are reported even when hits survive: an agent must be
+    # able to see that the decay or superseded filter removed candidates
+    # from a non-empty result instead of silently getting fewer hits.
+    if dropped_by_decay:
+        payload["dropped_by_decay"] = dropped_by_decay
+    if dropped_by_superseded:
+        payload["dropped_by_superseded"] = dropped_by_superseded
     if stats.get("fulltext_only"):
         payload["fulltext_only"] = stats["fulltext_only"]
     return ok(STATUS_OK, count=len(rows), results=rows, warnings=warnings,

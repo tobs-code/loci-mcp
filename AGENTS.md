@@ -73,7 +73,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Read / Search
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak vector matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `graph_entity`) to include connected entities; `fields` to narrow columns; `offset` pages through ranked hits; logs `access_count`; reports `candidates` / `dropped_by_similarity` / `dropped_by_coverage` / `scopes_searched` |
+| `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak vector matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `graph_entity`) to include connected entities; `fields` to narrow columns; `offset` pages through ranked hits; logs `access_count`; reports `candidates` / `dropped_by_similarity` / `dropped_by_coverage` / `dropped_by_decay` / `dropped_by_superseded` / `scopes_searched` |
 | `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `include_global`, `fields`, `contains`, `memory_id` (direct id lookup), `include_deleted` (soft-forgotten rows), `include_relation_context` (hide the edge sentences), `updated_after`, `metadata_filter`, `order_by`; `offset` pages through a scope |
 | `get_entity` | Get entity details + all linked memories + graph connections; `include_global`, `include_superseded`, `fields`, `limit`/`offset`; the answer reports `total`/`has_more` and warns when it was truncated |
 | `list_entities` | Browse entities; filters: `entity_type`, `project`, `include_global`; `offset` pages through the list; synthetic relation-context entities (`<from>_<relation>_<to>`) are hidden; `entity_type` selects one kind of entity (a graph node or a memory-only one) and `count` always equals `total` |
@@ -155,7 +155,10 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   `recall` reports `candidates` (the hits that made it into the ranking),
   `dropped_by_similarity` (the number of vector hits removed, not the number
   kept), `dropped_by_coverage` and `scopes_searched` (the scopes that were
-  really searched). An empty result names **every** filter that removed
+  really searched). `dropped_by_decay` and `dropped_by_superseded` are
+  reported whenever the `min_decay_score` / `only_superseded` filter removed
+  hits - also when other hits survived, so a non-empty result is never
+  quietly short. An empty result names **every** filter that removed
   something (`min_similarity`, `min_decay_score`, `only_superseded`, the
   coverage floor) — not just the first one — so an empty result is never
   silent and never misdiagnosed.
@@ -244,7 +247,9 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   table when `project` is omitted. `forget(entity=...)` removes the entity's
   memories from all scopes and deletes its graph node; with `project` it
   touches only that scope's memories and node. Unknown ids/entities return
-  `NOT FOUND`. `dry_run` counts exactly what the real call removes, including
+  `NOT FOUND` - `update_memory` checks the id **before** the
+  "nothing to update" validation, so an unknown id never reads like a valid
+  one. `dry_run` counts exactly what the real call removes, including
   the graph nodes and relations of every scope when no `project` is given.
 - A soft-forgotten memory can be recovered with `restore_memory`: it clears
   `deleted_at` and the forgotten sentinel — never a real `superseded_by` id,
@@ -366,7 +371,10 @@ field difference to one subject). The `/nli` contract carries optional
 mismatched labels add a "likely different subjects" hint to the user prompt.
 Earlier prompts judged "deploys to staging" vs "deploys to production" as
 neutral (both could be true) — the widened prompt detects that once the
-subject is shared.
+subject is shared. Near-identical wording alone does not make two facts the
+same subject: two instances of the same pattern (two test facts, tickets,
+incidents) stay neutral so a schema difference ("unknown id" vs "mismatched
+content") is not inflated to a 0.95 contradiction.
 
 **NLI outages are surfaced, never silent**: `/nli` sets an `error` field when
 **no** score is a real judgment (provider down, not configured); the MCP client
@@ -505,7 +513,7 @@ it explicitly.
 | `drop_project` | `project`, `dry_run` | Removes the scope completely (table, registry, graph nodes, mirror rows); a graph-only scope is removed as well; `global` is refused (use `forget(entity="*", project="global")`) |
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set; the answer names the scope it wrote to; an unknown `supersede` id replaces nothing and warns |
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
-| `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`) |
+| `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`); an unknown id returns `not_found` before the "nothing to update" validation |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
 | `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of **same-entity** pairs only - cross-entity pairs stay active with `cross_entity: true` and a `resolve skipped` warning |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project`, `dry_run` | `counts` splits memories/entities/relations; `entity="*"` + `project` empties a whole scope (soft by default, hard with `soft=false`; the scope itself survives either way - `drop_project` removes it completely); `dry_run=True` counts exactly what the real call removes |
@@ -521,10 +529,11 @@ similarity, threshold `fuzzy_threshold`, default 0.9), `off` (store everything).
 A duplicate answer names the mode that matched (`duplicate_mode`) and the
 measured similarity.
 
-`supersede_last` replaces the newest memory of an entity only when the new
-fact is about the same topic (cosine similarity ≥ 0.5). Otherwise the old
-memory stays active, the new fact is stored additionally and the response
-carries a warning - replacing an unrelated fact would destroy it silently.
+`supersede_last` replaces the memory of an entity that matches the new fact
+best (most similar, not the newest) only when the new fact is about the same
+topic (cosine similarity ≥ 0.5). Otherwise no memory is replaced, the new
+fact is stored additionally and the response carries a warning - replacing
+an unrelated fact would destroy it silently.
 
 ## When to use which tool
 

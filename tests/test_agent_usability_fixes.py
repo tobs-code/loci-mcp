@@ -64,6 +64,34 @@ def test_remember_batch_survives_nli_outage_and_warns(monkeypatch):
                for w in entry.get("warnings", []))
 
 
+def test_contradictions_report_aggregates_partial_nli_warnings(monkeypatch):
+    # A per-fact NLI call produces one partial_error each ("1 of N"); the
+    # report used to repeat the nearly identical lines. Now it aggregates.
+    entity = "PartialEntity"
+    remember(content=f"{entity} batches exports on the first host.",
+             entity=entity, project="nli-partial-report")
+    remember(content=f"{entity} batches exports on the second host.",
+             entity=entity, project="nli-partial-report")
+    remember(content=f"{entity} batches exports on the third host.",
+             entity=entity, project="nli-partial-report")
+    monkeypatch.setattr(
+        "mcp_server.tools.maintenance.nli_detailed",
+        lambda q, d, *a, **kw: (
+            [0.0] * len(d),
+            f"NLI unavailable for 1 of {len(d)} document(s): bad JSON"),
+    )
+    result = contradictions_report(entity=entity,
+                                   project="nli-partial-report")
+    assert result["ok"] is True
+    partial_lines = [w for w in result["warnings"]
+                     if w.startswith("scan partially incomplete")]
+    assert len(partial_lines) == 1, partial_lines
+    assert "in total" in partial_lines[0]
+    # The per-call format ("1 of 2") is gone: only the aggregated totals name
+    # the documents, so partial warnings never repeat per fact.
+    assert "1 of" not in partial_lines[0]
+
+
 def test_contradictions_report_survives_nli_outage(monkeypatch):
     # Two facts on one entity: the vector part finds candidate pairs, the
     # NLI leg raises - the tool must return an envelope with a warning.
@@ -151,6 +179,24 @@ def test_update_memory_says_what_is_missing():
     assert result["ok"] is False
     assert "nothing to update: pass content, importance, metadata," in \
         result["error"]
+
+
+def test_update_memory_answers_not_found_before_the_validation():
+    # An unknown id must read as "the memory does not exist", not as "you
+    # forgot to pass something": the existence check runs first now.
+    result = update_memory(memory_id="zzunknownid00")
+
+    assert result["ok"] is False
+    assert result["status"] == "not_found"
+    assert "NOT FOUND" in result["error"]
+
+
+def test_update_memory_answers_not_found_with_fields_passsed():
+    result = update_memory(memory_id="zzunknownid01", importance=0.5)
+
+    assert result["ok"] is False
+    assert result["status"] == "not_found"
+    assert "NOT FOUND" in result["error"]
 
 
 def test_nli_detailed_returns_partial_scores_and_keeps_the_warning(monkeypatch):

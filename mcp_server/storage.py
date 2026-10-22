@@ -186,11 +186,14 @@ def _find_by_content(cur, content: str, project: str | None,
 def _find_last_for_entity(cur, entity: str, project: str | None,
                           embedding: list[float] | None = None
                           ) -> tuple[str, str, float | None] | None:
-    """The most recently updated active memory of an entity.
+    """The active memory of an entity that best matches the new fact.
 
-    With `embedding` the cosine similarity to that memory is returned as
-    well. It is used to decide whether a new fact really replaces the old
-    one or whether it is about a different topic.
+    With `embedding` the candidate is the most SIMILAR active memory
+    (ties go to the newest), not the newest one: `supersede_last` may only
+    replace a fact about the same topic, and an unrelated memory that was
+    stored more recently must not block the replacement of an actually
+    matching one. Without an embedding the newest memory is the only
+    deterministic fallback.
     """
     table = _mem_table(project)
     if embedding is not None:
@@ -198,7 +201,7 @@ def _find_last_for_entity(cur, entity: str, project: str | None,
             f"SELECT id, content, embedding <=> %s::vector AS dist "
             f"FROM {table} WHERE entity = %s "
             f"AND superseded_by IS NULL AND deleted_at IS NULL "
-            f"ORDER BY updated_at DESC LIMIT 1",
+            f"ORDER BY dist ASC, updated_at DESC LIMIT 1",
             (embedding, entity),
         )
         row = cur.fetchone()

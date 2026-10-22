@@ -66,7 +66,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `project` | string? | Project scope. `global` is reserved and means the shared scope. |
 | `supersede` | string? | Memory id this fact replaces. |
 | `supersede_content` | string? | Exact content of the memory this fact replaces. |
-| `supersede_last` | bool | Replace the newest memory of the same entity - only if the new fact is about the same topic (similarity >= 0.5), otherwise the fact is stored additionally and a warning is returned. |
+| `supersede_last` | bool | Replace the memory of the same entity that matches the new fact best (most similar, not the newest) - only if the new fact is about the same topic (similarity >= 0.5), otherwise the fact is stored additionally and a warning is returned. |
 | `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
 | `fuzzy_threshold` | number? | Similarity threshold for `dedupe="semantic"` (default 0.9). |
@@ -163,6 +163,9 @@ The answer reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
 `dropped_by_coverage` (the number of full-text hits that covered too little of
 the query), plus `fulltext_only` when a hit came only from the full-text leg.
+`dropped_by_decay` and `dropped_by_superseded` are reported whenever the
+`min_decay_score` / `only_superseded` filter removed hits — also when other
+hits survived, so a non-empty result is never quietly short.
 `scopes_searched` names the scopes the query actually covered. See
 [Retrieval](retrieval.md) for the score fields.
 
