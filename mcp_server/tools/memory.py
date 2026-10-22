@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
@@ -44,6 +44,7 @@ from mcp_server.scopes import (
 )
 from mcp_server.scoring import _content_hash
 from mcp_server.storage import (
+    clear_dangling_supersede,
     _check_contradictions,
     _deduplicate,
     _find_by_content,
@@ -159,6 +160,92 @@ def _near_duplicate_warning(near_dup: dict) -> str:
         f"reworded copy; pass supersede={near_dup['id']} to replace it, or "
         f"dedupe='off' to store without this warning"
     )
+
+
+def _ttl_past_warning(value: Any) -> str | None:
+    """Warn when an accepted TTL is already in the past.
+
+    A past timestamp is valid input (imports restore expired rows), but a
+    write that stores an immediately invisible fact must say so instead of
+    answering "stored" and letting the caller search for it.
+    """
+    if value is None:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    if stamp <= datetime.now(timezone.utc):
+        return (
+            "expires_at is in the past: the memory was stored but is "
+            "immediately inactive - it is hidden from every active read "
+            "(use include_expired=true to see it)")
+    return None
+
+
+def _read_metadata(cur, store_project: str | None, memory_id: str) -> dict:
+    """Metadata of a row that is about to be replaced (project, then global)."""
+    table = _mem_table(store_project)
+    cur.execute(
+        f"SELECT metadata FROM {table} WHERE id = %s AND deleted_at IS NULL",
+        (memory_id,))
+    row = cur.fetchone()
+    if not row and store_project:
+        # A cross-scope supersede replaced a shared fact: its metadata lives
+        # in the global table, not in the project one.
+        cur.execute(
+            "SELECT metadata FROM memories WHERE id = %s AND deleted_at IS NULL",
+            (memory_id,))
+        row = cur.fetchone()
+    if not row:
+        return {}
+    try:
+        meta = row[0] if isinstance(row[0], dict) else json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _is_past(value: Any) -> bool:
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value <= datetime.now(timezone.utc)
+
+
+def _hidden_state_reason(cur, memory_id: str,
+                         tables: list[str]) -> str | None:
+    """Why an existing row cannot be updated or touched.
+
+    A plain "NOT FOUND" hides that the id *does* exist but is superseded,
+    forgotten or expired - the caller then keeps looking for the wrong
+    problem. This returns the actionable reason, or None for an unknown id.
+    """
+    for table in tables:
+        cur.execute(
+            f"SELECT superseded_by, deleted_at, expires_at FROM {table} "
+            "WHERE id = %s", (memory_id,))
+        row = cur.fetchone()
+        if not row:
+            continue
+        superseded_by, deleted_at, expires_at = row
+        reasons: list[str] = []
+        if deleted_at is not None:
+            reasons.append("soft-forgotten (use restore_memory to bring it back)")
+        if (superseded_by is not None
+                and superseded_by != SENTINEL_FORGOTTEN):
+            reasons.append(
+                f"superseded by {superseded_by} (history only; read it with "
+                f"include_superseded=true)")
+        if _is_past(expires_at):
+            reasons.append(
+                "expired (TTL passed; set clear_expires_at=true or a future "
+                "expires_at)")
+        return "; ".join(reasons) if reasons else None
+    return None
 
 
 def _cross_scope_warning(ids: list[str]) -> str:
@@ -345,6 +432,7 @@ def remember(
     """
     logger.info("remember entity=%s mem_type=%s importance=%s check_contradictions=%s fuzzy=%s scope=%s dedupe=%s",
                 entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope, dedupe)
+    raw_project = project
     try:
         project = _norm_project(project)
         entity = _norm_entity(entity)
@@ -390,10 +478,17 @@ def remember(
         return fail(STATUS_ERROR, "metadata must be an object")
     effective_scope = scope or ("project" if project else "global")
     if effective_scope == "project" and not project:
+        if str(raw_project or "").strip().lower() == "global":
+            return fail(
+                STATUS_ERROR,
+                "project='global' is the shared scope and cannot be combined "
+                "with scope='project'; pass a real project name, or use "
+                "scope='global' (the default when no project is set)")
         return fail(STATUS_ERROR, "project required when scope='project'")
     store_project = project if effective_scope == "project" else None
 
     meta = metadata or {}
+    ttl_warning = _ttl_past_warning(expires_at)
     emb = embed([content])[0]
     conn = get_conn()
     try:
@@ -575,6 +670,8 @@ def remember(
 
         warnings: list[str] = []
         warnings.extend(guard_warnings)
+        if ttl_warning:
+            warnings.append(ttl_warning)
         if superseded_match:
             mode = superseded_match["mode"]
             detail = ("the same content" if mode == "exact"
@@ -965,6 +1062,7 @@ def remember_batch(
             "supersede_last": bool(fact.get("supersede_last")),
             "on_near_duplicate": fact_near,
             "expires_at": fexpires,
+            "ttl_warning": _ttl_past_warning(fexpires),
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -1119,6 +1217,26 @@ def remember_batch(
                         continue
                     _supersede(cur, store_project, mid, c["existing_id"])
                     auto_superseded.append(c)
+
+                # Carry metadata over from every replaced fact (same contract
+                # as `remember`): a batch write must not drop provenance that
+                # a single write preserves.
+                replaced_ids = list(dict.fromkeys(
+                    superseded + [c["existing_id"] for c in auto_superseded]))
+                carried: list[str] = []
+                if replaced_ids:
+                    merged_meta = dict(spec["metadata"])
+                    for old_id in replaced_ids:
+                        for key, value in _read_metadata(
+                                cur, store_project, old_id).items():
+                            if key not in merged_meta:
+                                merged_meta[key] = value
+                                carried.append(key)
+                    if carried:
+                        cur.execute(
+                            f"UPDATE {_mem_table(store_project)} "
+                            "SET metadata = %s::jsonb WHERE id = %s",
+                            (json.dumps(merged_meta), mid))
                 # Shared facts this entry invalidated: a project write hides
                 # them in every scope, so the entry has to name them.
                 cross_scope_superseded = (
@@ -1144,6 +1262,13 @@ def remember_batch(
                      "project": (store_project or "global")}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
+            if spec.get("ttl_warning"):
+                entry.setdefault("warnings", []).append(spec["ttl_warning"])
+            if carried:
+                entry.setdefault("warnings", []).append(
+                    "metadata carried over from the replaced memories (these "
+                    "values come from the old fact; verify they still apply): "
+                    + ", ".join(sorted(set(carried))))
             if near_dup and spec["on_near_duplicate"] == "supersede":
                 entry.setdefault("warnings", []).append(
                     f"auto-supersede: replaced near-duplicate "
@@ -1183,12 +1308,15 @@ def remember_batch(
     finally:
         conn.close()
     failed = [r for r in results if r.get("status") == "error"]
+    succeeded = len(results) - len(failed)
     if failed and len(failed) == len(results):
         return fail(STATUS_ERROR, "no fact could be stored",
-                    count=len(results), results=results)
-    status = STATUS_PARTIAL if failed else "ok"
+                    count=len(results), succeeded=0, failed=len(failed),
+                    results=results)
+    status = STATUS_PARTIAL if failed else STATUS_OK
     warnings = [f"{len(failed)} fact(s) failed"] if failed else []
-    return ok(status, count=len(results), results=results, warnings=warnings)
+    return ok(status, count=len(results), succeeded=succeeded,
+              failed=len(failed), results=results, warnings=warnings)
 
 
 def update_memory(
@@ -1351,7 +1479,13 @@ def update_memory(
                 active_table = table
                 break
         if active_table is None:
+            reason = _hidden_state_reason(cur, memory_id, tables)
             conn.rollback()
+            if reason:
+                return fail(
+                    STATUS_NOT_FOUND,
+                    f"memory {memory_id} exists but cannot be updated: {reason}",
+                    id=memory_id)
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
         if not sets:
             conn.rollback()
@@ -1399,6 +1533,9 @@ def update_memory(
     finally:
         conn.close()
     warnings = ([_near_duplicate_warning(near_dup)] if near_dup else [])
+    ttl_warning = _ttl_past_warning(expires_at) if expires_at is not None else None
+    if ttl_warning:
+        warnings.append(ttl_warning)
     return ok(STATUS_UPDATED, id=memory_id, project=scope, warnings=warnings)
 
 
@@ -1542,6 +1679,9 @@ def update_batch(
                 error = "expires_at must be an ISO 8601 timestamp"
         elif error is None and entry_clear:
             fields["expires_at"] = None
+        entry_ttl_warning = (_ttl_past_warning(entry_expires)
+                             if entry_expires is not None and error is None
+                             else None)
         if error is None and not fields:
             error = ("nothing to update: pass content, importance, metadata, "
                      "entity, mem_type or expires_at/clear_expires_at")
@@ -1552,7 +1692,8 @@ def update_batch(
                               "project": entry_project,
                               "fields": fields,
                               "dedupe": entry_dedupe,
-                              "fuzzy_threshold": entry_fuzzy}, None))
+                              "fuzzy_threshold": entry_fuzzy,
+                              "ttl_warning": entry_ttl_warning}, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
              if spec is not None]
@@ -1623,9 +1764,13 @@ def update_batch(
                         active_table = table
                         break
                 if active_table is None:
+                    reason = _hidden_state_reason(cur, memory_id, tables)
                     cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    error = (f"memory {memory_id} exists but cannot be "
+                             f"updated: {reason}" if reason
+                             else f"NOT FOUND: {memory_id}")
                     results.append({"id": memory_id, "status": "not_found",
-                                    "error": f"NOT FOUND: {memory_id}"})
+                                    "error": error})
                     continue
                 scope = _scope_of_table(cur, active_table)
                 near_dup = None
@@ -1678,6 +1823,8 @@ def update_batch(
                                      "project": scope}
             if near_dup:
                 entry["warnings"] = [_near_duplicate_warning(near_dup)]
+            if spec.get("ttl_warning"):
+                entry.setdefault("warnings", []).append(spec["ttl_warning"])
             results.append(entry)
         conn.commit()
     except Exception as e:
@@ -1687,12 +1834,15 @@ def update_batch(
     finally:
         conn.close()
     failed = [r for r in results if r.get("status") != STATUS_UPDATED]
+    succeeded = len(results) - len(failed)
     if failed and len(failed) == len(results):
         return fail(STATUS_ERROR, "no memory could be updated",
-                    count=len(results), results=results)
+                    count=len(results), succeeded=0, failed=len(failed),
+                    results=results)
     status = STATUS_PARTIAL if failed else STATUS_OK
     warnings = [f"{len(failed)} update(s) failed"] if failed else []
-    return ok(status, count=len(results), results=results, warnings=warnings)
+    return ok(status, count=len(results), succeeded=succeeded,
+              failed=len(failed), results=results, warnings=warnings)
 
 
 def touch_memory(
@@ -1776,7 +1926,13 @@ def touch_memory(
                 active = True
                 break
         if not active:
+            reason = _hidden_state_reason(cur, memory_id, tables)
             conn.rollback()
+            if reason:
+                return fail(
+                    STATUS_NOT_FOUND,
+                    f"memory {memory_id} exists but cannot be touched: {reason}",
+                    id=memory_id)
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
                         id=memory_id)
         touched_table = None
@@ -2046,6 +2202,8 @@ def forget(
                     bulk_results.append({"id": mid, "status": "not_found"})
             
             if not dry_run:
+                if not soft:
+                    clear_dangling_supersede(cur)
                 conn.commit()
             else:
                 conn.rollback()
@@ -2098,6 +2256,8 @@ def forget(
             if not counts["memories"]:
                 conn.rollback()
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+            if not soft and not dry_run:
+                clear_dangling_supersede(cur)
         if entity_name:
             cur.execute("SET search_path TO ag_catalog, public")
             en_json = json.dumps(entity_name)
@@ -2143,6 +2303,8 @@ def forget(
                 if dry_run:
                     conn.rollback()
                 else:
+                    if not soft:
+                        clear_dangling_supersede(cur)
                     conn.commit()
                 if not (counts["memories"] or counts["entities"]
                         or counts["relations"]):
@@ -2252,11 +2414,35 @@ def forget(
                     )
                     counts["memories"] += cur.rowcount
             if not (counts["memories"] or counts["entities"] or counts["relations"]):
+                # An entity whose memories are all soft-forgotten already has
+                # nothing active to hide, but it still exists. Answering
+                # "NOT FOUND" would send the caller looking for a typo.
+                hidden = 0
+                if soft:
+                    for tbl in dict.fromkeys(tables):
+                        if not _table_exists(cur, tbl):
+                            continue
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {tbl} WHERE entity = %s "
+                            f"OR (metadata->>'relation_context' = 'true' AND "
+                            f"(metadata->>'from' = %s OR metadata->>'to' = %s))",
+                            (entity_name, entity_name, entity_name))
+                        hidden += cur.fetchone()[0]
+                if hidden:
+                    conn.rollback()
+                    return ok(
+                        STATUS_OK, id=None, entity=entity_name,
+                        project=scope_name, counts=counts, dry_run=dry_run,
+                        message=(f"nothing to forget: all {hidden} "
+                                 f"memory/memories of {entity_name!r} are "
+                                 f"already soft-forgotten"))
                 conn.rollback()
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {entity_name}")
         if dry_run:
             conn.rollback()
         else:
+            if entity_name and not soft:
+                clear_dangling_supersede(cur)
             conn.commit()
     except Exception as e:
         conn.rollback()

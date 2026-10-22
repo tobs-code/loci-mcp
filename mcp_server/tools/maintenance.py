@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.inference_client import health_details, nli_detailed
@@ -13,6 +14,7 @@ from mcp_server.scopes import (
     _all_mem_tables,
     _norm_project,
     _project_names,
+    _project_suffix,
     _retrieval_tables,
 )
 from mcp_server.search import _search_memories
@@ -400,6 +402,155 @@ def contradictions_report(entity: Annotated[
         # aggregated warning still names the incomplete scan then.
         result["nli_failures"] = nli_failures
     return ok(STATUS_OK, **result)
+
+
+def verify_integrity(
+    project: Annotated[
+        str | None,
+        Field(description="Scope to check. Without it every scope is checked; "
+                          "'global' checks only the shared scope.")] = None,
+    fix: Annotated[
+        bool,
+        Field(description="Clear dangling/self-referencing supersede links. "
+                          "Without it the tool only reports.")] = False,
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of problem rows to list (default 20).",
+              ge=1, le=500)] = 20,
+) -> dict[str, Any]:
+    """Check stored memories for links that make rows unreachable.
+
+    The main failure this catches: a memory is marked `superseded_by` an id
+    that no longer exists (the replacement was hard-deleted, a project was
+    dropped, or a partial import restored only one side). Such a row is hidden
+    from every active read forever, although nothing supersedes it any more.
+    `fix=true` clears those links so the row becomes readable history again;
+    it never deletes content and never restores a valid supersede.
+
+    Also reports self-references (`superseded_by = id`) and supersede chains
+    (A replaced by B, B replaced by C), which are legal but often point at an
+    unintended second write. Expired-but-active rows are counted as context,
+    not as an error.
+    """
+    logger.info("verify_integrity project=%s fix=%s", project, fix)
+    try:
+        name = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    only_global = str(project or "").strip().lower() == "global"
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        all_tables = _all_mem_tables(cur)
+        if only_global:
+            tables = ["memories"]
+        elif name:
+            tables = [f"mem_{_project_suffix(name)}"]
+        else:
+            tables = all_tables
+        tables = [t for t in tables if t in all_tables]
+        if not tables:
+            return fail(STATUS_ERROR, f"unknown project {name!r}")
+
+        # A supersede link may point into another scope (cross-scope
+        # supersede), so validity is checked against every scope, not only
+        # the selected one.
+        all_ids: set[str] = set()
+        for table in all_tables:
+            cur.execute(f"SELECT id FROM {table}")
+            all_ids |= {row[0] for row in cur.fetchall()}
+
+        names = _project_names(cur)
+        details: list[dict[str, Any]] = []
+        dangling: list[tuple[str, str, str]] = []
+        self_refs: list[tuple[str, str, str]] = []
+        links: dict[str, str] = {}
+        expired_active = 0
+        total = 0
+        for table in tables:
+            scope = ("global" if table == "memories"
+                     else names.get(table[len("mem_"):], table[len("mem_"):]))
+            cur.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE superseded_by IS NULL "
+                f"AND deleted_at IS NULL AND expires_at IS NOT NULL "
+                f"AND expires_at <= NOW()")
+            expired_active += cur.fetchone()[0]
+            cur.execute(
+                f"SELECT id, superseded_by, entity, content FROM {table} "
+                f"WHERE superseded_by IS NOT NULL "
+                f"AND superseded_by <> %s", (SENTINEL_FORGOTTEN,))
+            for mid, sup, entity, content in cur.fetchall():
+                total += 1
+                links[mid] = sup
+                if sup == mid:
+                    self_refs.append((table, mid, entity))
+                elif sup not in all_ids:
+                    dangling.append((table, mid, entity))
+                if len(details) < limit and (sup == mid or sup not in all_ids):
+                    details.append({
+                        "project": scope,
+                        "id": mid,
+                        "superseded_by": sup,
+                        "entity": entity,
+                        "content": content[:200],
+                        "problem": ("self_reference" if sup == mid
+                                    else "dangling_superseded_by"),
+                    })
+
+        # A chain (A -> B -> C) is legal after repeated supersede, but a chain
+        # whose middle link is dangling is not: report the count so a caller
+        # can spot repeated rewrites of one fact.
+        chains = sum(
+            1 for mid, sup in links.items()
+            if sup in links and links.get(sup) != mid)
+
+        fixed = 0
+        if fix and (dangling or self_refs):
+            bad = [(table, mid) for table, mid, _ in dangling + self_refs]
+            for table, mid in bad:
+                cur.execute(
+                    f"UPDATE {table} SET superseded_by = NULL WHERE id = %s",
+                    (mid,))
+                fixed += 1
+            conn.commit()
+        else:
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+
+    warnings: list[str] = []
+    if dangling or self_refs:
+        if fix:
+            warnings.append(
+                f"cleared {fixed} broken supersede link(s); those memories "
+                f"are readable history now")
+        else:
+            warnings.append(
+                f"{len(dangling) + len(self_refs)} broken supersede link(s) "
+                f"hide rows from every read; call verify_integrity(fix=true) "
+                f"to clear them")
+    elif total:
+        warnings.append("no integrity problems found")
+    if expired_active:
+        warnings.append(
+            f"{expired_active} active memory/memories have a passed TTL and "
+            f"are hidden from reads (not an error; use include_expired=true "
+            f"to inspect them)")
+    return ok(
+        STATUS_OK,
+        checked_tables=tables,
+        superseded_links=total,
+        dangling_superseded_by=len(dangling),
+        self_references=len(self_refs),
+        chains=chains,
+        expired_active=expired_active,
+        fixed=fixed,
+        results=details,
+        warnings=warnings,
+    )
 
 
 def server_health() -> dict[str, Any]:

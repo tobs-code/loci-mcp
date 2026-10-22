@@ -44,7 +44,11 @@ from mcp_server.search import (
     _search_memories,
     _search_memories_graph_boost,
 )
-from mcp_server.storage import ACTIVE_ROW_SQL, _log_access
+from mcp_server.storage import (
+    ACTIVE_ROW_SQL,
+    _log_access,
+    visibility_condition,
+)
 from mcp_server.tools.maintenance import _health_check
 
 logger = logging.getLogger(__name__)
@@ -67,24 +71,8 @@ def _visibility_condition(include_deleted: bool, include_superseded: bool,
     `include_deleted` even when it was superseded as well, exactly like the
     listing behaved before expired rows were separated out.
     """
-    if include_deleted and include_superseded:
-        base = "TRUE"
-    elif include_deleted:
-        base = "(deleted_at IS NOT NULL OR superseded_by IS NULL)"
-    elif include_superseded:
-        base = "deleted_at IS NULL"
-    elif include_expired:
-        base = "superseded_by IS NULL AND deleted_at IS NULL"
-    else:
-        base = ACTIVE_ROW_SQL
-    if include_expired:
-        return base
-    # Expired rows are neither active history nor forgotten: only an explicit
-    # `include_expired` exposes them. Deleted/superseded rows stay visible
-    # through their own flag, because a TTL does not change their history.
-    return (f"({base}) AND (deleted_at IS NOT NULL OR "
-            f"superseded_by IS NOT NULL OR expires_at IS NULL OR "
-            f"expires_at > NOW())")
+    return visibility_condition(include_deleted, include_superseded,
+                                include_expired)
 
 
 def _is_expired(value: Any) -> bool:
@@ -158,6 +146,16 @@ def recall(
         bool,
         Field(description="Also return superseded memories (history). Forgotten "
                           "memories stay hidden.")] = False,
+    include_deleted: Annotated[
+        bool,
+        Field(description="Also return soft-forgotten memories (recognizable by "
+                          "`forgotten: true`). Superseded history stays hidden "
+                          "unless `include_superseded` is also set.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Also return memories whose TTL (`expires_at`) has "
+                          "passed. They carry `expired: true` and are hidden "
+                          "from every active read otherwise.")] = False,
     graph_boost: Annotated[
         bool,
         Field(description="Add memories of entities connected in the graph. "
@@ -340,7 +338,8 @@ def recall(
             hybrid=hybrid, tables=tables,
             updated_after=updated_after, metadata_filter=metadata_filter,
             exclude_relation_context=not include_relation_context,
-            stats=stats,
+            stats=stats, include_expired=include_expired,
+            include_deleted=include_deleted,
         )
 
         # Graph-enhanced retrieval when enabled
@@ -351,6 +350,9 @@ def recall(
                 updated_after=updated_after, metadata_filter=metadata_filter,
                 exclude_relation_context=not include_relation_context,
                 all_projects=all_projects,
+                include_expired=include_expired,
+                include_deleted=include_deleted,
+                warnings=warnings,
             )
             if results and all(r.get("_relevance_score") is None
                                for r in results if isinstance(r, dict)):
@@ -412,7 +414,25 @@ def recall(
     finally:
         conn.close()
 
-    rows = [project_row(r, fields) for r in results if isinstance(r, dict)]
+    rows = []
+    expired_count = 0
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        item = project_row(r, fields)
+        if r.get("deleted_at"):
+            item["forgotten"] = True
+            if item.get("superseded_by") == SENTINEL_FORGOTTEN:
+                item["superseded_by"] = None
+        if _is_expired(r.get("expires_at")):
+            expired_count += 1
+            if fields is None or "expired" in fields:
+                item["expired"] = True
+        rows.append(item)
+    if expired_count:
+        warnings.append(
+            f"{expired_count} result(s) have an expired TTL: they are not "
+            f"active memories anymore")
 
     # An empty result set is ambiguous: the memory may simply not exist, or
     # a filter may have dropped it. Name *every* filter that removed
@@ -446,6 +466,14 @@ def recall(
             reasons.append(
                 f"{dropped_by_superseded} hit(s) were not superseded "
                 f"(only_superseded=true)")
+        if metadata_filter:
+            reasons.append(
+                f"metadata_filter={metadata_filter!r} may have excluded the "
+                f"matching rows")
+        if updated_after:
+            reasons.append(
+                f"updated_after={updated_after!r} may have excluded the "
+                f"matching rows")
         if reasons:
             warnings.append("no results: " + "; ".join(reasons))
         elif candidates:
@@ -910,7 +938,8 @@ def get_memory(
 
 
 def _relation_context_memories(cur, target: str, tables: list[str],
-                               include_superseded: bool) -> list[dict]:
+                               include_superseded: bool,
+                               include_expired: bool = False) -> list[dict]:
     """Relation-context sentences attached to the edges of an entity.
 
     `relate(context=...)` stores the sentence under the synthetic entity
@@ -928,10 +957,10 @@ def _relation_context_memories(cur, target: str, tables: list[str],
             "(metadata->>'from' = %s OR metadata->>'to' = %s)",
         ]
         params: list[Any] = [target, target]
-        if include_superseded:
-            conditions.append("deleted_at IS NULL")
-        else:
-            conditions.append(ACTIVE_ROW_SQL)
+        conditions.append(visibility_condition(
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+        ))
         cur.execute(
             f"SELECT * FROM {table} WHERE {' AND '.join(conditions)}",
             params,
@@ -947,7 +976,8 @@ def _relation_context_memories(cur, target: str, tables: list[str],
 
 
 def _count_entity_memories(cur, target: str, tables: list[str],
-                           include_superseded: bool) -> int:
+                           include_superseded: bool,
+                           include_expired: bool = False) -> int:
     """Number of memories that belong to an entity, across the given tables.
 
     The count is taken over the union of the tables, so a memory that exists
@@ -956,10 +986,9 @@ def _count_entity_memories(cur, target: str, tables: list[str],
     """
     if not tables:
         return 0
-    if include_superseded:
-        where = "entity = %s AND deleted_at IS NULL"
-    else:
-        where = ("entity = %s AND " + ACTIVE_ROW_SQL + "")
+    where = ("entity = %s AND " + visibility_condition(
+        include_superseded=include_superseded,
+        include_expired=include_expired))
     parts = [
         f"SELECT COALESCE(content_hash, id) AS key FROM {table} WHERE {where}"
         for table in tables
@@ -981,6 +1010,12 @@ def get_entity(name: Annotated[
     include_superseded: Annotated[
         bool,
         Field(description="Also include superseded memories.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Also include memories whose TTL has passed. They "
+                          "carry `expired: true`; without this flag an expired "
+                          "row stays hidden even when "
+                          "`include_superseded` is set.")] = False,
     entity: Annotated[
         str | None,
         Field(description="Entity to look up. Alias: `name`.")] = None,
@@ -1060,13 +1095,14 @@ def get_entity(name: Annotated[
         memories = _search_memories(cur, None, None, None, target,
                                     limit + offset + 1, project,
                                     include_superseded=include_superseded,
+                                    include_expired=include_expired,
                                     tables=tables)
         total = _count_entity_memories(cur, target, used_tables,
-                                       include_superseded)
+                                       include_superseded, include_expired)
         # The context sentence of an edge belongs to both of its endpoints.
         known_ids = {m.get("id") for m in memories}
         for row in _relation_context_memories(
-            cur, target, used_tables, include_superseded
+            cur, target, used_tables, include_superseded, include_expired
         ):
             if row.get("id") in known_ids:
                 continue
@@ -1142,8 +1178,21 @@ def get_entity(name: Annotated[
             f"showing {len(window)} of {total} memories of {target!r}; use "
             f"offset={offset + limit} to page through the rest"
         )
+    projected: list[dict] = []
+    expired_count = 0
+    for m in window:
+        item = project_row(m, fields)
+        if _is_expired(m.get("expires_at")):
+            expired_count += 1
+            if fields is None or "expired" in fields:
+                item["expired"] = True
+        projected.append(item)
+    if expired_count:
+        warnings.append(
+            f"{expired_count} memory/memories of {target!r} have an expired "
+            f"TTL: they are not active anymore")
     return ok(STATUS_OK, entity=target, details=entity_data,
-              memories=[project_row(m, fields) for m in window],
+              memories=projected,
               total=total, relation_context_count=relation_context_count,
               count=len(window), offset=offset,
               has_more=has_more,
@@ -1305,8 +1354,7 @@ def list_entities(
             context_flag = "COALESCE(metadata->>'relation_context', 'false') <> 'true'"
             cur.execute(
                 f"SELECT COUNT(*) FROM (SELECT entity FROM {table} "
-                f"WHERE entity IS NOT NULL AND superseded_by IS NULL "
-                f"AND deleted_at IS NULL "
+                f"WHERE entity IS NOT NULL AND " + ACTIVE_ROW_SQL + " "
                 f"GROUP BY entity HAVING bool_or({context_flag})) e "
                 f"WHERE NOT EXISTS (SELECT 1 FROM entities en "
                 f"WHERE en.name = e.entity AND en.project = %s)",

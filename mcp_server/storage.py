@@ -19,6 +19,69 @@ ACTIVE_ROW_SQL = (
     "AND (expires_at IS NULL OR expires_at > NOW())"
 )
 
+
+def visibility_condition(include_deleted: bool = False,
+                         include_superseded: bool = False,
+                         include_expired: bool = False) -> str:
+    """SQL filter for the orthogonal visibility flags.
+
+    Active rows are always visible; `include_superseded` adds history,
+    `include_deleted` adds forgotten rows, and `include_expired` adds rows
+    whose TTL has passed. Without `include_expired`, an expired row stays
+    hidden even when `include_deleted` or `include_superseded` is set: a TTL
+    does not turn a row into history or make it a forgotten one.
+    """
+    if include_deleted and include_superseded:
+        base = "TRUE"
+    elif include_deleted:
+        base = "(deleted_at IS NOT NULL OR superseded_by IS NULL)"
+    elif include_superseded:
+        base = "deleted_at IS NULL"
+    elif not include_expired:
+        # No history flag: the active-row predicate already carries the TTL.
+        return ACTIVE_ROW_SQL
+    else:
+        base = "superseded_by IS NULL AND deleted_at IS NULL"
+    if include_expired:
+        return base
+    # The TTL is orthogonal to history: an expired row stays hidden even when
+    # forgotten or superseded rows are requested.
+    return f"({base}) AND (expires_at IS NULL OR expires_at > NOW())"
+
+
+def clear_dangling_supersede(cur, tables: list[str] | None = None) -> int:
+    """Drop `superseded_by` links that point at a row that no longer exists.
+
+    A hard delete of a replacement leaves the old row marked as superseded by
+    an id that is gone: the row then stays invisible to every read even though
+    nothing supersedes it any more. Called after hard deletes and imports so a
+    dangling link can never make a memory permanently unreachable.
+    """
+    from mcp_server.scopes import _all_mem_tables  # avoid import cycle
+
+    targets = tables if tables is not None else _all_mem_tables(cur)
+    all_ids: set[str] = set()
+    for table in targets:
+        cur.execute(f"SELECT id FROM {table}")
+        all_ids |= {row[0] for row in cur.fetchall()}
+    repaired = 0
+    for table in targets:
+        if all_ids:
+            cur.execute(
+                f"UPDATE {table} SET superseded_by = NULL "
+                "WHERE superseded_by IS NOT NULL AND superseded_by <> %s "
+                "AND superseded_by <> ALL(%s)",
+                (SENTINEL_FORGOTTEN, sorted(all_ids)),
+            )
+        else:
+            cur.execute(
+                f"UPDATE {table} SET superseded_by = NULL "
+                "WHERE superseded_by IS NOT NULL AND superseded_by <> %s",
+                (SENTINEL_FORGOTTEN,),
+            )
+        repaired += max(cur.rowcount, 0)
+    return repaired
+
 logger = logging.getLogger(__name__)
 
 def _store_memory(

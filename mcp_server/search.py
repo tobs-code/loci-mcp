@@ -18,7 +18,7 @@ from mcp_server.scopes import (
     _retrieval_tables,
     _scope_label,
 )
-from mcp_server.storage import ACTIVE_ROW_SQL
+from mcp_server.storage import ACTIVE_ROW_SQL, visibility_condition
 from mcp_server.scoring import (
     _blend_scores,
     _clamp01,
@@ -186,6 +186,8 @@ def _search_memories_rrf(
     include_embedding: bool = False,
     include_superseded: bool = False,
     min_similarity: float | None = None,
+    include_expired: bool = False,
+    include_deleted: bool = False,
     k: int = RRF_K,
     tables: list[str] | None = None,
     updated_after: str | None = None,
@@ -233,11 +235,11 @@ def _search_memories_rrf(
     for table in tables:
         conditions = ["TRUE"]
         params: list[Any] = []
-        if include_superseded:
-            # Superseded history is retrievable, intentionally deleted rows are not.
-            conditions.append("deleted_at IS NULL")
-        else:
-            conditions.append(ACTIVE_ROW_SQL)
+        conditions.append(visibility_condition(
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+        ))
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
@@ -455,6 +457,8 @@ def _search_memories(
     recent_first: bool = False,
     exclude_relation_context: bool = False,
     stats: dict[str, Any] | None = None,
+    include_expired: bool = False,
+    include_deleted: bool = False,
 ) -> list[dict]:
     """
     Wrapper for search functions. Uses RRF when hybrid=True, otherwise legacy search.
@@ -468,6 +472,8 @@ def _search_memories(
         return _search_memories_rrf(
             cur, query_embedding, query_text, mem_type, entity, limit, project,
             include_decay, include_embedding, include_superseded, min_similarity,
+            include_expired=include_expired,
+            include_deleted=include_deleted,
             tables=tables, updated_after=updated_after,
             metadata_filter=metadata_filter,
             exclude_relation_context=exclude_relation_context, stats=stats,
@@ -536,10 +542,11 @@ def _search_memories(
         conditions.extend(extra_conditions)
         params.extend(extra_params)
 
-        if include_superseded:
-            conditions.append("deleted_at IS NULL")
-        else:
-            conditions.append(ACTIVE_ROW_SQL)
+        conditions.append(visibility_condition(
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+        ))
 
         where = " AND ".join(conditions)
         cur.execute(
@@ -645,10 +652,18 @@ def _search_memories_graph_boost(
     metadata_filter: dict | None = None,
     exclude_relation_context: bool = False,
     all_projects: bool = False,
+    include_expired: bool = False,
+    include_deleted: bool = False,
+    warnings: list[str] | None = None,
 ) -> list[dict]:
     """
     Augments search results with memories from connected entities via the graph.
     Merges graph candidates with RRF scores.
+
+    A `graph_entity` that has no graph node and no memories is a silent no-op
+    otherwise: the caller asked to expand a neighbourhood that does not exist
+    and would read the unchanged result as a complete one. The warning names
+    the entity and where it was looked up.
     """
     tables = None
     name_json = json.dumps(entity)
@@ -708,7 +723,10 @@ def _search_memories_graph_boost(
             for table in tables:
                 cur.execute(
                     f"SELECT * FROM {table} "
-                    f"WHERE entity = %s AND " + ACTIVE_ROW_SQL + ""
+                    f"WHERE entity = %s AND "
+                    + visibility_condition(
+                        include_deleted=include_deleted,
+                        include_expired=include_expired)
                     + extra_sql
                     + " LIMIT 5",
                     [entity_name] + extra_params,
@@ -744,6 +762,26 @@ def _search_memories_graph_boost(
                     existing_ids.add(d["id"])
                     graph_results.append(d)
 
+        if not graph_entities:
+            # Distinguish an isolated node (no neighbours) from a name that
+            # has no node at all: only the latter is a meaningless expansion.
+            node_exists = False
+            for label in labels:
+                cur.execute(
+                    f"SELECT * FROM cypher('memory_graph', $$ "
+                    f"MATCH (a:{label} {{name: {name_json}}}) RETURN a $$) "
+                    f"AS (a agtype) LIMIT 1"
+                )
+                if cur.fetchone():
+                    node_exists = True
+                    break
+            if not node_exists and warnings is not None:
+                scope_label = ("every scope" if all_projects
+                               else (project or "the global scope"))
+                warnings.append(
+                    f"graph_boost: entity {entity!r} has no graph node in "
+                    f"{scope_label}, so there was nothing to expand; the "
+                    f"result contains query hits only (create it with relate)")
         conn.commit()
     except Exception as e:
         conn.rollback()

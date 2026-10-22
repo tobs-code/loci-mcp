@@ -21,7 +21,7 @@ from mcp_server.scopes import (
 )
 from mcp_server.scoring import _content_hash, _gen_id, _now
 from mcp_server.search import _extra_conditions
-from mcp_server.storage import _deduplicate
+from mcp_server.storage import _deduplicate, clear_dangling_supersede
 
 logger = logging.getLogger(__name__)
 
@@ -113,24 +113,44 @@ def _export_excluded_counts(cur, project: str | None,
 
 
 def _export_graph(cur, project: str | None,
-                  only_global: bool = False) -> dict:
-    """Entities and relations for the backup (scoped when project is given)."""
+                  only_global: bool = False,
+                  entity: str | None = None) -> dict:
+    """Entities and relations for the backup (scoped when project is given).
+
+    `entity` narrows the graph to that node and its incident edges, matching
+    the memory filter: exporting only one entity's memories but the whole
+    graph made the backup say more than the caller asked for.
+    """
     scope_name = "global" if only_global else project
-    scope_filter = "WHERE project = %s" if scope_name else ""
-    params: tuple[Any, ...] = (scope_name,) if scope_name else ()
+    conditions: list[str] = []
+    params: list[Any] = []
+    if scope_name:
+        conditions.append("project = %s")
+        params.append(scope_name)
+    if entity:
+        conditions.append("name = %s")
+        params.append(entity)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     cur.execute(
-        f"SELECT name, type, project FROM entities {scope_filter} ORDER BY project, name",
+        f"SELECT name, type, project FROM entities {where} "
+        f"ORDER BY project, name",
         params,
     )
     entities = [{"name": r[0], "type": r[1], "project": r[2]} for r in cur.fetchall()]
-    rel_filter = "WHERE e1.project = %s" if scope_name else ""
+    rel_conditions = (["e1.project = %s"] if scope_name else [])
+    rel_params: list[Any] = [scope_name] if scope_name else []
+    if entity:
+        rel_conditions.append("(e1.name = %s OR e2.name = %s)")
+        rel_params.extend([entity, entity])
+    rel_filter = ("WHERE " + " AND ".join(rel_conditions)
+                  if rel_conditions else "")
     cur.execute(
         f"SELECT e1.name, e2.name, r.relation_type, r.weight, e1.project "
         f"FROM relations r "
         f"JOIN entities e1 ON e1.id = r.source_id "
         f"JOIN entities e2 ON e2.id = r.target_id {rel_filter} "
         f"ORDER BY e1.project, e1.name, e2.name",
-        params,
+        rel_params,
     )
     relations = [
         {"from_entity": r[0], "to_entity": r[1], "relation_type": r[2],
@@ -208,7 +228,8 @@ def export_memories(
                                      entity=entity, mem_type=mem_type,
                                      updated_after=updated_after,
                                      metadata_filter=metadata_filter)
-        graph = (_export_graph(cur, project, only_global=only_global)
+        graph = (_export_graph(cur, project, only_global=only_global,
+                               entity=entity)
                  if (include_graph and format != "jsonl") else None)
         excluded = ((0, 0) if include_superseded
                     else _export_excluded_counts(cur, project, only_global))
@@ -253,6 +274,16 @@ def export_memories(
         records.append(record)
 
     warnings: list[str] = []
+    if format == "jsonl" and include_graph:
+        warnings.append(
+            "format='jsonl' has no graph: include_graph was ignored. Use "
+            "format='json' to back up entities and relations")
+    if graph is not None and (mem_type or updated_after or metadata_filter):
+        warnings.append(
+            "the memory filters (mem_type/updated_after/metadata_filter) do "
+            "not apply to the graph: entities and relations were exported in "
+            "full for the selected scope; pass include_graph=false for a "
+            "memory-only backup")
     now = datetime.now(timezone.utc)
     expired_count = sum(
         1 for r in rows
@@ -580,9 +611,14 @@ def import_memories(
                 graph_relations_created += sum(
                     1 for edge in restored if edge.get("status") == "created")
 
+        repaired_links = 0
         if dry_run:
             conn.rollback()
         else:
+            # A record can carry a `superseded_by` id that was not part of the
+            # import (or whose replacement was hard-deleted). Without repair
+            # that row would stay invisible forever.
+            repaired_links = clear_dangling_supersede(cur)
             conn.commit()
     except Exception as e:
         conn.rollback()
@@ -595,6 +631,11 @@ def import_memories(
               "invalid": len(errors)}
     if dry_run:
         result["dry_run"] = True
+        # `imported` is the dry-run preview of what would be written; the
+        # explicit key stops an agent from reading it as "already done".
+        result["would_create"] = imported
+    elif repaired_links:
+        result["repaired_superseded_links"] = repaired_links
     if graph is not None:
         # `graph_entities`/`graph_relations` count the records the import
         # processed; the `*_created` keys count what did not exist before.
@@ -643,6 +684,11 @@ def import_memories(
         warnings.append(
             "dry-run: nothing was written; the counts describe what an "
             "import would do")
+    if not dry_run and repaired_links:
+        warnings.append(
+            f"{repaired_links} superseded link(s) pointed at a memory that "
+            f"was not part of the import; they were cleared so those rows "
+            f"stay readable as history")
     if skipped_parts:
         warnings.append("import skipped: " + "; ".join(skipped_parts))
     return ok(STATUS_OK, warnings=warnings, **result)

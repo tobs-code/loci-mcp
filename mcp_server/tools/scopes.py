@@ -15,6 +15,7 @@ from pydantic import Field
 
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
+from mcp_server.storage import clear_dangling_supersede
 from mcp_server.scopes import (
     _all_mem_tables,
     _mem_table,
@@ -203,6 +204,10 @@ def drop_project(
         cur.execute("SET search_path TO public")
         cur.execute(f"DROP TABLE IF EXISTS {table}")
         cur.execute("DELETE FROM projects WHERE suffix = %s", (suffix,))
+        # A global fact superseded by a fact of this project now points at an
+        # id that no longer exists: clear that link so the old fact becomes
+        # readable history instead of staying invisible forever.
+        clear_dangling_supersede(cur)
         conn.commit()
     except Exception as e:
         conn.rollback()

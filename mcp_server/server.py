@@ -18,6 +18,7 @@ from mcp_server.tools.maintenance import (
     contradictions_report,
     server_health,
     stats_resource,
+    verify_integrity,
 )
 from mcp_server.tools.memory import (
     forget,
@@ -60,6 +61,7 @@ _TOOLS = (
     find_connections,
     find_paths,
     contradictions_report,
+    verify_integrity,
     server_health,
     export_memories,
     import_memories,

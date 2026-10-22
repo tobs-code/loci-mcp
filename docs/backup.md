@@ -50,10 +50,13 @@ import_memories(data=<export data>, format="json")
 | `format` | `json` (default) or `jsonl`. |
 | `skip_duplicates` | Skip records whose content already exists when the record has **no** id (default `true`). A record whose id already exists is always skipped - that is what makes a re-import idempotent. |
 | `fuzzy_threshold` | Similarity threshold for semantic dedup of records without an id. |
-| `dry_run` | Validate and count without writing anything. |
+| `dry_run` | Validate and count without writing anything; `would_create` names how many records an import would add. |
 
 Records keep their `id`, TTL (`expires_at`), timestamps and `superseded_by`, so
-a re-import is idempotent and restores the exact state. Project tables are recreated on
+a re-import is idempotent and restores the exact state. A `superseded_by` link
+whose target is missing from the backup is cleared with a warning (otherwise the
+row would stay unreadable forever; `verify_integrity` reports the same case).
+Project tables are recreated on
 demand, entities and relations are upserted with MERGE. `graph_entities` and
 `graph_relations` count the processed records; `graph_entities_created` and
 `graph_relations_created` count the ones that did not exist before (MERGE
