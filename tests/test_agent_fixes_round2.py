@@ -38,7 +38,10 @@ def test_remember_warns_when_it_re_adds_a_superseded_fact():
 
 def test_remember_warns_on_a_semantic_match_with_a_superseded_fact():
     old_id = remember("The deploy target is the blue environment")["id"]
-    remember("The deploy target is the green environment", supersede=old_id)
+    # The replacing fact is unrelated on purpose: a one-word variant of the
+    # old fact is above the semantic dedupe floor (0.85) and would be caught
+    # as a duplicate before the superseded-match warning could fire.
+    remember("The vault password rotates monthly", supersede=old_id)
 
     result = remember("The deploy target is the blue environment",
                       dedupe="semantic")

@@ -151,10 +151,11 @@ def test_nli_retries_once_on_an_unparseable_response(monkeypatch):
 
     monkeypatch.setattr(ic, "_get_session", lambda: FakeSession())
 
-    scores, partial = ic.nli_detailed("A", ["B"])
+    scores, partial, failed = ic.nli_detailed("A", ["B"])
 
     assert scores == [0.91]
     assert partial is None
+    assert failed == []
     assert len(calls) == 2
 
 

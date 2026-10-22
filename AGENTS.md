@@ -55,7 +55,7 @@ holds for an invalid call (missing argument, wrong type): the argument check
 answers with the same envelope (`error` names the argument) instead of a raw
 validation error.
 
-## MCP Tools (21 total)
+## MCP Tools (23 total)
 
 ### Write
 | Tool | Description |
@@ -63,8 +63,10 @@ validation error.
 | `remember` | Store a fact/decision/learning with auto-embedding, dedup mode (`dedupe`), supersede variants (`supersede`, `supersede_content`, `supersede_last`), optional contradiction check; the answer names the `scope`/`project` it wrote to |
 | `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, `dedupe`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`, optional `check_contradictions`; every entry names its `scope`/`project` |
 | `update_memory` | Update content, importance, or metadata (re-embeds on content change) |
+| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`; invalid/unknown entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `entity="*"` empties a whole project (soft by default: recoverable rows, the scope itself survives - `drop_project` removes the scope completely); `dry_run` previews exactly what the real call removes; `counts` reports memories/entities/relations separately |
 | `restore_memory` | Bring a soft-forgotten memory back (clears `deleted_at` and the forgotten sentinel); only soft-forgotten rows can be restored |
+| `touch_memory` | Bump `updated_at` without changing the content (refreshes the decay recency); optional `importance`; unknown ids answer `not_found` |
 
 Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 `pattern`, `incident`, `runbook`, `context`, `observation`, `convention`,
@@ -260,6 +262,18 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 - `remember` warns when the new content matches a **superseded** memory: the
   fact is still stored as active (an intentional revert is legitimate), but the
   response names the old id and its replacement so the fork is visible.
+- `remember`/`remember_batch` also warn when the new content is a
+  **near-duplicate** of an active memory (cosine similarity at or above
+  `NEAR_DUPLICATE_THRESHOLD`, 0.75) that dedupe did not reject. The fact is
+  still stored - the warning names the similar id and the measured similarity,
+  so a silent fork or a reworded duplicate is visible. The check is skipped
+  with `dedupe="off"` (that mode explicitly asks for every write to land).
+  A one-word change (0.857 for the fake test embedding) lands in this window.
+- A cross-scope supersede is named, never silent: when a project write
+  invalidates a fact of the shared `memories` table (the contradiction check,
+  or an explicit `supersede` of a global id), the fact disappears from
+  **every** scope. The answer carries `cross_scope_superseded` (the ids) and a
+  `cross-scope supersede` warning, and a per-entry one in `remember_batch`.
 - `include_superseded=true` exposes superseded history but never rows that were
   forgotten (`deleted_at` is set), so soft deletion stays invisible to normal
   reads. `only_superseded=true` in `recall` returns the invalidated facts only.
@@ -458,8 +472,13 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
 - `import_memories` restores ids and timestamps, recreates per-project tables
   on demand and upserts entities/relations with MERGE (idempotent). Without
   `project` every record keeps its export scope; with `project` all records go
-  into that project. Re-importing the same file reports those ids as `skipped`;
-  `skip_duplicates=false` inserts them again instead. `graph_entities` and
+  into that project. A record whose id already exists in the target scope is
+  always `skipped` (that is what makes a re-import idempotent);
+  `skip_duplicates=false` only disables the *content* dedupe for records
+  **without** an id. When anything was skipped the answer warns and splits the
+  count in `skipped_reasons` (`id_exists`, `duplicate_content`,
+  `empty_content`), so an idempotent re-import is distinguishable from a
+  backup that silently lost rows. `graph_entities` and
   `graph_relations` count the processed records; `graph_entities_created` and
   `graph_relations_created` count the ones that did not exist before (MERGE
   updates an existing node/edge instead of duplicating it).
@@ -505,7 +524,7 @@ it explicitly.
 | `relate` | `from_entity`, `to_entity` (not `from`, `to`), `weight` (0..1) | Source and target entity names; `weight` is the edge strength |
 | `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent); unlike `remember_batch` it is all-or-nothing - one invalid edge aborts the whole call |
 | `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
-| `recall` | `project` (`"*"` = every scope), `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `include_relation_context`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `include_relation_context=false` hides the edge sentences from the ranking; `offset` pages (`has_more`/`next_offset`); an unknown project falls back to the global scope and says so in `warnings`; the answer names every filter that emptied the result and reports `scopes_searched` |
+| `recall` | `project` (`"*"` = every scope), `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `limit`, `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `include_relation_context`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `include_relation_context=false` hides the edge sentences from the ranking; `limit` caps the ranked result (default 10) and `offset` pages (`has_more`/`next_offset`); an unknown project falls back to the global scope and says so in `warnings`; the answer names every filter that emptied the result and reports `scopes_searched` |
 | `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `contains`, `memory_id`, `include_deleted`, `include_superseded`, `include_relation_context` | Browse without a query; `contains` is a case-insensitive literal substring; `memory_id` is a direct lookup; `include_deleted` lists forgotten rows with `deleted_at` (superseded rows only with `include_superseded` - the two flags are orthogonal); `offset` pages, the response reports `total`/`has_more`/`next_offset` (all after dedup); without `project` or with `project="*"` every scope is listed, `project="global"` only the shared one |
 | `list_entities` | `entity_type`, `project`, `include_global`, `limit`, `offset` | Without `project` or with `project="*"`, lists all scopes; `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden; `entity_type` selects one kind ('graph', 'memory-only', or a raw AGE label); `count` equals `total`; sorted by name so `offset` is stable |
 | `init_context` | `project` (`"*"` = every scope), `include_global`, `detail`, `limit` | every memory reports its `project`; the list holds the most recently changed memories; `projects` names every covered scope (including `"global"`); `graph_entities_count` counts the covered scopes only |
@@ -514,20 +533,23 @@ it explicitly.
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set; the answer names the scope it wrote to; an unknown `supersede` id replaces nothing and warns |
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
 | `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`); an unknown id returns `not_found` before the "nothing to update" validation |
+| `update_batch` | `updates: [{memory_id, content?, importance?, metadata?, entity?, mem_type?, project?}]` | Savepoints: an invalid/unknown/ambiguous entry is reported in its result entry (`partial`), the rest is still applied; `ok` is false only when nothing could be updated |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
-| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of **same-entity** pairs only - cross-entity pairs stay active with `cross_entity: true` and a `resolve skipped` warning |
+| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of **same-entity** pairs only - cross-entity pairs stay active with `cross_entity: true` and a `resolve skipped` warning; a partially failed NLI reports `nli_failures` (`fact_id`, `neighbor_ids`, `reason`) so the unjudged pairs are named |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project`, `dry_run` | `counts` splits memories/entities/relations; `entity="*"` + `project` empties a whole scope (soft by default, hard with `soft=false`; the scope itself survives either way - `drop_project` removes it completely); `dry_run=True` counts exactly what the real call removes |
 | `restore_memory` | `memory_id`, `project` | Reverses a soft delete; only rows with `deleted_at` set can be restored |
+| `touch_memory` | `memory_id`, `importance` (0..1), `project` | Bumps `updated_at` (decay recency) without touching the content; an unknown id answers `not_found` |
 | `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Payload is returned in `data`; graph is only included in JSON exports |
-| `import_memories` | `data` (object or string), `project`, `format`, `skip_duplicates`, `fuzzy_threshold` | Without `project` records keep their export scope |
+| `import_memories` | `data` (object or string), `project`, `format`, `skip_duplicates`, `fuzzy_threshold` | Without `project` records keep their export scope; an id that already exists in the target scope is always skipped (idempotent re-import), a non-empty `skipped` comes with `skipped_reasons` and a warning |
 
 Every tool parameter carries a description in the JSON schema; the table
 above only lists the ones that are easy to get wrong.
 
 Dedupe modes: `exact` (default, content hash), `semantic` (also vector
-similarity, threshold `fuzzy_threshold`, default 0.9), `off` (store everything).
+similarity, threshold `fuzzy_threshold`, default 0.85), `off` (store everything).
 A duplicate answer names the mode that matched (`duplicate_mode`) and the
-measured similarity.
+measured similarity. A near-duplicate that dedupe did not reject (similarity
+>= 0.75) is stored and reported in `warnings`.
 
 `supersede_last` replaces the memory of an entity that matches the new fact
 best (most similar, not the newest) only when the new fact is about the same
@@ -540,12 +562,14 @@ an unrelated fact would destroy it silently.
 - **Session start** → `init_context`
 - **Store user fact** → `remember` with `mem_type="preference"`, attach `entity`
 - **Search past context** → `recall` with `hybrid=true`, `include_decay=true`
+- **Change many facts at once** → `update_batch` (per-entry savepoints, `partial` on bad ids)
 - **Browse without semantics** → `list_memories` / `list_entities` (`offset` pages)
 - **Connect concepts** → `relate` (auto-creates AGE nodes + edges); many at once → `relate_batch`
 - **Undo a relation** → `unrelate`
 - **Explore relationships** → `find_connections` or `find_paths`
 - **Check for stale/wrong facts** → `contradictions_report`
 - **Remove stale data** → `forget` with `soft=true`
+- **Refresh an old fact's recency** → `touch_memory` (no content change)
 - **Undo a soft delete** → `restore_memory` (find the id with `list_memories(include_deleted=true)`)
 - **Remove a whole project** → `drop_project` (after `forget(entity="*")` emptied it)
 - **Which projects exist** → `list_projects`

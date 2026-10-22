@@ -78,7 +78,8 @@ def test_contradictions_report_aggregates_partial_nli_warnings(monkeypatch):
         "mcp_server.tools.maintenance.nli_detailed",
         lambda q, d, *a, **kw: (
             [0.0] * len(d),
-            f"NLI unavailable for 1 of {len(d)} document(s): bad JSON"),
+            f"NLI unavailable for 1 of {len(d)} document(s): bad JSON",
+            [0]),
     )
     result = contradictions_report(entity=entity,
                                    project="nli-partial-report")
@@ -218,9 +219,10 @@ def test_nli_detailed_returns_partial_scores_and_keeps_the_warning(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setattr(ic, "_get_session", lambda: FakeSession())
-    scores, partial = ic.nli_detailed("A", ["B", "C"])
+    scores, partial, failed = ic.nli_detailed("A", ["B", "C"])
     assert scores == [0.95, 0.0]
     assert "1 of 2" in partial
+    assert failed == []
     # The plain wrapper keeps its list contract for existing callers.
     assert ic.nli("A", ["B", "C"]) == [0.95, 0.0]
 

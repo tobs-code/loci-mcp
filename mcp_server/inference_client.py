@@ -39,18 +39,21 @@ def nli_detailed(query: str,
                  documents: list[str],
                  query_entity: str | None = None,
                  document_entities: list[str | None] | None = None,
-                 ) -> tuple[list[float], str | None]:
-    """Return (scores, partial_error).
+                 ) -> tuple[list[float], str | None, list[int]]:
+    """Return (scores, partial_error, failed_indices).
 
     Raises when no document could be judged (outage). `partial_error` is set
     when some documents failed: their score is 0.0 and must not be treated
-    as a clean "neutral" judgment.
+    as a clean "neutral" judgment. `failed_indices` names exactly those
+    documents, so a caller can report which pairs were not judged (a stale
+    inference container that does not send the field yields an empty list,
+    which is why `partial_error` stays authoritative).
 
     The optional entity labels tell the NLI model which subject each fact
     belongs to (older inference containers ignore them silently).
     """
     if not documents:
-        return [], None
+        return [], None, []
     body: dict = {"query": query, "documents": documents}
     if query_entity is not None:
         body["query_entity"] = query_entity
@@ -80,7 +83,15 @@ def nli_detailed(query: str,
         scores = payload.get("contradiction_scores")
         if not error:
             if (isinstance(scores, list) and len(scores) == len(documents)):
-                return scores, payload.get("partial_error")
+                failed = payload.get("failed_indices") or []
+                # Keep only usable indices: a broken or stale payload must not
+                # make a caller name a document that does not exist.
+                if not isinstance(failed, list):
+                    failed = []
+                failed_indices = [i for i in failed
+                                  if isinstance(i, int)
+                                  and 0 <= i < len(documents)]
+                return scores, payload.get("partial_error"), failed_indices
             error = ("response did not contain one contradiction score per "
                      "document")
         last_error = str(error)
@@ -98,7 +109,7 @@ def nli_detailed(query: str,
 def nli(query: str, documents: list[str],
         query_entity: str | None = None,
         document_entities: list[str | None] | None = None) -> list[float]:
-    scores, partial = nli_detailed(
+    scores, partial, _failed = nli_detailed(
         query, documents, query_entity, document_entities)
     if partial:
         logger.warning("%s", partial)

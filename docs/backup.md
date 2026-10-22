@@ -41,7 +41,7 @@ import_memories(data=<export data>, format="json")
 | `data` | The export payload, as the object or as its JSON string. |
 | `project` | Target scope for all records. Without it every record is restored into the scope it was exported from. |
 | `format` | `json` (default) or `jsonl`. |
-| `skip_duplicates` | Skip records whose id already exists instead of inserting them again (default `true`). |
+| `skip_duplicates` | Skip records whose content already exists when the record has **no** id (default `true`). A record whose id already exists is always skipped - that is what makes a re-import idempotent. |
 | `fuzzy_threshold` | Similarity threshold for semantic dedup of records without an id. |
 
 Records keep their `id`, timestamps and `superseded_by`, so a re-import is
@@ -51,8 +51,10 @@ demand, entities and relations are upserted with MERGE. `graph_entities` and
 `graph_relations_created` count the ones that did not exist before (MERGE
 updates an existing node/edge instead of duplicating it).
 
-Re-importing the same file reports the existing ids as `skipped`;
-`skip_duplicates=false` inserts them again instead. Records that fail
+Re-importing the same file reports the existing ids as `skipped`. A non-empty
+`skipped` comes with `skipped_reasons` (`id_exists`, `duplicate_content`,
+`empty_content`) and a warning, so an idempotent re-import is distinguishable
+from a backup that silently lost rows. Records that fail
 validation (bad metadata, blank project, broken row) are counted in `invalid`
 and listed in `errors`; they are a subset of `skipped`, so
 `imported + skipped` still equals the number of records.

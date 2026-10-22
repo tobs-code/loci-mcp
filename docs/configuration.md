@@ -120,6 +120,7 @@ The tuning knobs live in `mcp_server/config.py`:
 | `FTS_WEIGHT` | 0.6 | Weight of the full-text signal in the relevance score. |
 | `RRF_K` | 60 | RRF smoothing constant. |
 | `DEFAULT_MIN_SIMILARITY` | 0.35 | Default vector-hit floor. |
-| `DEFAULT_DUPLICATE_THRESHOLD` | 0.9 | Similarity threshold of `dedupe="semantic"`. |
+| `DEFAULT_DUPLICATE_THRESHOLD` | 0.85 | Similarity threshold of `dedupe="semantic"`. |
+| `NEAR_DUPLICATE_THRESHOLD` | 0.75 | Similarity at which a stored write is reported as a near-duplicate in `warnings`. |
 | `SUPERSEDE_SIMILARITY_MIN` | 0.5 | Topic similarity below which `supersede_last` refuses. |
 | `PROJECT_SCOPE_BOOST` | 0.05 | Tie-breaker in favour of project hits. |

@@ -2,7 +2,11 @@ import json
 import logging
 from typing import Any
 
-from mcp_server.config import DEFAULT_DUPLICATE_THRESHOLD, SENTINEL_FORGOTTEN
+from mcp_server.config import (
+    DEFAULT_DUPLICATE_THRESHOLD,
+    NEAR_DUPLICATE_THRESHOLD,
+    SENTINEL_FORGOTTEN,
+)
 from mcp_server.inference_client import nli
 from mcp_server.scopes import _mem_table, _retrieval_tables
 from mcp_server.scoring import _content_hash, _gen_id, _now
@@ -92,6 +96,58 @@ def _deduplicate(cur, content: str, project: str | None,
             return row[0], "semantic", round(1.0 - float(row[1]), 4)
 
     return None
+
+
+def _find_near_duplicate(cur, content: str, project: str | None,
+                         embedding_vec: list[float] | None = None) -> dict | None:
+    """The active memory that is closest to `content` above the near-dup floor.
+
+    Runs only when `_deduplicate` found no match: the dedupe thresholds say
+    "different fact", but a similarity of at least `NEAR_DUPLICATE_THRESHOLD`
+    still reads like a reworded copy of an existing memory. Storing it anyway
+    is allowed (the caller may want both versions) - this function only
+    reports the match so the response can warn instead of forking silently.
+
+    Returns {"id", "similarity"} or None. Exact content hashes never land
+    here: `_deduplicate` already reports them before this check runs.
+    """
+    if embedding_vec is None:
+        return None
+    c_hash = _content_hash(content)
+    table = _mem_table(project)
+    cur.execute(
+        f"SELECT id, embedding <=> %s::vector AS dist FROM {table} "
+        f"WHERE content_hash <> %s "
+        f"AND superseded_by IS NULL AND deleted_at IS NULL "
+        f"AND embedding IS NOT NULL "
+        f"ORDER BY dist ASC LIMIT 1",
+        (embedding_vec, c_hash),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    similarity = round(1.0 - float(row[1]), 4)
+    if similarity >= NEAR_DUPLICATE_THRESHOLD:
+        return {"id": row[0], "similarity": similarity}
+    return None
+
+
+def _scope_of_id(cur, memory_id: str, store_project: str | None) -> str | None:
+    """Which scope holds `memory_id`: "project", "global" or None (nowhere).
+
+    `supersede=<id>` and a contradiction candidate can name a memory of a
+    different scope than the one the new fact is written to. A project write
+    that invalidates a shared (global) fact hides that fact in EVERY scope,
+    which the response has to say - this function tells the caller when that
+    happened. Ids are unique per scope, so the store table is checked first.
+    """
+    if store_project:
+        cur.execute(f"SELECT 1 FROM {_mem_table(store_project)} WHERE id = %s",
+                    (memory_id,))
+        if cur.fetchone():
+            return "project"
+    cur.execute("SELECT 1 FROM memories WHERE id = %s", (memory_id,))
+    return "global" if cur.fetchone() else None
 
 
 def _find_superseded_match(

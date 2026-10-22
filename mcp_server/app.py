@@ -101,12 +101,15 @@ app = LociFastMCP(
     instructions="""Persistent memory tools for agents.
 
 TOOLS BY TASK
-- Store/change/remove: `remember`, `remember_batch`, `update_memory`, `forget`.
+- Store/change/remove: `remember`, `remember_batch`, `update_memory`,
+  `update_batch`, `forget`.
 - Search/browse/bootstrap: `recall`, `list_memories`, `get_entity`,
   `list_entities`, `init_context`.
 - Graph: `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`.
 - Maintenance/backup: `server_health`, `contradictions_report`,
   `export_memories`, `import_memories`, `list_projects`, `drop_project`.
+- Repair/refresh: `touch_memory` (bump `updated_at`, no content change),
+  `restore_memory` (undo a soft delete).
 
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.

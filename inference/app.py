@@ -44,6 +44,10 @@ class NliResponse(BaseModel):
     # the failed ones are 0.0 and must not be read as "neutral".
     partial_error: str | None = None
     failed: int = 0
+    # Indices of the documents whose score is a placeholder (0.0). A caller
+    # can name exactly which pairs were NOT judged instead of guessing from
+    # the count alone (older clients ignore the field).
+    failed_indices: list[int] = []
 
 
 @app.get("/health")
@@ -87,6 +91,7 @@ def nli(req: NliRequest):
 
     scores: list[float] = []
     failures: list[str] = []
+    failure_indices: list[int] = []
     document_entities = req.document_entities or []
     for index, doc in enumerate(req.documents):
         document_entity = (
@@ -106,6 +111,7 @@ def nli(req: NliRequest):
             logger.warning("NLI failed for one document: %s", exc)
             scores.append(0.0)
             failures.append(str(exc))
+            failure_indices.append(index)
 
     if failures and len(failures) == len(req.documents):
         # Nothing was judged: this is an outage, not a clean scan.
@@ -113,6 +119,7 @@ def nli(req: NliRequest):
             contradiction_scores=scores,
             error=f"NLI unavailable: {failures[0]}",
             failed=len(failures),
+            failed_indices=failure_indices,
         )
     partial_error = None
     if failures:
@@ -122,4 +129,5 @@ def nli(req: NliRequest):
         )
     return NliResponse(contradiction_scores=scores,
                        partial_error=partial_error,
-                       failed=len(failures))
+                       failed=len(failures),
+                       failed_indices=failure_indices)

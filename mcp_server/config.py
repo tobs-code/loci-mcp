@@ -69,7 +69,21 @@ FTS_LANGUAGE = "english"
 
 
 # Similarity threshold used by the "semantic" dedupe mode.
-DEFAULT_DUPLICATE_THRESHOLD = 0.9
+#
+# Calibrated against the live embedding model (jina-embeddings-v5): a
+# paraphrase of a stored fact scores 0.88, an intentional rewrite of one
+# attribute (rate limit 60 -> 120) 0.94, unrelated facts below 0.37. The
+# old 0.9 hid the paraphrase pair - it was stored as a "new" fact next to
+# the old one - so the default sits at 0.85 now.
+DEFAULT_DUPLICATE_THRESHOLD = 0.85
+
+
+# A write that the dedupe check did NOT match still gets flagged when it is
+# at least this close to an active memory: between this value and the dedupe
+# threshold the content reads as a reworded copy, not as a new fact. The
+# caller stores the memory but warns with the id of the near-duplicate, so
+# the agent can supersede deliberately instead of forking silently.
+NEAR_DUPLICATE_THRESHOLD = 0.75
 
 
 # Avoid returning clearly unrelated vector hits unless callers opt out.

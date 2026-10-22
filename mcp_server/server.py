@@ -24,6 +24,8 @@ from mcp_server.tools.memory import (
     remember,
     remember_batch,
     restore_memory,
+    touch_memory,
+    update_batch,
     update_memory,
 )
 from mcp_server.tools.read import (
@@ -41,6 +43,8 @@ _TOOLS = (
     remember,
     remember_batch,
     update_memory,
+    update_batch,
+    touch_memory,
     forget,
     restore_memory,
     recall,

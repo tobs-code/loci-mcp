@@ -67,6 +67,14 @@ def _append_partial_warning(warnings: list[str], partials: list[str]) -> None:
             for p in dict.fromkeys(partials))
 
 
+def _partial_reason(partial: str | None) -> str | None:
+    """The reason inside a /nli partial_error, without the counts."""
+    if not partial:
+        return None
+    match = _NLI_PARTIAL_RE.fullmatch(partial)
+    return match.group("reason").strip() if match else partial
+
+
 def _entities_differ(a: str | None, b: str | None) -> bool:
     """True when two memories are tagged with different entities.
 
@@ -113,6 +121,9 @@ def contradictions_report(entity: Annotated[
     the ids); cross-entity pairs stay untouched. An empty result says in
     `warnings` why it is empty: nothing to compare, no similar pair, or no
     contradiction among the checked pairs.
+    When the NLI provider fails for some pairs, `nli_failures` names exactly
+    which fact/neighbour ids were NOT judged (with the reason), so a partial
+    scan is never mistaken for a clean one.
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
     try:
@@ -206,6 +217,11 @@ def contradictions_report(entity: Annotated[
 
     contradictions: list[dict] = []
     warnings: list[str] = []
+    # Machine-readable account of the pairs NLI did NOT judge: one entry per
+    # fact whose call failed (all its neighbours) and one per fact whose call
+    # failed only for some documents (partial answer). The aggregated warning
+    # above stays the human-readable summary.
+    nli_failures: list[dict] = []
     nli_failed: str | None = None
     checked_pairs = 0
     try:
@@ -228,8 +244,9 @@ def contradictions_report(entity: Annotated[
         # strictly sequential, so a small bounded pool overlaps them. The
         # results are still consumed in candidate order, which keeps the
         # report deterministic.
-        scores_by_fact: dict[str, tuple[list[float], str | None]] = {}
-        nli_errors: list[str] = []
+        scores_by_fact: dict[str, tuple[list[float], str | None, list[int]]] = {}
+        nli_errors: list[tuple[str, str]] = []
+        nli_error_facts: dict[str, list[str]] = {}
         partials: list[str] = []
         if candidate_list:
             workers = min(8, len(candidate_list))
@@ -240,14 +257,21 @@ def contradictions_report(entity: Annotated[
                     try:
                         scores_by_fact[item[0]["id"]] = future.result()
                     except Exception as e:  # noqa: BLE001 - reported below
-                        nli_errors.append(str(e))
+                        nli_errors.append((item[0]["id"], str(e)))
+                        nli_error_facts[item[0]["id"]] = [
+                            neighbour[0] for neighbour in item[1]]
         if nli_errors:
-            nli_failed = f"NLI unavailable: {nli_errors[0]}"
+            nli_failed = f"NLI unavailable: {nli_errors[0][1]}"
             warnings.append(
                 f"scan incomplete: {nli_failed} - the result is not a clean "
                 f"contradiction scan; retry later")
             logger.warning("contradictions_report NLI failed: %s",
-                           nli_errors[0])
+                           nli_errors[0][1])
+            for fact_id, error in nli_errors:
+                nli_failures.append({
+                    "fact_id": fact_id,
+                    "neighbor_ids": nli_error_facts.get(fact_id, []),
+                    "reason": error})
 
         for f, neighbours in candidate_list:
             if len(contradictions) >= limit:
@@ -256,13 +280,19 @@ def contradictions_report(entity: Annotated[
             if scored is None:
                 # This fact's NLI call failed; its pairs were not judged.
                 continue
-            scores, partial = scored
+            scores, partial, failed_indices = scored
             if partial:
                 # Collected here, aggregated into ONE warning after the
                 # loop: a scope-wide check makes one /nli call per fact, and
                 # three identical partial lines are harder to read than a
                 # qualifying summary.
                 partials.append(partial)
+            if failed_indices:
+                nli_failures.append({
+                    "fact_id": f["id"],
+                    "neighbor_ids": [neighbours[i][0] for i in failed_indices
+                                     if 0 <= i < len(neighbours)],
+                    "reason": _partial_reason(partial) or "NLI unavailable"})
             checked_pairs += len(neighbours)
             for (nid, ncontent, nentity), score in zip(neighbours, scores):
                 if len(contradictions) >= limit:
@@ -359,8 +389,16 @@ def contradictions_report(entity: Annotated[
             finally:
                 conn.close()
 
-    return ok(STATUS_OK, count=len(contradictions), results=contradictions,
-              resolved=resolved, warnings=warnings)
+    result: dict[str, Any] = {"count": len(contradictions),
+                              "results": contradictions,
+                              "resolved": resolved,
+                              "warnings": warnings}
+    if nli_failures:
+        # Which pairs were NOT judged, per fact. A stale inference container
+        # that does not send `failed_indices` leaves this empty; the
+        # aggregated warning still names the incomplete scan then.
+        result["nli_failures"] = nli_failures
+    return ok(STATUS_OK, **result)
 
 
 def server_health() -> dict[str, Any]:

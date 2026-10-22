@@ -50,8 +50,10 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, optional contradiction check, `scope` global/project) |
 | `remember_batch` | Store multiple facts (savepoints; per fact: `project`, `scope`, `supersede`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance or metadata |
+| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
 | `restore_memory` | Bring a soft-forgotten memory back; only rows with `deleted_at` set can be restored |
+| `touch_memory` | Bump `updated_at` without changing the content (refreshes the decay recency); optional `importance` |
 
 ### `remember`
 
@@ -69,7 +71,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `supersede_last` | bool | Replace the memory of the same entity that matches the new fact best (most similar, not the newest) - only if the new fact is about the same topic (similarity >= 0.5), otherwise the fact is stored additionally and a warning is returned. |
 | `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
-| `fuzzy_threshold` | number? | Similarity threshold for `dedupe="semantic"` (default 0.9). |
+| `fuzzy_threshold` | number? | Similarity threshold for `dedupe="semantic"` (default 0.85). |
 
 The answer carries `superseded` (the ids that were invalidated) and, with
 `check_contradictions`, a `contradictions` object. A duplicate answer names the
@@ -82,6 +84,17 @@ in the shared table, and later reads and deletes have to use `project="global"`.
 `supersede` and `supersede_content` are checked: an id that does not exist (or
 a content without an active match) produces a warning and replaces nothing -
 the answer never claims a replacement that did not happen.
+
+A stored write that is still very similar to an active memory (cosine
+similarity >= 0.75) is reported in `warnings` as a near-duplicate, naming the
+similar id and the measured similarity. The fact is stored anyway - only the
+silent fork is removed. `dedupe="off"` skips the check, because that mode
+explicitly asks for every write to land.
+
+When the write invalidates a fact of the shared `memories` table (the
+contradiction check or an explicit `supersede` of a global id), the fact
+disappears from every scope. The answer carries `cross_scope_superseded` (the
+ids) and a `cross-scope supersede` warning so that this is never silent.
 
 ### `remember_batch`
 
@@ -99,6 +112,15 @@ next to the facts that were stored. Every entry reports the `scope` and
 looked up in every scope; a memory id is unique per scope, so an id that
 exists in several scopes is refused and the scopes are named (see
 [Scopes](scopes.md)).
+
+### `update_batch`
+
+`updates` is a list of objects with the same fields as `update_memory`
+(`memory_id` is required). Every entry runs in its own savepoint, so an
+invalid, unknown or ambiguous entry is reported in its result entry and the
+rest of the batch is still applied (`status: "partial"`). The answer carries
+`count` and one result per entry; `ok` is only `false` when nothing could be
+updated.
 
 ### `forget`
 
@@ -122,11 +144,19 @@ memory is visible to `recall`/`list_memories` again. Find the id with
 `not_found`. Without `project` an id that exists in several scopes is refused
 (`scopes` names them).
 
+### `touch_memory`
+
+`memory_id`, optional `importance`, `project`. Bumps `updated_at` without
+touching content or embedding, so the cognitive decay treats the fact as
+recent again. The content stays byte-identical (unlike `update_memory`, which
+re-embeds). An unknown id answers `not_found`; without `project` the id is
+looked up in every scope (an ambiguous id is refused, like `update_memory`).
+
 ## Read tools
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted`, `include_superseded`, `include_relation_context` |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `fields`, `limit`, `offset` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden |
@@ -270,9 +300,9 @@ scopes without active memories.
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older, cross-entity pairs stay active (warning) |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older, cross-entity pairs stay active (warning); a partially failed NLI names the unjudged pairs in `nli_failures` (`fact_id`, `neighbor_ids`, `reason`) |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; warns when the default export leaves superseded/forgotten rows out |
-| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones |
+| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved; an id that already exists is always skipped; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |
 | `server_health` | Check Postgres + Inference connectivity; reports `version`, `code_fingerprint` (detects a stale container) and `started_at` |
 

@@ -273,12 +273,23 @@ fact is still stored as active (an intentional revert is legitimate), but the
 response names the old id and its replacement, so the fork is visible instead
 of silently reintroducing an invalidated fact.
 
+A stored fact that is still very similar to an active memory is reported as a
+**near-duplicate** (cosine similarity >= 0.75) without being rejected: the
+warning names the similar id and the measured similarity, so a reworded
+duplicate or a silent fork is visible even when dedupe let it through.
+`dedupe="off"` skips the check by design.
+
+A write that invalidates a fact of the shared `memories` table (the
+contradiction check or an explicit `supersede` of a global id) hides it from
+every scope. That is reported as `cross_scope_superseded` plus a
+`cross-scope supersede` warning.
+
 ## Dedupe modes
 
 | Mode | Detects |
 |------|---------|
 | `exact` (default) | Identical content hash |
-| `semantic` | Additionally vector similarity above `fuzzy_threshold` (default 0.9) |
+| `semantic` | Additionally vector similarity above `fuzzy_threshold` (default 0.85) |
 | `off` | Nothing — every call stores a new memory |
 
 A duplicate answer names the mode that matched (`duplicate_mode`) and the

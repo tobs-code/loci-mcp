@@ -65,13 +65,14 @@ def test_nli_detailed_forwards_the_entity_labels(monkeypatch):
 
     monkeypatch.setattr(inference_client, "_get_session", lambda: _Session())
 
-    scores, partial = inference_client.nli_detailed(
+    scores, partial, failed = inference_client.nli_detailed(
         "Fact A", ["Fact B"],
         query_entity="API", document_entities=["PostgreSQL"],
     )
 
     assert scores == [0.0]
     assert partial is None
+    assert failed == []
     assert captured == {
         "query": "Fact A",
         "documents": ["Fact B"],
@@ -115,7 +116,7 @@ def test_report_sends_the_fact_entities_to_nli(monkeypatch):
             query=query, documents=documents,
             query_entity=query_entity, document_entities=document_entities,
         )
-        return [0.0] * len(documents), None
+        return [0.0] * len(documents), None, []
 
     import mcp_server.tools.maintenance as maintenance
     monkeypatch.setattr(maintenance, "nli_detailed", fake_nli_detailed)

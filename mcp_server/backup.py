@@ -268,8 +268,11 @@ def import_memories(
         Field(description="Format of `data` (default: json).")] = "json",
     skip_duplicates: Annotated[
         bool,
-        Field(description="Skip records whose id already exists instead of "
-                          "inserting them again.")] = True,
+        Field(description="Skip records whose CONTENT already exists. A "
+                          "record with an id is always skipped when that id "
+                          "exists, so a re-import stays idempotent; this flag "
+                          "only controls the content check for records "
+                          "WITHOUT an id.")] = True,
     fuzzy_threshold: Annotated[
         float | None,
         Field(description="Similarity threshold 0.0-1.0 for semantic dedup of "
@@ -326,6 +329,12 @@ def import_memories(
     conn = get_conn()
     imported = 0
     skipped = 0
+    # Why a record was skipped matters to the caller: an idempotent re-import
+    # ("the id already exists") is not the same as a silently dropped record
+    # ("no content") or a content duplicate that a flag can override.
+    skipped_id_exists = 0
+    skipped_duplicate_content = 0
+    skipped_empty_content = 0
     errors: list[str] = []
     graph_entities = 0
     graph_entities_created = 0
@@ -341,6 +350,7 @@ def import_memories(
             content = rec.get("content") or rec.get("text") or ""
             if not content:
                 skipped += 1
+                skipped_empty_content += 1
                 continue
             try:
                 target = (project if project is not None
@@ -359,6 +369,7 @@ def import_memories(
             cur.execute(f"SELECT 1 FROM {table} WHERE id = %s", (mid,))
             if cur.fetchone():
                 skipped += 1
+                skipped_id_exists += 1
                 continue
 
             emb = rec.get("embedding")
@@ -369,6 +380,7 @@ def import_memories(
                                          rec.get("fuzzy_threshold") or fuzzy_threshold)
                 if duplicate:
                     skipped += 1
+                    skipped_duplicate_content += 1
                     continue
             meta = rec.get("metadata", {})
             if isinstance(meta, str):
@@ -465,4 +477,35 @@ def import_memories(
         result["graph_relations_created"] = graph_relations_created
     if errors:
         result["errors"] = errors[:5]
-    return ok(STATUS_OK, **result)
+    reasons: dict[str, int] = {}
+    if skipped_id_exists:
+        reasons["id_exists"] = skipped_id_exists
+    if skipped_duplicate_content:
+        reasons["duplicate_content"] = skipped_duplicate_content
+    if skipped_empty_content:
+        reasons["empty_content"] = skipped_empty_content
+    if reasons:
+        result["skipped_reasons"] = reasons
+    # A non-empty `skipped` must never be silent: "already imported" (fine and
+    # expected on a re-run) reads very differently from "dropped because it
+    # had no content" (data loss the caller should investigate).
+    skipped_parts: list[str] = []
+    if skipped_id_exists:
+        skipped_parts.append(
+            f"{skipped_id_exists} record(s) already existed with the same id "
+            f"(a re-import is idempotent; the existing rows were not changed)")
+    if skipped_duplicate_content:
+        skipped_parts.append(
+            f"{skipped_duplicate_content} record(s) without an id matched an "
+            f"existing memory's content (pass skip_duplicates=false to import "
+            f"them anyway)")
+    if skipped_empty_content:
+        skipped_parts.append(
+            f"{skipped_empty_content} record(s) had no content")
+    if errors:
+        skipped_parts.append(
+            f"{len(errors)} record(s) were invalid (see errors)")
+    warnings: list[str] = []
+    if skipped_parts:
+        warnings.append("import skipped: " + "; ".join(skipped_parts))
+    return ok(STATUS_OK, warnings=warnings, **result)

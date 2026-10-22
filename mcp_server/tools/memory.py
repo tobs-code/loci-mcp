@@ -47,7 +47,9 @@ from mcp_server.storage import (
     _find_by_content,
     _find_by_id,
     _find_last_for_entity,
+    _find_near_duplicate,
     _find_superseded_match,
+    _scope_of_id,
     _store_memory,
     _supersede,
 )
@@ -125,6 +127,69 @@ def _sanitize_batch_fact(value: Any) -> Any:
 BatchFactInput = Annotated[BatchFact, BeforeValidator(_sanitize_batch_fact)]
 
 
+def _near_duplicate_warning(near_dup: dict) -> str:
+    """Warning for a write that dedupe did not match but that still reads
+    like a reworded copy of an active memory (remember + remember_batch)."""
+    return (
+        f"near-duplicate: active memory {near_dup['id']} matches this content "
+        f"with similarity {near_dup['similarity']} - the write looks like a "
+        f"reworded copy; pass supersede={near_dup['id']} to replace it, or "
+        f"dedupe='off' to store without this warning"
+    )
+
+
+def _cross_scope_warning(ids: list[str]) -> str:
+    """Warning for a project write that invalidated shared (global) facts:
+    they are hidden in EVERY scope now, not only in the project."""
+    return (
+        f"cross-scope supersede: {len(ids)} shared (global) "
+        f"memory/memories invalidated by this project write: "
+        + ", ".join(ids)
+        + " - a global fact is hidden in EVERY scope now, not only in this "
+        "project"
+    )
+
+
+class BatchUpdate(BaseModel):
+    """One entry of an update batch. Only `memory_id` is required."""
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _allow_missing_id(cls, data: Any) -> Any:
+        """A malformed entry must be reported individually, not abort the
+        batch: the runtime validation answers "memory_id is required"."""
+        if isinstance(data, dict) and "memory_id" not in data:
+            return {**data, "memory_id": None}
+        return data
+
+    memory_id: Any = Field(json_schema_extra={"type": "string"},
+                           description="Id of the memory to update (required).")
+    content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                         description="New content; re-embeds the memory.")
+    importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
+                            description="New importance in 0.0-1.0.")
+    metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]},
+                          description="Replacement metadata object.")
+    entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                        description="New entity the memory belongs to.")
+    mem_type: Any = Field(default=None, json_schema_extra={"type": "string"},
+                          description="New memory type. " + MEMORY_TYPE_HELP)
+    project: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
+                         description="Overrides the batch project for this entry.")
+
+
+def _sanitize_batch_update(value: Any) -> Any:
+    """Accept a malformed entry without losing the whole batch."""
+    if isinstance(value, (dict, BatchUpdate)):
+        return value
+    return {"memory_id": None, "_not_an_object": True}
+
+
+BatchUpdateInput = Annotated[BatchUpdate, BeforeValidator(_sanitize_batch_update)]
+
+
 def remember(
     content: Annotated[str, Field(description="The fact to remember (non-empty).")],
     mem_type: Annotated[
@@ -165,7 +230,7 @@ def remember(
     fuzzy_threshold: Annotated[
         float | None,
         Field(description="Similarity threshold 0.0-1.0 for semantic dedup "
-                          "(default 0.9). Only used by dedupe='semantic'.")] = None,
+                          "(default 0.85). Only used by dedupe='semantic'.")] = None,
     dedupe: Annotated[
         Literal["exact", "semantic", "off"],
         Field(description="Duplicate detection: 'exact' (content hash, default), "
@@ -192,7 +257,12 @@ def remember(
     `dedupe` selects how duplicates are detected: "exact" (default, content
     hash), "semantic" (also vector similarity, see `fuzzy_threshold`) or "off".
     A duplicate answer names the mode that matched ("exact" or "semantic") and
-    the measured similarity.
+    the measured similarity. A stored memory that is still very similar to an
+    active one (but not similar enough to dedupe) returns a `near-duplicate`
+    warning naming the other id.
+    A project write that invalidates a shared (global) fact returns a
+    `cross-scope supersede` warning plus `cross_scope_superseded`: the global
+    fact is hidden in every scope now, not only in this project.
     `scope` defaults to "project" when a project is given, else "global".
     scope="global" stores in the shared table even when a project is given.
 
@@ -260,6 +330,14 @@ def remember(
         superseded_match = _find_superseded_match(
             cur, content, store_project, emb, fuzzy_threshold, dedupe=dedupe)
 
+        # Also no dedupe match - but possibly still a reworded copy. The
+        # thresholds above call it a different fact; this check only reports
+        # the nearest active memory above the near-duplicate floor so the
+        # response can warn. dedupe='off' means "store everything", so it
+        # also skips this warning.
+        near_dup = (_find_near_duplicate(cur, content, store_project, emb)
+                    if dedupe != "off" else None)
+
         contradictions = []
         contradiction_skip: str | None = None
         nli_unavailable = check_contradictions and nli_configured() is False
@@ -302,6 +380,15 @@ def remember(
                 _supersede(cur, store_project, mem_id, eid)
                 superseded.append(eid)
 
+        # A project write that invalidates a SHARED (global) fact hides that
+        # fact in every scope, not only in this project. Without this check
+        # the response reads like a project-local change, and the agent keeps
+        # trusting a global fact this write just invalidated.
+        cross_scope_superseded = (
+            [old for old in superseded
+             if _scope_of_id(cur, old, store_project) == "global"]
+            if store_project else [])
+
         # Keep context when a replaced fact is superseded: keys of the old
         # metadata that the new memory does not set are merged into it, so a
         # superseding fact does not silently drop provenance (tickets, ...)
@@ -315,6 +402,16 @@ def remember(
                     f"WHERE id = %s AND deleted_at IS NULL",
                     (old_id,))
                 row = cur.fetchone()
+                if not row and store_project:
+                    # A cross-scope supersede replaced a shared fact: its
+                    # metadata lives in the global table, not in the project
+                    # one. The promised merge must not stop at the scope
+                    # boundary either.
+                    cur.execute(
+                        "SELECT metadata FROM memories "
+                        "WHERE id = %s AND deleted_at IS NULL",
+                        (old_id,))
+                    row = cur.fetchone()
                 if not row:
                     continue
                 try:
@@ -349,6 +446,10 @@ def remember(
                 f"invalidated). The new fact was stored as active, so both "
                 f"versions are reachable now; verify this revert is intended"
             )
+        if near_dup:
+            warnings.append(_near_duplicate_warning(near_dup))
+        if cross_scope_superseded:
+            warnings.append(_cross_scope_warning(cross_scope_superseded))
         if contradictions:
             warnings.append(
                 f"superseded {len(contradictions)} contradicting memory/facts")
@@ -376,8 +477,11 @@ def remember(
                                    # agent that asked for a project but wrote
                                    # to the shared scope has to know that:
                                    # later reads and deletes need that name.
-                                   "scope": effective_scope,
-                                   "project": (store_project or "global")}
+                                    "scope": effective_scope,
+                                    "project": (store_project or "global")}
+        if cross_scope_superseded:
+            # Machine-readable: which shared facts this project write hid.
+            payload["cross_scope_superseded"] = cross_scope_superseded
         if check_contradictions:
             contradictions_payload: dict[str, Any] = {
                 "found": bool(contradictions),
@@ -502,6 +606,10 @@ def remember_batch(
     Per-fact 'fuzzy_threshold' overrides the top-level value.
     `dedupe` selects how duplicates are detected: "exact" (default, content
     hash), "semantic" (also vector similarity) or "off".
+    A stored fact that is still very similar to an active one returns a
+    `near-duplicate` warning in its result entry; a project fact that
+    invalidates a shared (global) fact adds `cross_scope_superseded` and a
+    `cross-scope supersede` warning to that entry.
     `scope` sets the default scope for all facts; per-fact 'scope' wins.
     Set check_contradictions=True to NLI-check each fact against the nearest
     active memories of its scope and auto-supersede contradictions (an
@@ -632,6 +740,7 @@ def remember_batch(
                     _ensure_project_table(cur, store_project)
                     ensured.add(store_project)
 
+                near_dup = None
                 if skip_duplicates:
                     fact_dedupe = spec.get("dedupe") or dedupe
                     existing = _deduplicate(cur, spec["content"], store_project,
@@ -646,6 +755,13 @@ def remember_batch(
                                         "scope": spec["scope"],
                                         "project": (store_project or "global")})
                         continue
+                    # No duplicate, but maybe a reworded copy: report it in
+                    # the entry so a batch write cannot fork silently either.
+                    # skip_duplicates=False means "store duplicates anyway",
+                    # so the whole check (and its warning) is skipped then.
+                    if fact_dedupe != "off":
+                        near_dup = _find_near_duplicate(
+                            cur, spec["content"], store_project, embeddings[i])
 
                 contradictions = []
                 contradiction_skip: str | None = None
@@ -683,6 +799,14 @@ def remember_batch(
                         continue
                     _supersede(cur, store_project, mid, c["existing_id"])
                     auto_superseded.append(c)
+                # Shared facts this entry invalidated: a project write hides
+                # them in every scope, so the entry has to name them.
+                cross_scope_superseded = (
+                    [old for old in dict.fromkeys(
+                        superseded + [c["existing_id"]
+                                      for c in auto_superseded])
+                     if _scope_of_id(cur, old, store_project) == "global"]
+                    if store_project else [])
                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             except Exception as exc:
                 cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -700,6 +824,13 @@ def remember_batch(
                      "project": (store_project or "global")}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
+            if near_dup:
+                entry.setdefault("warnings", []).append(
+                    _near_duplicate_warning(near_dup))
+            if cross_scope_superseded:
+                entry["cross_scope_superseded"] = cross_scope_superseded
+                entry.setdefault("warnings", []).append(
+                    _cross_scope_warning(cross_scope_superseded))
             if check_contradictions:
                 entry["contradictions"] = {
                     "found": bool(auto_superseded),
@@ -878,6 +1009,336 @@ def update_memory(
     finally:
         conn.close()
     return ok(STATUS_UPDATED, id=memory_id, project=scope)
+
+
+def update_batch(
+    updates: Annotated[
+        list[BatchUpdateInput],
+        Field(description="Updates to apply. Each entry needs 'memory_id'; "
+                          "optional 'content', 'importance', 'metadata', "
+                          "'entity', 'mem_type' and 'project'. Invalid "
+                          "entries are reported individually and the rest is "
+                          "still applied.")],
+    project: Annotated[
+        str | None,
+        Field(description="Default project scope for all entries (per-entry "
+                          "project wins). Without it every id is looked up in "
+                          "every scope.")] = None,
+) -> dict[str, Any]:
+    """Update several memories at once (savepoints per entry).
+
+    Each entry works like one `update_memory` call: `content` changes
+    re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` are
+    applied as given. An unknown id answers `not_found` in its entry, an id
+    that exists in several scopes without a `project` answers `error` with
+    the `scopes` - one bad entry never aborts the rest (unlike
+    `relate_batch`, which is all-or-nothing).
+    Returns `count` + `results`; `status` is "partial" when some entries
+    failed.
+    """
+    logger.info("update_batch count=%s project=%s",
+                len(updates) if isinstance(updates, list) else -1, project)
+    try:
+        default_project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    if not isinstance(updates, list) or not updates:
+        return fail(STATUS_ERROR, "updates must be a non-empty list")
+
+    updates = [u.model_dump(exclude_unset=True) if isinstance(u, BatchUpdate)
+               else u for u in updates]
+
+    # Validate everything before embedding, so one malformed entry cannot
+    # abort the batch (the same contract as remember_batch).
+    prepared: list[tuple[dict | None, str | None]] = []
+    for entry in updates:
+        if not isinstance(entry, dict) or entry.get("_not_an_object"):
+            prepared.append((None, "update must be an object"))
+            continue
+        memory_id = entry.get("memory_id")
+        memory_id = memory_id.strip() if isinstance(memory_id, str) else ""
+        if not memory_id:
+            prepared.append((None, "memory_id is required"))
+            continue
+        try:
+            entry_project = _norm_project(entry.get("project", default_project))
+        except ValueError as e:
+            prepared.append((None, str(e)))
+            continue
+        fields: dict[str, Any] = {}
+        error: str | None = None
+        content = entry.get("content")
+        if content is not None:
+            content = content.strip() if isinstance(content, str) else ""
+            if not content:
+                error = "content must not be empty"
+            else:
+                fields["content"] = content
+        importance = entry.get("importance")
+        if error is None and importance is not None:
+            try:
+                importance = float(importance)
+            except (TypeError, ValueError):
+                error = "importance must be a number between 0.0 and 1.0"
+            else:
+                if not 0.0 <= importance <= 1.0:
+                    error = "importance must be between 0.0 and 1.0"
+                else:
+                    fields["importance"] = importance
+        metadata = entry.get("metadata")
+        if error is None and metadata is not None:
+            if not isinstance(metadata, dict):
+                error = "metadata must be an object"
+            else:
+                fields["metadata"] = metadata
+        entity = entry.get("entity")
+        if error is None and entity is not None:
+            entity = entity.strip() if isinstance(entity, str) else ""
+            if not entity:
+                error = "entity must not be empty"
+            else:
+                fields["entity"] = entity
+        mem_type = entry.get("mem_type")
+        if error is None and mem_type is not None:
+            if mem_type not in MEMORY_TYPES:
+                error = (f"Invalid mem_type. Choose from: "
+                         f"{', '.join(sorted(MEMORY_TYPES))}")
+            else:
+                fields["mem_type"] = mem_type
+        if error is None and not fields:
+            error = ("nothing to update: pass content, importance, metadata, "
+                     "entity or mem_type")
+        if error:
+            prepared.append((None, error))
+        else:
+            prepared.append(({"memory_id": memory_id,
+                              "project": entry_project,
+                              "fields": fields}, None))
+
+    valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
+             if spec is not None]
+    with_content = [(i, spec["fields"]["content"]) for i, spec in valid
+                    if "content" in spec["fields"]]
+    embeddings: dict[int, list[float]] = {}
+    if with_content:
+        try:
+            vectors = embed([content for _, content in with_content])
+        except Exception as e:
+            logger.exception("update_batch embedding failed")
+            return fail(STATUS_ERROR, f"embedding failed: {e}")
+        embeddings = {i: vec for (i, _), vec in zip(with_content, vectors)}
+
+    conn = get_conn()
+    results: list[dict] = []
+    try:
+        cur = conn.cursor()
+        for i, (spec, err) in enumerate(prepared):
+            if spec is None:
+                raw = updates[i]
+                raw_id = raw.get("memory_id") if isinstance(raw, dict) else None
+                results.append({"id": raw_id, "status": "error", "error": err})
+                continue
+            memory_id = spec["memory_id"]
+            entry_project = spec["project"]
+            savepoint = f"update_{i}"
+            cur.execute(f"SAVEPOINT {savepoint}")
+            try:
+                sets: list[str] = []
+                params: list[Any] = []
+                for name, value in spec["fields"].items():
+                    if name == "content":
+                        sets += ["content = %s", "content_hash = %s",
+                                 "embedding = %s::vector"]
+                        params += [value, _content_hash(value), embeddings[i]]
+                    elif name == "metadata":
+                        sets.append("metadata = %s::jsonb")
+                        params.append(json.dumps(value))
+                    else:
+                        sets.append(f"{name} = %s")
+                        params.append(value)
+                sets.append("updated_at = NOW()")
+
+                if entry_project:
+                    tables = [_mem_table(entry_project), "memories"]
+                else:
+                    scopes = _memory_scopes(cur, memory_id)
+                    if len(scopes) > 1:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        results.append({
+                            "id": memory_id, "status": "error",
+                            "error": (f"ambiguous memory id {memory_id}: it "
+                                      f"exists in the scopes {scopes}; pass "
+                                      f"project=<name> to say which one to "
+                                      f"update"),
+                            "scopes": scopes})
+                        continue
+                    tables = _all_mem_tables(cur)
+
+                active = False
+                for table in tables:
+                    cur.execute(
+                        f"SELECT 1 FROM {table} WHERE id = %s "
+                        "AND superseded_by IS NULL AND deleted_at IS NULL",
+                        (memory_id,))
+                    if cur.fetchone():
+                        active = True
+                        break
+                if not active:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    results.append({"id": memory_id, "status": "not_found",
+                                    "error": f"NOT FOUND: {memory_id}"})
+                    continue
+                updated_table = None
+                for table in tables:
+                    cur.execute(
+                        f"UPDATE {table} SET {', '.join(sets)} "
+                        "WHERE id = %s AND superseded_by IS NULL "
+                        "AND deleted_at IS NULL",
+                        params + [memory_id])
+                    if cur.rowcount:
+                        updated_table = table
+                        break
+                if updated_table is None:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    results.append({"id": memory_id, "status": "not_found",
+                                    "error": f"NOT FOUND: {memory_id}"})
+                    continue
+                scope = _scope_of_table(cur, updated_table)
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception as exc:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                results.append({"id": memory_id, "status": "error",
+                                "error": str(exc)})
+                continue
+            results.append({"id": memory_id, "status": STATUS_UPDATED,
+                            "project": scope})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.exception("update_batch failed")
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+    failed = [r for r in results if r.get("status") != STATUS_UPDATED]
+    if failed and len(failed) == len(results):
+        return fail(STATUS_ERROR, "no memory could be updated",
+                    count=len(results), results=results)
+    status = STATUS_PARTIAL if failed else STATUS_OK
+    warnings = [f"{len(failed)} update(s) failed"] if failed else []
+    return ok(status, count=len(results), results=results, warnings=warnings)
+
+
+def touch_memory(
+    memory_id: Annotated[
+        str,
+        Field(description="Id of the memory to refresh.")],
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. Without it the id is looked up in "
+                          "every scope.")] = None,
+    importance: Annotated[
+        float | None,
+        Field(description="Optional new importance in 0.0-1.0; leave unset to "
+                          "keep the current value.")] = None,
+) -> dict[str, Any]:
+    """Refresh a memory: reset its decay age without changing its content.
+
+    Sets `updated_at` to now, so the recency half of the cognitive decay
+    starts over: a fact that was just confirmed or re-read stops fading with
+    its original age (the half-life is 90 days). Optionally sets
+    `importance` in the same call (importance also slows decay).
+
+    `recall` bumps `access_count`, which already slows decay when a fact is
+    read. `touch_memory` is for the opposite direction: "this is still true
+    and important" without a search. Content, embedding and `access_count`
+    are untouched - use `update_memory` to change what the memory says.
+
+    Without `project` the id is looked up in every scope; an id that exists
+    in several scopes is refused (pass `project`).
+    """
+    logger.info("touch_memory id=%s project=%s has_importance=%s",
+                memory_id, project, importance is not None)
+    memory_id = (memory_id or "").strip()
+    if not memory_id:
+        return fail(STATUS_ERROR, "memory_id must not be empty")
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+
+    sets: list[str] = []
+    params: list[Any] = []
+    if importance is not None:
+        try:
+            importance = float(importance)
+        except (TypeError, ValueError):
+            return fail(STATUS_ERROR,
+                        "importance must be a number between 0.0 and 1.0")
+        if not 0.0 <= importance <= 1.0:
+            return fail(STATUS_ERROR,
+                        "importance must be between 0.0 and 1.0")
+        sets.append("importance = %s")
+        params.append(importance)
+    sets.append("updated_at = NOW()")
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if project:
+            tables = [_mem_table(project), "memories"]
+        else:
+            scopes = _memory_scopes(cur, memory_id)
+            if len(scopes) > 1:
+                conn.rollback()
+                return fail(STATUS_ERROR,
+                            f"ambiguous memory id {memory_id}: it exists in "
+                            f"the scopes {scopes}; pass project=<name> to say "
+                            f"which one to touch",
+                            id=memory_id, scopes=scopes)
+            tables = _all_mem_tables(cur)
+        # Only an active memory can be refreshed: a superseded or forgotten
+        # row is invisible to reads, so refreshing it would be a no-op an
+        # agent cannot verify.
+        active = False
+        for table in tables:
+            cur.execute(
+                f"SELECT 1 FROM {table} WHERE id = %s "
+                "AND superseded_by IS NULL AND deleted_at IS NULL",
+                (memory_id,))
+            if cur.fetchone():
+                active = True
+                break
+        if not active:
+            conn.rollback()
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                        id=memory_id)
+        touched_table = None
+        for table in tables:
+            cur.execute(
+                f"UPDATE {table} SET {', '.join(sets)} "
+                "WHERE id = %s AND superseded_by IS NULL "
+                "AND deleted_at IS NULL",
+                params + [memory_id])
+            if cur.rowcount:
+                touched_table = table
+                break
+        if touched_table is None:
+            conn.rollback()
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                        id=memory_id)
+        scope = _scope_of_table(cur, touched_table)
+        cur.execute(f"SELECT updated_at FROM {touched_table} WHERE id = %s",
+                    (memory_id,))
+        row = cur.fetchone()
+        touched_at = row[0].isoformat() if row and row[0] else None
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e), id=memory_id)
+    finally:
+        conn.close()
+    return ok(STATUS_UPDATED, id=memory_id, project=scope,
+              updated_at=touched_at)
 
 
 def restore_memory(
