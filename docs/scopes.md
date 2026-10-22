@@ -52,11 +52,11 @@ Graph tools use the global graph when `project` is omitted.
 
 ## Which tools accept `project`
 
-`remember`, `remember_batch`, `update_memory`, `update_batch`, `touch_memory`,
-`get_entity`, `list_entities`, `list_memories`, `get_memory`, `recall`,
+`remember`, `remember_batch`, `update_memory`, `update_batch`,
+`get_entity`, `list_entities`, `list_memories`, `recall`,
 `init_context`,
 `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
-`forget`, `restore_memory`, `contradictions_report`, `export_memories`,
+`forget`, `contradictions_report`, `export_memories`,
 `import_memories`, `drop_project`.
 
 The read defaults differ per tool and are listed in
@@ -79,7 +79,7 @@ passed explicitly. `recall` searches the shared scope in both cases.
 A memory id is unique **per scope, not globally**: an import copies the id
 into the target scope, and then the same id exists in two scopes.
 
-`update_memory`, `touch_memory`, `restore_memory`, `get_memory` and
+`update_memory` (including `touch=true` and `restore=true`) and
 `forget(memory_id=...)` therefore refuse an id that exists in several scopes
 and name the scopes in the error:
 
@@ -100,7 +100,7 @@ the entity from every scope.
 
 | Tool | Effect |
 |------|--------|
-| `list_projects` | Lists every scope with a memory table, with `memories`, `total_memories`, `superseded_memories`, `forgotten_memories`, `entities` and `relations`. |
+| `init_context(project="*")` | Lists every scope with its own `project_stats` entry (`memories`, `total_memories`, `superseded_memories`, `forgotten_memories`, `entities` and `relations`). |
 | `forget(entity="*", project=…)` | **Empties** the scope: memories, graph nodes and mirror rows are removed, the scope itself survives. The shared scope is addressed with `project="global"`. |
 | `drop_project(project=…)` | **Removes** the scope completely: memory table, registry entry, graph nodes and mirror rows. `dry_run=true` previews the counts. `global` is refused. |
 
@@ -113,9 +113,9 @@ finished and its scope should disappear from every listing.
 
 A scope created by `relate` also gets a memory table, even when no fact is
 stored. A scope that exists only as graph rows (for example from a graph-only
-import) has no memory table and is therefore not listed by `list_projects`;
-`drop_project` still removes its graph nodes and mirror rows, so they cannot
-stay behind as orphans.
+import) has no memory table and is therefore not listed by
+`init_context(project="*")`; `drop_project` still removes its graph nodes and
+mirror rows, so they cannot stay behind as orphans.
 
 ## Storing outside a project
 

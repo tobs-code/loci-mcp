@@ -5,7 +5,7 @@
 - a memory id that exists in several scopes is reported, not guessed
 - the contradiction check covers every memory type, not only `fact`
 - `list_memories` / `list_entities` can be paged
-- `list_projects` / `drop_project` manage the project scopes
+- `init_context` / `drop_project` manage the project scopes
 """
 
 import asyncio
@@ -19,7 +19,6 @@ from mcp_server.server import (
     init_context,
     list_entities,
     list_memories,
-    list_projects,
     remember,
     update_memory,
 )
@@ -140,13 +139,13 @@ def test_list_entities_pages_through_a_scope():
     assert not (names_first & names_second)
 
 
-def test_list_projects_reports_the_scopes():
+def test_init_context_reports_the_project_stats():
     remember("Scope probe: a fact in a listed project", project="listed-probe")
 
-    result = list_projects()
+    result = init_context(project="*")
 
     assert result["ok"] is True
-    projects = {row["project"]: row for row in result["results"]}
+    projects = {row["project"]: row for row in result["project_stats"]}
     assert "listed-probe" in projects
     assert projects["listed-probe"]["memories"] >= 1
     assert projects["global"]["scope"] == "global"
@@ -159,14 +158,15 @@ def test_drop_project_removes_the_scope_completely():
     preview = drop_project("dropped-probe", dry_run=True)
     assert preview["ok"] is True
     assert preview["counts"]["memories"] >= 1
-    assert any(r["project"] == "dropped-probe" for r in list_projects()["results"])
+    assert any(r["project"] == "dropped-probe"
+               for r in init_context(project="*")["project_stats"])
 
     result = drop_project("dropped-probe")
     assert result["ok"] is True
     assert result["counts"]["memories"] >= 1
 
     assert not any(r["project"] == "dropped-probe"
-                   for r in list_projects()["results"])
+                   for r in init_context(project="*")["project_stats"])
     assert list_memories(project="dropped-probe")["count"] == 0
 
 

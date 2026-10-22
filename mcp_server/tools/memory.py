@@ -234,7 +234,9 @@ def _hidden_state_reason(cur, memory_id: str,
         superseded_by, deleted_at, expires_at = row
         reasons: list[str] = []
         if deleted_at is not None:
-            reasons.append("soft-forgotten (use restore_memory to bring it back)")
+            reasons.append(
+                "soft-forgotten (pass restore=true to update_memory to bring "
+                "it back)")
         if (superseded_by is not None
                 and superseded_by != SENTINEL_FORGOTTEN):
             reasons.append(
@@ -299,6 +301,10 @@ class BatchUpdate(BaseModel):
     clear_expires_at: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Remove the TTL (mutually exclusive with expires_at).")
+    restore: Any = Field(default=None, json_schema_extra={
+        "type": ["boolean", "null"]},
+        description="Undo a soft delete (mutually exclusive with every other "
+                    "update field).")
 
 
 def _sanitize_batch_update(value: Any) -> Any:
@@ -1319,6 +1325,63 @@ def remember_batch(
               failed=len(failed), results=results, warnings=warnings)
 
 
+def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
+    """Clear the soft delete of one memory (inverse of `forget(soft=True)`).
+
+    A real `superseded_by` id is kept: a restored memory cannot resurrect
+    next to the fact that replaced it. With a project only that project's
+    table is searched (the explicit scope); without one every scope is
+    searched and an ambiguous id is refused.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if project:
+            tables = [_mem_table(project)]
+            if not _table_exists(cur, tables[0]):
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                            id=memory_id)
+        else:
+            scopes = _memory_scopes(cur, memory_id)
+            if len(scopes) > 1:
+                conn.rollback()
+                return fail(STATUS_ERROR,
+                            f"ambiguous memory id {memory_id}: it exists in "
+                            f"the scopes {scopes}; pass project=<name> to say "
+                            f"which one to restore",
+                            id=memory_id, scopes=scopes)
+            tables = _all_mem_tables(cur)
+        restored = 0
+        restored_table = None
+        for table in tables:
+            # NULLIF clears only the forgotten sentinel; a `superseded_by` id
+            # from a real supersede stays set, so a restored memory cannot
+            # resurrect next to the fact that replaced it.
+            cur.execute(
+                f"UPDATE {table} SET deleted_at = NULL, "
+                f"superseded_by = NULLIF(superseded_by, %s), "
+                f"updated_at = NOW() WHERE id = %s AND deleted_at IS NOT NULL",
+                (SENTINEL_FORGOTTEN, memory_id),
+            )
+            if cur.rowcount:
+                restored += cur.rowcount
+                restored_table = table
+                break
+        conn.commit()
+        if not restored:
+            return fail(
+                STATUS_NOT_FOUND,
+                f"NOT FOUND: {memory_id} (not soft-forgotten or does not exist)",
+                id=memory_id)
+        scope = _scope_of_table(cur, restored_table) if restored_table else None
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e), id=memory_id)
+    finally:
+        conn.close()
+    return ok(STATUS_RESTORED, id=memory_id, project=scope)
+
+
 def update_memory(
     memory_id: Annotated[
         str,
@@ -1362,6 +1425,17 @@ def update_memory(
         Field(description="Remove the TTL entirely (makes the memory "
                           "open-ended again). Mutually exclusive with "
                           "expires_at.")] = False,
+    touch: Annotated[
+        bool,
+        Field(description="Refresh the memory without changing its content: "
+                          "sets updated_at to now so the decay age starts "
+                          "over. Can be combined with importance.")] = False,
+    restore: Annotated[
+        bool,
+        Field(description="Undo a soft delete: clears deleted_at (and the "
+                          "forgotten sentinel) of a soft-forgotten memory. "
+                          "Mutually exclusive with every other update "
+                          "field.")] = False,
 ) -> dict[str, Any]:
     """Update an existing memory's content, importance, metadata, entity, type or TTL.
 
@@ -1370,6 +1444,9 @@ def update_memory(
     the id) is refused: the response names the scopes, and `project` says
     which one to update.
     `expires_at` sets a new TTL (`clear_expires_at=True` removes it).
+    `touch=True` only refreshes the decay age (no content change);
+    `restore=True` undoes a soft delete (the inverse of `forget(soft=True)`).
+    A real `superseded_by` is never cleared by a restore.
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
                 memory_id, content is not None, importance is not None, metadata is not None)
@@ -1395,6 +1472,16 @@ def update_memory(
             return fail(STATUS_ERROR,
                         "expires_at must be an ISO 8601 timestamp "
                         "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
+    if restore:
+        if (content is not None or importance is not None
+                or metadata is not None or entity is not None
+                or mem_type is not None or expires_at is not None
+                or clear_expires_at or touch):
+            return fail(STATUS_ERROR,
+                        "restore=true cannot be combined with other update "
+                        "fields; it only clears the soft delete")
+        return _restore_memory(memory_id, project)
+
     sets: list[str] = []
     params: list[Any] = []
     emb: list[float] | None = None
@@ -1442,6 +1529,9 @@ def update_memory(
 
     if sets:
         # Updated memories must also age like new ones for decay scoring.
+        sets.append("updated_at = NOW()")
+    elif touch:
+        # A pure refresh: no content change, only the decay age restarts.
         sets.append("updated_at = NOW()")
 
     conn = get_conn()
@@ -1491,7 +1581,8 @@ def update_memory(
             conn.rollback()
             return fail(STATUS_ERROR,
                         "nothing to update: pass content, importance, metadata, "
-                        "entity, mem_type or expires_at/clear_expires_at",
+                        "entity, mem_type, expires_at/clear_expires_at, "
+                        "touch=true or restore=true",
                         id=memory_id)
         scope = _scope_of_table(cur, active_table)
         near_dup = None
@@ -1545,7 +1636,7 @@ def update_batch(
         Field(description="Updates to apply. Each entry needs 'memory_id'; "
                           "optional 'content', 'importance', 'metadata', "
                           "'entity', 'mem_type', 'expires_at', "
-                          "'clear_expires_at' and 'project'. Invalid "
+                          "'clear_expires_at', 'restore' and 'project'. Invalid "
                           "entries are reported individually and the rest is "
                           "still applied.")],
     project: Annotated[
@@ -1569,7 +1660,9 @@ def update_batch(
 
     Each entry works like one `update_memory` call: `content` changes
     re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` and the
-    TTL (`expires_at`/`clear_expires_at`) are applied as given. An unknown id answers `not_found` in its entry, an id
+    TTL (`expires_at`/`clear_expires_at`) are applied as given. `restore=true`
+    undoes a soft delete and is mutually exclusive with the other fields.
+    An unknown id answers `not_found` in its entry, an id
     that exists in several scopes without a `project` answers `error` with
     the `scopes` - one bad entry never aborts the rest (unlike
     `relate_batch`, which is all-or-nothing).
@@ -1682,15 +1775,21 @@ def update_batch(
         entry_ttl_warning = (_ttl_past_warning(entry_expires)
                              if entry_expires is not None and error is None
                              else None)
-        if error is None and not fields:
+        entry_restore = bool(entry.get("restore"))
+        if error is None and entry_restore and fields:
+            error = ("restore=true cannot be combined with other update "
+                     "fields")
+        if error is None and not fields and not entry_restore:
             error = ("nothing to update: pass content, importance, metadata, "
-                     "entity, mem_type or expires_at/clear_expires_at")
+                     "entity, mem_type, expires_at/clear_expires_at or "
+                     "restore=true")
         if error:
             prepared.append((None, error))
         else:
             prepared.append(({"memory_id": memory_id,
                               "project": entry_project,
                               "fields": fields,
+                              "restore": entry_restore,
                               "dedupe": entry_dedupe,
                               "fuzzy_threshold": entry_fuzzy,
                               "ttl_warning": entry_ttl_warning}, None))
@@ -1723,6 +1822,55 @@ def update_batch(
             savepoint = f"update_{i}"
             cur.execute(f"SAVEPOINT {savepoint}")
             try:
+                if spec.get("restore"):
+                    if entry_project:
+                        restore_tables = [_mem_table(entry_project)]
+                        if not _table_exists(cur, restore_tables[0]):
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            results.append({
+                                "id": memory_id, "status": "not_found",
+                                "error": f"NOT FOUND: {memory_id}"})
+                            continue
+                    else:
+                        scopes = _memory_scopes(cur, memory_id)
+                        if len(scopes) > 1:
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            results.append({
+                                "id": memory_id, "status": "error",
+                                "error": (f"ambiguous memory id {memory_id}: "
+                                          f"it exists in the scopes {scopes}; "
+                                          f"pass project=<name> to say which "
+                                          f"one to restore"),
+                                "scopes": scopes})
+                            continue
+                        restore_tables = _all_mem_tables(cur)
+                    restored = 0
+                    restored_table = None
+                    for table in restore_tables:
+                        cur.execute(
+                            f"UPDATE {table} SET deleted_at = NULL, "
+                            f"superseded_by = NULLIF(superseded_by, %s), "
+                            f"updated_at = NOW() WHERE id = %s "
+                            f"AND deleted_at IS NOT NULL",
+                            (SENTINEL_FORGOTTEN, memory_id))
+                        if cur.rowcount:
+                            restored = cur.rowcount
+                            restored_table = table
+                            break
+                    if not restored:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        results.append({
+                            "id": memory_id, "status": "not_found",
+                            "error": (f"NOT FOUND: {memory_id} "
+                                      f"(not soft-forgotten or does not "
+                                      f"exist)")})
+                        continue
+                    scope = _scope_of_table(cur, restored_table)
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    results.append({"id": memory_id,
+                                    "status": STATUS_RESTORED,
+                                    "project": scope})
+                    continue
                 sets: list[str] = []
                 params: list[Any] = []
                 for name, value in spec["fields"].items():
@@ -1833,7 +1981,8 @@ def update_batch(
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    failed = [r for r in results if r.get("status") != STATUS_UPDATED]
+    failed = [r for r in results
+              if r.get("status") not in (STATUS_UPDATED, STATUS_RESTORED)]
     succeeded = len(results) - len(failed)
     if failed and len(failed) == len(results):
         return fail(STATUS_ERROR, "no memory could be updated",
@@ -1844,228 +1993,6 @@ def update_batch(
     return ok(status, count=len(results), succeeded=succeeded,
               failed=len(failed), results=results, warnings=warnings)
 
-
-def touch_memory(
-    memory_id: Annotated[
-        str,
-        Field(description="Id of the memory to refresh.")],
-    project: Annotated[
-        str | None,
-        Field(description="Project scope. Without it the id is looked up in "
-                          "every scope.")] = None,
-    importance: Annotated[
-        float | None,
-        Field(description="Optional new importance in 0.0-1.0; leave unset to "
-                          "keep the current value.")] = None,
-) -> dict[str, Any]:
-    """Refresh a memory: reset its decay age without changing its content.
-
-    Sets `updated_at` to now, so the recency half of the cognitive decay
-    starts over: a fact that was just confirmed or re-read stops fading with
-    its original age (the half-life is 90 days). Optionally sets
-    `importance` in the same call (importance also slows decay).
-
-    `recall` bumps `access_count`, which already slows decay when a fact is
-    read. `touch_memory` is for the opposite direction: "this is still true
-    and important" without a search. Content, embedding and `access_count`
-    are untouched - use `update_memory` to change what the memory says.
-
-    Without `project` the id is looked up in every scope; an id that exists
-    in several scopes is refused (pass `project`).
-    """
-    logger.info("touch_memory id=%s project=%s has_importance=%s",
-                memory_id, project, importance is not None)
-    memory_id = (memory_id or "").strip()
-    if not memory_id:
-        return fail(STATUS_ERROR, "memory_id must not be empty")
-    try:
-        project = _norm_project(project)
-    except ValueError as e:
-        return fail(STATUS_ERROR, str(e))
-
-    sets: list[str] = []
-    params: list[Any] = []
-    if importance is not None:
-        try:
-            importance = float(importance)
-        except (TypeError, ValueError):
-            return fail(STATUS_ERROR,
-                        "importance must be a number between 0.0 and 1.0")
-        if not 0.0 <= importance <= 1.0:
-            return fail(STATUS_ERROR,
-                        "importance must be between 0.0 and 1.0")
-        sets.append("importance = %s")
-        params.append(importance)
-    sets.append("updated_at = NOW()")
-
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        if project:
-            tables = [_mem_table(project), "memories"]
-        else:
-            scopes = _memory_scopes(cur, memory_id)
-            if len(scopes) > 1:
-                conn.rollback()
-                return fail(STATUS_ERROR,
-                            f"ambiguous memory id {memory_id}: it exists in "
-                            f"the scopes {scopes}; pass project=<name> to say "
-                            f"which one to touch",
-                            id=memory_id, scopes=scopes)
-            tables = _all_mem_tables(cur)
-        # Only an active memory can be refreshed: a superseded or forgotten
-        # row is invisible to reads, so refreshing it would be a no-op an
-        # agent cannot verify.
-        active = False
-        for table in tables:
-            cur.execute(
-                f"SELECT 1 FROM {table} WHERE id = %s "
-                "AND superseded_by IS NULL AND deleted_at IS NULL",
-                (memory_id,))
-            if cur.fetchone():
-                active = True
-                break
-        if not active:
-            reason = _hidden_state_reason(cur, memory_id, tables)
-            conn.rollback()
-            if reason:
-                return fail(
-                    STATUS_NOT_FOUND,
-                    f"memory {memory_id} exists but cannot be touched: {reason}",
-                    id=memory_id)
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                        id=memory_id)
-        touched_table = None
-        for table in tables:
-            cur.execute(
-                f"UPDATE {table} SET {', '.join(sets)} "
-                "WHERE id = %s AND superseded_by IS NULL "
-                "AND deleted_at IS NULL",
-                params + [memory_id])
-            if cur.rowcount:
-                touched_table = table
-                break
-        if touched_table is None:
-            conn.rollback()
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                        id=memory_id)
-        scope = _scope_of_table(cur, touched_table)
-        cur.execute(f"SELECT updated_at FROM {touched_table} WHERE id = %s",
-                    (memory_id,))
-        row = cur.fetchone()
-        touched_at = row[0].isoformat() if row and row[0] else None
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return fail(STATUS_ERROR, str(e), id=memory_id)
-    finally:
-        conn.close()
-    return ok(STATUS_UPDATED, id=memory_id, project=scope,
-              updated_at=touched_at)
-
-
-def restore_memory(
-    memory_id: Annotated[
-        str | None,
-        Field(description="Id of the soft-forgotten memory to restore.")] = None,
-    project: Annotated[
-        str | None,
-        Field(description="Project scope. Without it the id is looked up in "
-                          "every scope.")] = None,
-    memory_ids: Annotated[
-        list[str] | None,
-        Field(description="Ids of several soft-forgotten memories to restore "
-                          "in one call. Each id is validated individually; "
-                          "mutually exclusive with `memory_id`.")] = None,
-) -> dict[str, Any]:
-    """Bring a soft-forgotten memory back.
-
-    `forget(soft=True)` hides a memory without deleting it. This tool reverses
-    that: it clears `deleted_at` (and the forgotten sentinel) so the memory is
-    visible to `recall`/`list_memories` again. Only soft-forgotten memories can
-    be restored; hard-deleted rows and active memories are reported as
-    `not_found`. A memory that was superseded before it was forgotten keeps
-    `superseded_by`: the restore clears the forgotten sentinel, never the
-    invalidation - it cannot resurrect an old fact next to the one that
-    replaced it.
-
-    Without `project` the id is looked up in every scope. An id that exists in
-    several scopes is refused; pass `project` to select one.
-    Pass `memory_ids` to restore several ids in one call; each entry is
-    validated individually and reported in `results`.
-    """
-    logger.info("restore_memory id=%s ids=%s project=%s", memory_id,
-                len(memory_ids) if isinstance(memory_ids, list) else None,
-                project)
-    if memory_id and memory_ids is not None:
-        return fail(STATUS_ERROR,
-                    "pass either memory_id or memory_ids, not both")
-    if memory_ids is not None:
-        if not isinstance(memory_ids, list) or not memory_ids:
-            return fail(STATUS_ERROR, "memory_ids must be a non-empty list")
-        results = [restore_memory(memory_id=mid, project=project)
-                   for mid in memory_ids]
-        restored = [r for r in results if r.get("ok")]
-        failed = [r for r in results if not r.get("ok")]
-        status = STATUS_RESTORED if not failed else STATUS_PARTIAL
-        warnings = ([f"{len(failed)} id(s) could not be restored"]
-                    if failed else [])
-        return ok(status, count=len(results), restored=len(restored),
-                  results=results, warnings=warnings)
-    memory_id = (memory_id or "").strip()
-    if not memory_id:
-        return fail(STATUS_ERROR, "memory_id must not be empty")
-    try:
-        project = _norm_project(project)
-    except ValueError as e:
-        return fail(STATUS_ERROR, str(e))
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        if project:
-            tables = [_mem_table(project)]
-            if not _table_exists(cur, tables[0]):
-                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                            id=memory_id)
-        else:
-            scopes = _memory_scopes(cur, memory_id)
-            if len(scopes) > 1:
-                conn.rollback()
-                return fail(STATUS_ERROR,
-                            f"ambiguous memory id {memory_id}: it exists in "
-                            f"the scopes {scopes}; pass project=<name> to say "
-                            f"which one to restore",
-                            id=memory_id, scopes=scopes)
-            tables = _all_mem_tables(cur)
-        restored = 0
-        restored_table = None
-        for table in tables:
-            # NULLIF clears only the forgotten sentinel; a `superseded_by` id
-            # from a real supersede stays set, so a restored memory cannot
-            # resurrect next to the fact that replaced it.
-            cur.execute(
-                f"UPDATE {table} SET deleted_at = NULL, "
-                f"superseded_by = NULLIF(superseded_by, %s), "
-                f"updated_at = NOW() WHERE id = %s AND deleted_at IS NOT NULL",
-                (SENTINEL_FORGOTTEN, memory_id),
-            )
-            if cur.rowcount:
-                restored += cur.rowcount
-                restored_table = table
-                break
-        conn.commit()
-        if not restored:
-            return fail(
-                STATUS_NOT_FOUND,
-                f"NOT FOUND: {memory_id} (not soft-forgotten or does not exist)",
-                id=memory_id)
-        scope = _scope_of_table(cur, restored_table) if restored_table else None
-    except Exception as e:
-        conn.rollback()
-        return fail(STATUS_ERROR, str(e), id=memory_id)
-    finally:
-        conn.close()
-    return ok(STATUS_RESTORED, id=memory_id, project=scope)
 
 
 def forget(
@@ -2319,8 +2246,9 @@ def forget(
                               f"{'Would remove' if dry_run else 'Soft-forgotten' if soft else 'Deleted'} "
                               f"all memories of {scope_name}"
                               + (" (rows stay recoverable with "
-                                 "restore_memory; use drop_project to remove "
-                                 "the scope completely)" if soft and not dry_run else "")
+                                 "update_memory(restore=true); use "
+                                 "drop_project to remove the scope "
+                                 "completely)" if soft and not dry_run else "")
                           ))
             # The scope filter must match the delete path exactly: without a
             # project the entity is removed from *every* scope, so the preview

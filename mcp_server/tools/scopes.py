@@ -1,4 +1,4 @@
-"""Project scopes: list them and remove them completely.
+"""Project scopes: remove them completely.
 
 A project is a scope with its own memory table, its own graph label and its
 own rows in the entity/relation mirror. `forget(entity="*")` empties a scope
@@ -17,10 +17,8 @@ from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.storage import clear_dangling_supersede
 from mcp_server.scopes import (
-    _all_mem_tables,
     _mem_table,
     _norm_project,
-    _project_names,
     _project_suffix,
     _scope_label,
     _scope_key,
@@ -29,89 +27,6 @@ from mcp_server.scopes import (
 
 logger = logging.getLogger(__name__)
 
-
-def list_projects(include_empty: Annotated[
-        bool,
-        Field(description="True (default) also lists projects without active "
-                          "memories; False only lists projects that still "
-                          "have memories.")] = True) -> dict[str, Any]:
-    """List the known project scopes with their sizes.
-
-    Without `init_context(project="*")` an agent has no way to see which
-    projects exist. Every row carries the project name, the number of active
-    and total memories, the number of graph entities and relations, and
-    whether the scope is the shared global scope.
-    `memories` counts the active rows, `total_memories` every row of the
-    scope; the difference is `superseded_memories` plus `forgotten_memories`.
-    """
-    logger.info("list_projects include_empty=%s", include_empty)
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        names = _project_names(cur)
-        rows: list[dict[str, Any]] = []
-
-        def _scope_stats(tables: list[str]) -> tuple[int, int, int, int]:
-            total = 0
-            active = 0
-            superseded = 0
-            forgotten = 0
-            for table in tables:
-                if not _table_exists(cur, table):
-                    continue
-                cur.execute(
-                    f"SELECT COUNT(*), "
-                    f"COUNT(*) FILTER (WHERE superseded_by IS NULL "
-                    f"AND deleted_at IS NULL), "
-                    f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL "
-                    f"AND deleted_at IS NULL), "
-                    f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
-                    f"FROM {table}"
-                )
-                t, a, s, f = cur.fetchone()
-                total += t
-                active += a
-                superseded += s
-                forgotten += f
-            return total, active, superseded, forgotten
-
-        for table in _all_mem_tables(cur):
-            if table == "memories":
-                scope = "global"
-            else:
-                scope = names.get(table[len("mem_"):], table[len("mem_"):])
-            total, active, superseded, forgotten = _scope_stats([table])
-            if not include_empty and not active:
-                continue
-            cur.execute(
-                "SELECT COUNT(*) FROM entities WHERE project = %s", (scope,)
-            )
-            entities = cur.fetchone()[0]
-            cur.execute(
-                "SELECT COUNT(*) FROM relations WHERE source_id IN "
-                "(SELECT id FROM entities WHERE project = %s) OR target_id IN "
-                "(SELECT id FROM entities WHERE project = %s)",
-                (scope, scope),
-            )
-            relations = cur.fetchone()[0]
-            rows.append({
-                "project": scope,
-                "scope": "global" if scope == "global" else "project",
-                "memories": active,
-                "total_memories": total,
-                "superseded_memories": superseded,
-                "forgotten_memories": forgotten,
-                "entities": entities,
-                "relations": relations,
-            })
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return fail(STATUS_ERROR, str(e))
-    finally:
-        conn.close()
-    rows.sort(key=lambda r: (r["scope"] != "global", str(r["project"])))
-    return ok(STATUS_OK, count=len(rows), results=rows)
 
 
 def drop_project(

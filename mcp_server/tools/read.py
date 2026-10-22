@@ -583,14 +583,19 @@ def list_memories(
                           "response reports `total` and `has_more`.")] = 0,
     memory_id: Annotated[
         str | None,
-        Field(description="Only list the memory with this id. Use it as a "
-                          "direct id lookup across the selected scope(s).")] = None,
+        Field(description="Direct id lookup: returns the single memory as "
+                          "`memory` (plus `results`) with its history "
+                          "markers. Without `project` (or with '*') every "
+                          "scope is searched; an id in several scopes is "
+                          "refused. Browse filters are ignored for this "
+                          "lookup.")] = None,
     include_deleted: Annotated[
         bool,
         Field(description="Also list soft-forgotten memories (recognizable by "
                           "a non-null `deleted_at`). Use it before "
-                          "`restore_memory`. Superseded history stays hidden "
-                          "unless `include_superseded` is also set.")] = False,
+                          "`update_memory(restore=true)`. Superseded history "
+                          "stays hidden unless `include_superseded` is also "
+                          "set.")] = False,
     include_expired: Annotated[
         bool,
         Field(description="Also list memories whose TTL (`expires_at`) has "
@@ -615,11 +620,15 @@ def list_memories(
     `updated_after` and `metadata_filter` narrow the result set, `order_by`
     changes the sorting and `contains` filters on a literal substring of the
     content. `offset` pages through a scope that has more matches than
-    `limit`. Pass `memory_id` for a direct id lookup and `include_deleted=True`
-    to include soft-forgotten memories (they carry `deleted_at`); superseded
-    history stays hidden unless `include_superseded=True` is also passed —
-    the two flags are orthogonal. Expired TTL rows are separate: they stay
-    hidden until `include_expired=True` and then carry `expired: true`.
+    `limit`. Pass `memory_id` for a direct id lookup: the answer then carries
+    the single `memory` (and a one-item `results`) with the
+    `superseded_by`/`forgotten`/`expired` markers, and a hidden row names the
+    flag that reveals it. Browse filters are ignored for that lookup.
+    `include_deleted=True` includes soft-forgotten memories (they carry
+    `deleted_at`); superseded history stays hidden unless
+    `include_superseded=True` is also passed — the two flags are orthogonal.
+    Expired TTL rows are separate: they stay hidden until
+    `include_expired=True` and then carry `expired: true`.
     `include_relation_context=False` hides the relation-context sentences of
     the graph edges. A project that does not exist is reported in `warnings`:
     the browse then only covered the global scope.
@@ -661,6 +670,36 @@ def list_memories(
         return fail(STATUS_ERROR,
                     "order_by must be one of updated_at, created_at, "
                     "access_count, importance")
+    if memory_id:
+        # Direct id lookup: one memory, its history state and the reason it is
+        # hidden. The browse filters (entity, contains, ...) would contradict
+        # "exactly this id", so they are reported as ignored instead of
+        # silently narrowing or widening the answer.
+        ignored = [
+            name for name, value in (
+                ("entity", entity), ("mem_type", mem_type),
+                ("contains", contains), ("updated_after", updated_after),
+                ("metadata_filter", metadata_filter),
+            ) if value is not None
+        ]
+        if offset:
+            ignored.append("offset")
+        if order_by != "updated_at":
+            ignored.append("order_by")
+        result = _get_memory(
+            memory_id=memory_id, project=raw_project,
+            include_superseded=include_superseded,
+            include_deleted=include_deleted,
+            include_expired=include_expired, fields=fields,
+            include_global=include_global)
+        if result.get("ok"):
+            result["count"] = 1
+            result["results"] = [result["memory"]]
+        if ignored:
+            result.setdefault("warnings", []).append(
+                "memory_id performs a direct id lookup: "
+                f"{', '.join(ignored)} ignored")
+        return result
     conn = get_conn()
     warnings: list[str] = []
     try:
@@ -810,7 +849,7 @@ def list_memories(
               warnings=warnings, results=results)
 
 
-def get_memory(
+def _get_memory(
     memory_id: Annotated[
         str,
         Field(description="Id of the memory to fetch.")],
@@ -831,28 +870,27 @@ def get_memory(
     fields: Annotated[
         list[str] | None,
         Field(description="Only return these columns, e.g. ['id', 'content'].")] = None,
+    include_global: bool = True,
 ) -> dict[str, Any]:
     """Fetch exactly one memory by id, including its history state.
 
-    `recall`/`list_memories` hide superseded, forgotten and expired rows unless
-    a flag asks for them. This tool is the direct id lookup: the answer names
-    the scope and sets the `superseded_by`/`forgotten`/`expired` markers, so
-    an agent can tell *why* a known id was missing from a search.
-    Without `project` the id is looked up in every scope; an id that exists in
-    several scopes is refused and the scopes are named.
+    This is the singular path of `list_memories(memory_id=...)`: the answer
+    names the scope and sets the `superseded_by`/`forgotten`/`expired`
+    markers, so an agent can tell *why* a known id was missing from a search.
+    Without `project` (or with `project="*"`) the id is looked up in every
+    scope; an id that exists in several scopes is refused and the scopes are
+    named.
     """
     logger.info("get_memory id=%s project=%s", memory_id, project)
     memory_id = (memory_id or "").strip()
     if not memory_id:
         return fail(STATUS_ERROR, "memory_id must not be empty")
-    if project is not None and str(project).strip() == "*":
-        return fail(STATUS_ERROR,
-                    "get_memory describes exactly one memory: pass one "
-                    "project name (or omit project to search every scope)")
     raw_project = project
+    if raw_project is not None and str(raw_project).strip() == "*":
+        raw_project = None
     global_only = _is_global_scope(raw_project)
     try:
-        project = _norm_project(project)
+        project = _norm_project(raw_project)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     fields_error = validate_fields(fields)
@@ -875,6 +913,8 @@ def get_memory(
                     f"scopes {scopes}; pass project=<name> to say which one "
                     f"to read", id=memory_id, scopes=scopes)
             tables = _all_mem_tables(cur)
+        if not include_global:
+            tables = [table for table in tables if table != "memories"]
         where = _visibility_condition(include_deleted, include_superseded,
                                       include_expired)
         found = None
@@ -920,7 +960,15 @@ def get_memory(
                         id=memory_id)
         scope = _scope_of_table(cur, found_table)
         found["_project"] = scope
-        item = project_row(found, fields)
+        projection_fields = fields
+        if include_deleted:
+            # Without this the caller could not tell a forgotten row from an
+            # active one (same rule as the collection path).
+            if projection_fields is None:
+                projection_fields = list(PUBLIC_FIELDS) + ["deleted_at"]
+            elif "deleted_at" not in projection_fields:
+                projection_fields = projection_fields + ["deleted_at"]
+        item = project_row(found, projection_fields)
         if found.get("deleted_at"):
             item["forgotten"] = True
             if item.get("superseded_by") == SENTINEL_FORGOTTEN:
@@ -1420,6 +1468,12 @@ def init_context(project: Annotated[
         Field(description="How many memories to return (default 10). The list "
                           "always contains the most recently changed "
                           "memories of the scope.")] = 10,
+    include_empty_projects: Annotated[
+        bool,
+        Field(description="True (default) lists every known scope in "
+                          "`project_stats`, including scopes without active "
+                          "memories; False only scopes with active "
+                          "memories.")] = True,
 ) -> dict[str, Any]:
     """Call at session start. Returns recent + important bootstrap info + health.
 
@@ -1438,6 +1492,10 @@ def init_context(project: Annotated[
     covered tables (a cross-scope copy can be counted in both);
     `total_memories` counts every row of the scope, so the difference is
     `superseded_memories` plus `forgotten_memories`.
+    `project_stats` lists every covered scope with its own sizes (memories,
+    total, superseded, forgotten, entities, relations) and replaces the
+    separate project listing; `include_empty_projects=False` drops scopes
+    without active memories.
     `graph_entities_count` counts the graph nodes of the covered scopes.
     """
     all_projects = project == "*"
@@ -1476,7 +1534,8 @@ def init_context(project: Annotated[
         # one. Without it the caller cannot see that global memories were
         # part of the answer.
         projects = list(scope_names)
-        for table in tables:
+        project_stats: list[dict[str, Any]] = []
+        for table, scope in zip(tables, scope_names):
             cur.execute(
                 f"SELECT COUNT(*), "
                 f"COUNT(*) FILTER (WHERE superseded_by IS NULL AND deleted_at IS NULL), "
@@ -1490,6 +1549,29 @@ def init_context(project: Annotated[
             active += table_active
             superseded += table_superseded
             forgotten += table_forgotten
+            cur.execute(
+                "SELECT COUNT(*) FROM entities WHERE project = %s", (scope,))
+            entities = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM relations WHERE source_id IN "
+                "(SELECT id FROM entities WHERE project = %s) OR target_id IN "
+                "(SELECT id FROM entities WHERE project = %s)",
+                (scope, scope),
+            )
+            relations = cur.fetchone()[0]
+            if include_empty_projects or table_active:
+                project_stats.append({
+                    "project": scope,
+                    "scope": "global" if scope == "global" else "project",
+                    "memories": table_active,
+                    "total_memories": table_total,
+                    "superseded_memories": table_superseded,
+                    "forgotten_memories": table_forgotten,
+                    "entities": entities,
+                    "relations": relations,
+                })
+        project_stats.sort(
+            key=lambda r: (r["scope"] != "global", str(r["project"])))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1513,6 +1595,7 @@ def init_context(project: Annotated[
         superseded_memories=superseded,
         forgotten_memories=forgotten,
         projects=sorted(projects),
+        project_stats=project_stats,
         count=len(memories),
         recent_memories=memories,
         graph_entities_count=_count_entities(scope_names),

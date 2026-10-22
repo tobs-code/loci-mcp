@@ -17,7 +17,7 @@ from mcp_server.server import (
     recall,
     relate,
     remember,
-    restore_memory,
+    update_memory,
 )
 
 
@@ -54,7 +54,7 @@ def test_remember_warns_on_a_semantic_match_with_a_superseded_fact():
 # A soft delete must be reversible
 # --------------------------------------------------------------------------
 
-def test_restore_memory_brings_a_soft_forgotten_fact_back():
+def test_update_memory_restore_brings_a_soft_forgotten_fact_back():
     memory_id = remember("The vault password is hunter2")["id"]
     forget(memory_id)
     assert recall("vault password")["results"] == []
@@ -63,7 +63,7 @@ def test_restore_memory_brings_a_soft_forgotten_fact_back():
     assert listed["count"] == 1
     assert listed["results"][0]["deleted_at"] is not None
 
-    restored = restore_memory(memory_id)
+    restored = update_memory(memory_id, restore=True)
     assert restored["ok"] is True
     assert restored["status"] == "restored"
     assert any(r["id"] == memory_id for r in recall("vault password")["results"])
@@ -73,13 +73,13 @@ def test_restore_memory_brings_a_soft_forgotten_fact_back():
     assert "deleted_at" not in default_list["results"][0]
 
 
-def test_restore_memory_rejects_an_active_or_hard_deleted_fact():
+def test_update_memory_restore_rejects_an_active_or_hard_deleted_fact():
     active_id = remember("This fact was never forgotten")["id"]
-    assert restore_memory(active_id)["status"] == "not_found"
+    assert update_memory(active_id, restore=True)["status"] == "not_found"
 
     purged_id = remember("This fact is gone for good")["id"]
     forget(purged_id, soft=False)
-    assert restore_memory(purged_id)["status"] == "not_found"
+    assert update_memory(purged_id, restore=True)["status"] == "not_found"
 
 
 # --------------------------------------------------------------------------

@@ -8,7 +8,7 @@ Covers:
 - `import_memories` names why records were skipped;
 - `contradictions_report` exposes `nli_failures` (which pairs were not
   judged) instead of only a count;
-- `update_batch` (savepoints per entry) and `touch_memory` (decay refresh).
+- `update_batch` (savepoints per entry) and `update_memory(touch=true)` (decay refresh).
 """
 
 from mcp_server.server import (
@@ -17,8 +17,8 @@ from mcp_server.server import (
     list_memories,
     remember,
     remember_batch,
-    touch_memory,
     update_batch,
+    update_memory,
 )
 
 
@@ -254,15 +254,15 @@ def test_update_batch_refuses_an_ambiguous_id_per_entry():
 
 
 # --------------------------------------------------------------------------
-# touch_memory
+# update_memory(touch=True)
 # --------------------------------------------------------------------------
 
-def test_touch_memory_resets_the_decay_age():
+def test_update_memory_touch_resets_the_decay_age():
     stored = remember("Touch probe: the lease renews on monday")
     before = list_memories(memory_id=stored["id"],
                            fields=["updated_at"])["results"][0]["updated_at"]
 
-    result = touch_memory(stored["id"])
+    result = update_memory(stored["id"], touch=True)
 
     assert result["ok"] is True
     assert result["status"] == "updated"
@@ -272,10 +272,10 @@ def test_touch_memory_resets_the_decay_age():
     assert after > before
 
 
-def test_touch_memory_can_set_importance_and_leaves_content_alone():
+def test_update_memory_touch_can_set_importance_and_leaves_content_alone():
     stored = remember("Touch importance probe")
 
-    assert touch_memory(stored["id"], importance=0.8)["ok"] is True
+    assert update_memory(stored["id"], importance=0.8, touch=True)["ok"] is True
 
     row = list_memories(memory_id=stored["id"],
                         fields=["importance", "content"])["results"][0]
@@ -283,19 +283,19 @@ def test_touch_memory_can_set_importance_and_leaves_content_alone():
     assert row["content"] == "Touch importance probe"
 
 
-def test_touch_memory_reports_an_unknown_id_as_not_found():
-    result = touch_memory("zzunknownid02")
+def test_update_memory_touch_reports_an_unknown_id_as_not_found():
+    result = update_memory("zzunknownid02", touch=True)
 
     assert result["ok"] is False
     assert result["status"] == "not_found"
     assert "NOT FOUND" in result["error"]
 
 
-def test_touch_memory_reports_the_project_scope():
+def test_update_memory_touch_reports_the_project_scope():
     remember("Touch project probe", project="touch-project")
     row = list_memories(project="touch-project",
                         contains="Touch project probe")["results"][0]
 
-    result = touch_memory(row["id"])
+    result = update_memory(row["id"], touch=True)
 
     assert result["project"] == "touch-project"

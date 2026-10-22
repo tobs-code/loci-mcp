@@ -2,7 +2,7 @@
 
 Covers the audit findings and the features added with them:
 - TTL survives export/import (JSON and JSONL);
-- expired rows are visible through `include_expired`/`get_memory`, but never
+- expired rows are visible through `include_expired`/`list_memories(memory_id=...)`, but never
   leak into `include_deleted`;
 - `metadata_mode` controls the metadata carry-over on a supersede;
 - `on_near_duplicate` can warn, supersede or reject;
@@ -19,12 +19,10 @@ from mcp_server.server import (
     find_connections,
     forget,
     get_entity,
-    get_memory,
     import_memories,
     list_memories,
     relate,
     remember,
-    restore_memory,
     unrelate,
     update_batch,
     update_memory,
@@ -69,25 +67,26 @@ def test_include_deleted_does_not_show_expired_rows():
     assert "Temporary maintenance window" not in contents
 
 
-def test_get_memory_explains_hidden_expired_row():
+def test_list_memories_by_id_explains_hidden_expired_row():
     stored = remember("Rotating credential expires tonight",
                       project="ttl-get", expires_at=PAST)
-    hidden = get_memory(stored["id"], project="ttl-get")
+    hidden = list_memories(memory_id=stored["id"], project="ttl-get")
     assert hidden["ok"] is False
     assert "include_expired" in hidden["error"]
 
-    visible = get_memory(stored["id"], project="ttl-get",
+    visible = list_memories(memory_id=stored["id"], project="ttl-get",
                          include_expired=True)
     assert visible["ok"] is True
     assert visible["memory"]["expired"] is True
     assert visible["memory"]["expires_at"] is not None
 
 
-def test_get_memory_rejects_star_scope():
+def test_list_memories_memory_id_accepts_star_scope():
     stored = remember("One memory one scope", project="ttl-get-star")
-    result = get_memory(stored["id"], project="*")
-    assert result["ok"] is False
-    assert "exactly one memory" in result["error"]
+    result = list_memories(memory_id=stored["id"], project="*")
+    assert result["ok"] is True
+    assert result["memory"]["id"] == stored["id"]
+    assert result["memory"]["project"] == "ttl-get-star"
 
 
 def test_metadata_mode_replace_drops_old_keys():
@@ -99,7 +98,7 @@ def test_metadata_mode_replace_drops_old_keys():
                         metadata={"port": 9443}, supersede=old["id"],
                         metadata_mode="replace")
     assert replaced["ok"] is True
-    row = get_memory(replaced["id"], project="meta-mode")["memory"]
+    row = list_memories(memory_id=replaced["id"], project="meta-mode")["memory"]
     assert row["metadata"] == {"port": 9443}
 
 
@@ -180,13 +179,13 @@ def test_update_memory_sets_and_clears_ttl():
     set_ttl = update_memory(stored["id"], project="ttl-update",
                             expires_at=FUTURE)
     assert set_ttl["ok"] is True
-    assert get_memory(stored["id"], project="ttl-update")[
+    assert list_memories(memory_id=stored["id"], project="ttl-update")[
         "memory"]["expires_at"] is not None
 
     cleared = update_memory(stored["id"], project="ttl-update",
                             clear_expires_at=True)
     assert cleared["ok"] is True
-    assert get_memory(stored["id"], project="ttl-update")[
+    assert list_memories(memory_id=stored["id"], project="ttl-update")[
         "memory"]["expires_at"] is None
 
 
@@ -200,7 +199,7 @@ def test_update_batch_sets_and_clears_ttl():
     ], project="ttl-batch-update")
     assert result["ok"] is True
     assert result["count"] == 2
-    assert all(get_memory(m["id"], project="ttl-batch-update")[
+    assert all(list_memories(memory_id=m["id"], project="ttl-batch-update")[
         "memory"]["expires_at"] for m in (one, two))
 
     cleared = update_batch(updates=[
@@ -208,7 +207,7 @@ def test_update_batch_sets_and_clears_ttl():
         {"memory_id": two["id"], "clear_expires_at": True},
     ], project="ttl-batch-update")
     assert cleared["ok"] is True
-    assert all(get_memory(m["id"], project="ttl-batch-update")[
+    assert all(list_memories(memory_id=m["id"], project="ttl-batch-update")[
         "memory"]["expires_at"] is None for m in (one, two))
 
 
@@ -224,10 +223,13 @@ def test_bulk_restore():
     two = remember("Bulk restore two", project="bulk-restore")
     forget(memory_ids=[one["id"], two["id"]], project="bulk-restore")
 
-    result = restore_memory(memory_ids=[one["id"], two["id"]],
-                            project="bulk-restore")
+    result = update_batch(
+        [{"memory_id": one["id"], "restore": True},
+         {"memory_id": two["id"], "restore": True}],
+        project="bulk-restore")
     assert result["ok"] is True
-    assert result["restored"] == 2
+    assert result["succeeded"] == 2
+    assert {r["status"] for r in result["results"]} == {"restored"}
     assert {r["content"] for r in
             list_memories(project="bulk-restore")["results"]} == {
                 "Bulk restore one", "Bulk restore two"}

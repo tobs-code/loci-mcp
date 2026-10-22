@@ -21,9 +21,9 @@ from mcp_server.server import (
     forget,
     get_entity,
     import_memories,
+    init_context,
     list_entities,
     list_memories,
-    list_projects,
     recall,
     relate,
     remember,
@@ -163,8 +163,9 @@ def test_list_memories_without_a_project_still_lists_every_scope():
 def test_a_graph_only_project_is_listed_and_can_be_dropped():
     relate("GraphOnlyA", "GraphOnlyB", "uses", project="graph-only")
 
-    listed = list_projects()
-    assert any(row["project"] == "graph-only" for row in listed["results"]), listed
+    listed = init_context(project="*")
+    assert any(row["project"] == "graph-only"
+               for row in listed["project_stats"]), listed
 
     dropped = drop_project(project="graph-only")
 
@@ -172,8 +173,9 @@ def test_a_graph_only_project_is_listed_and_can_be_dropped():
     assert dropped["counts"]["entities"] == 2
     assert dropped["counts"]["relations"] == 1
 
-    listed_again = list_projects()
-    assert not any(row["project"] == "graph-only" for row in listed_again["results"])
+    listed_again = init_context(project="*")
+    assert not any(row["project"] == "graph-only"
+                   for row in listed_again["project_stats"])
 
 
 # --- get_entity pages instead of truncating silently ---------------------

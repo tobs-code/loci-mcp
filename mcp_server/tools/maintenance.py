@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Literal
@@ -567,6 +568,9 @@ def server_health() -> dict[str, Any]:
     except Exception:
         pass
     inference_details = health_details()
+    toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
+    if toolset not in ("core", "full"):
+        toolset = "full"
     return ok(
         STATUS_OK,
         version=VERSION,
@@ -577,6 +581,7 @@ def server_health() -> dict[str, Any]:
         nli_configured=(inference_details.get("llm_configured")
                         if inference_details is not None
                         and "llm_configured" in inference_details else None),
+        toolset=toolset,
     )
 
 

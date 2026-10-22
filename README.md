@@ -58,23 +58,19 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 |------|--------------|
 | `remember` | Store a fact, decision or learning (auto-embedded, deduplicated) |
 | `remember_batch` | Store many facts at once |
-| `update_memory` | Change content, importance, metadata, entity, type or TTL |
+| `update_memory` | Change content, importance, metadata, entity, type or TTL; `touch=true` refreshes recency, `restore=true` undoes a soft delete |
 | `update_batch` | Update many memories in one call |
 | `forget` | Soft delete or hard delete, by id or by entity |
-| `restore_memory` | Bring one or several soft-forgotten memories back |
-| `touch_memory` | Refresh a memory's recency without changing its content |
 
 **Read**
 
 | Tool | What it does |
 |------|--------------|
 | `recall` | Hybrid vector + full-text search with ranking, decay and graph boost |
-| `list_memories` | Browse memories without a query (filter, sort, page) |
-| `get_memory` | Fetch one memory by id, including hidden rows |
+| `list_memories` | Browse memories without a query (filter, sort, page); `memory_id` fetches one, including hidden rows |
 | `get_entity` | Everything known about one entity |
 | `list_entities` | Browse the entities of a scope |
-| `init_context` | Session bootstrap: the most recently changed memories |
-| `list_projects` | The known project scopes and their sizes |
+| `init_context` | Session bootstrap: recent memories plus `project_stats` for every scope |
 
 **Graph**
 
@@ -91,8 +87,12 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 |------|--------------|
 | `contradictions_report` | Find conflicting memories, per entity or scope-wide |
 | `export_memories` / `import_memories` | Backup and restore, including the graph |
+| `verify_integrity` | Find and repair dangling supersede links |
 | `drop_project` | Remove a project scope completely |
 | `server_health` | Check Postgres and the inference API |
+
+`MCP_TOOLSET=core` exposes only the 13 daily read/write/graph tools; the
+default `full` exposes all 21.
 
 There is also one resource, `memory://stats`, with the memory, entity and
 relation counts plus the health of the services.

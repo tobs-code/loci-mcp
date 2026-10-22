@@ -401,4 +401,4 @@ def _unknown_project_warning(cur, project: str | None) -> str | None:
         return (f"project {project!r} has no memories yet (only graph data); "
                 f"only the global scope was searched")
     return (f"project {project!r} does not exist; only the global scope was "
-            f"searched - check the name with list_projects")
+            f"searched - check the name with init_context(project='*')")

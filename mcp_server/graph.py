@@ -320,7 +320,7 @@ def relate(
         if project:
             # Every project that gets a graph node also gets its memory table
             # and its registry entry. Without that the scope existed only in
-            # the graph: invisible in `list_projects` and not removable with
+            # the graph: invisible in `init_context(project='*')` and not removable with
             # `drop_project`, which left its nodes behind as orphans.
             _ensure_project_table(cur, project)
         cur.execute("SET search_path TO ag_catalog, public")
@@ -386,7 +386,7 @@ def relate_batch(
     try:
         cur = conn.cursor()
         # Every project that gets a graph node also gets its memory table and
-        # its registry entry, so the scope is visible in `list_projects` and
+        # its registry entry, so the scope is visible in `init_context(project='*')` and
         # removable with `drop_project`.
         for p in {_norm_project(e.get("project", project)) for e in edges}:
             if p:

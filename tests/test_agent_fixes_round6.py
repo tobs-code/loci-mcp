@@ -15,7 +15,7 @@ from mcp_server.server import (
     recall,
     relate,
     remember,
-    restore_memory,
+    update_memory,
 )
 from mcp_server.config import SENTINEL_FORGOTTEN
 
@@ -29,7 +29,7 @@ def test_restore_keeps_a_real_supersede_intact():
                       project="revive-scope", supersede=old_id)["id"]
 
     forget(memory_id=old_id, project="revive-scope")  # soft
-    result = restore_memory(old_id, project="revive-scope")
+    result = update_memory(old_id, project="revive-scope", restore=True)
     assert result["ok"] is True
 
     listed = list_memories(project="revive-scope", memory_id=old_id,
@@ -202,7 +202,7 @@ def test_soft_star_forget_says_the_rows_stay_recoverable():
     result = forget(entity="*", project="star-scope")
 
     assert result["status"] == "soft_forgotten"
-    assert "restore_memory" in result["message"]
+    assert "restore=true" in result["message"]
 
     recovered = list_memories(project="star-scope", contains="Star scope",
                               include_deleted=True)

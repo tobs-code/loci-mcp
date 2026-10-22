@@ -3,7 +3,7 @@
 Covers:
 - `recall` can return forgotten and expired rows on request;
 - `graph_boost` warns when the entity has no graph node;
-- hidden rows explain why they are hidden in `update_memory`/`touch_memory`;
+- hidden rows explain why they are hidden in `update_memory`;
 - batch answers distinguish entries from successes;
 - `forget(entity=...)` reports an already-forgotten entity;
 - `verify_integrity` finds and repairs dangling supersede links;
@@ -24,7 +24,6 @@ from mcp_server.server import (
     export_memories,
     forget,
     get_entity,
-    get_memory,
     import_memories,
     list_entities,
     list_memories,
@@ -32,7 +31,6 @@ from mcp_server.server import (
     relate,
     remember,
     remember_batch,
-    touch_memory,
     update_batch,
     update_memory,
     verify_integrity,
@@ -90,9 +88,9 @@ def test_update_and_touch_explain_hidden_state():
                             importance=0.5)
     assert updated["ok"] is False
     assert "soft-forgotten" in updated["error"]
-    assert "restore_memory" in updated["error"]
+    assert "restore=true" in updated["error"]
 
-    touched = touch_memory(gone["id"], project="hidden-state")
+    touched = update_memory(gone["id"], project="hidden-state", touch=True)
     assert touched["ok"] is False
     assert "soft-forgotten" in touched["error"]
 
@@ -142,7 +140,7 @@ def test_verify_integrity_finds_and_repairs_dangling_link():
         f"UPDATE {_mem_table('integrity')} SET superseded_by = %s "
         f"WHERE id = %s", ("missingreplacement", fact["id"]))
 
-    assert get_memory(fact["id"], project="integrity")["ok"] is False
+    assert list_memories(memory_id=fact["id"], project="integrity")["ok"] is False
 
     report = verify_integrity(project="integrity")
     assert report["ok"] is True
@@ -152,7 +150,7 @@ def test_verify_integrity_finds_and_repairs_dangling_link():
 
     repaired = verify_integrity(project="integrity", fix=True)
     assert repaired["fixed"] == 1
-    assert get_memory(fact["id"], project="integrity")["ok"] is True
+    assert list_memories(memory_id=fact["id"], project="integrity")["ok"] is True
 
 
 def test_export_entity_filter_narrows_the_graph():
@@ -196,7 +194,7 @@ def test_batch_supersede_carries_metadata():
           "supersede": first["id"]}],
         project="batch-meta")
     assert stored["succeeded"] == 1
-    new = get_memory(stored["results"][0]["id"], project="batch-meta")
+    new = list_memories(memory_id=stored["results"][0]["id"], project="batch-meta")
     assert new["memory"]["metadata"]["ticket"] == "OPS-42"
     assert new["memory"]["metadata"]["owner"] == "data"
 

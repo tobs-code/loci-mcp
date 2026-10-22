@@ -9,6 +9,7 @@
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
+| `MCP_TOOLSET` | `full` | `full` (21 tools) or `core` (13 daily read/write/graph tools); an unknown value warns and falls back to `full` |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model (empty = provider default) |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |

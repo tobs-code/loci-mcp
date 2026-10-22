@@ -24,34 +24,44 @@ from mcp_server.tools.memory import (
     forget,
     remember,
     remember_batch,
-    restore_memory,
-    touch_memory,
     update_batch,
     update_memory,
 )
 from mcp_server.tools.read import (
     get_entity,
-    get_memory,
     init_context,
     list_entities,
     list_memories,
     recall,
 )
-from mcp_server.tools.scopes import drop_project, list_projects
+from mcp_server.tools.scopes import drop_project
 
 logger = logging.getLogger(__name__)
 
-_TOOLS = (
+_CORE_TOOL_NAMES = frozenset({
+    "remember",
+    "remember_batch",
+    "update_memory",
+    "forget",
+    "recall",
+    "list_memories",
+    "get_entity",
+    "list_entities",
+    "init_context",
+    "relate",
+    "unrelate",
+    "find_connections",
+    "find_paths",
+})
+
+_ALL_TOOLS = (
     remember,
     remember_batch,
     update_memory,
     update_batch,
-    touch_memory,
     forget,
-    restore_memory,
     recall,
     list_memories,
-    get_memory,
     get_entity,
     list_entities,
     init_context,
@@ -65,9 +75,21 @@ _TOOLS = (
     server_health,
     export_memories,
     import_memories,
-    list_projects,
     drop_project,
 )
+
+# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (13
+# tools); `full` (default) exposes all 21. Maintenance and batch tools are
+# full-only, which keeps the per-turn schema small for interactive agents.
+_toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
+if _toolset == "core":
+    _TOOLS = tuple(t for t in _ALL_TOOLS if t.__name__ in _CORE_TOOL_NAMES)
+elif _toolset == "full":
+    _TOOLS = _ALL_TOOLS
+else:
+    logger.warning("Unknown MCP_TOOLSET=%s; exposing all tools", _toolset)
+    _toolset = "full"
+    _TOOLS = _ALL_TOOLS
 
 for _tool in _TOOLS:
     app.tool()(_tool)
