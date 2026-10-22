@@ -12,20 +12,19 @@ backed by PostgreSQL + pgvector (vector search) + Apache AGE (graph/Cypher).
 ## Architecture
 
 ```
-┌──────────────┐  MCP stdio/HTTP   ┌──────────────────────┐
-│  AI Agent     │ ◄──────────────► │  mcp_server/        │
-│ (Claude Code, │                  │  Python FastMCP      │
-│  Cursor, ...) │                  └──────────┬───────────┘
-└──────────────┘                             │
-                     ┌───────────────────────┼───────────┐
-                     │                       │           │
-                     ▼                       ▼           ▼
-              ┌──────────────┐      ┌──────────────┐
-              │  PostgreSQL   │      │  Inference   │
-              │  + pgvector   │      │  API (:8001) │
-              │  + Apache AGE │      │  Embeddings  │
-              └──────────────┘      │  + NLI (LLM) │
-                                    └──────────────┘
+┌──────────────┐  MCP stdio/HTTP    ┌────────────────────────┐
+│  AI Agent    │ ◄────────────────► │  mcp_server/           │
+│ (Claude Code,│                    │  Python FastMCP        │
+│  Cursor, ...)│                    └──────────┬─────────────┘
+└──────────────┘                               │
+                          ┌────────────────────┴────────────────────┐
+                          │                                         │
+                          ▼                                         ▼
+             ┌─────────────────────────┐               ┌─────────────────────────┐
+             │  PostgreSQL             │               │  Inference API          │
+             │  + pgvector             │               │  (:8001)                │
+             │  + Apache AGE           │               │  Embeddings + NLI       │
+             └─────────────────────────┘               └─────────────────────────┘
 ```
 
 ## Response Envelope

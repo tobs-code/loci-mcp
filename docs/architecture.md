@@ -78,11 +78,11 @@ $$) AS (name agtype, friend_name agtype);
 
 ```
 Agent ──MCP──> FastMCP tool ──> envelope
-                  │
-                  ├─ embed()  ──> inference /embed ──> vector
-                  ├─ search   ──> pgvector + FTS ──> RRF fusion ──> projection
-                  ├─ graph    ──> Apache AGE (Cypher)
-                  └─ postgres ──> per-project tables + global table
+                    │
+                    ├─ embed()  ──> inference /embed ──> vector
+                    ├─ search   ──> pgvector + FTS ──> RRF fusion ──> projection
+                    ├─ graph    ──> Apache AGE (Cypher)
+                    └─ postgres ──> per-project tables + global table
 ```
 
 Every tool returns the same envelope, so a caller never has to branch on the
