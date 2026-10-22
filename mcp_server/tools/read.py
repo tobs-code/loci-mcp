@@ -206,7 +206,10 @@ def recall(
     # "*" means every scope. It is resolved before the project name is
     # normalized, otherwise it would become a project called "*".
     all_projects = project == "*"
-    project = None if all_projects else _norm_project(project)
+    try:
+        project = None if all_projects else _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     warnings: list[str] = []
     if not query or not query.strip():
         return fail(STATUS_ERROR, "query must not be empty")
@@ -507,7 +510,10 @@ def list_memories(
     logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
                 entity, mem_type, limit, offset, project)
     raw_project = project
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     global_only = _is_global_scope(raw_project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
@@ -766,7 +772,10 @@ def get_entity(name: Annotated[
     """
     target = entity or name
     logger.info("get_entity name=%s", target)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if not target:
         return fail(STATUS_ERROR, "entity is required")
     if limit < 1:
@@ -922,7 +931,10 @@ def list_entities(
     logger.info("list_entities entity_type=%s limit=%s offset=%s project=%s",
                 entity_type, limit, offset, project)
     raw_project = project
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     global_only = _is_global_scope(raw_project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
@@ -1086,7 +1098,10 @@ def init_context(project: Annotated[
     `graph_entities_count` counts the graph nodes of the covered scopes.
     """
     all_projects = project == "*"
-    project = None if all_projects else _norm_project(project)
+    try:
+        project = None if all_projects else _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if detail not in ("slim", "full"):
         return fail(STATUS_ERROR, "detail must be 'slim' or 'full'")
     if limit < 1:

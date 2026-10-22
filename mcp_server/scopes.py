@@ -20,11 +20,20 @@ def _norm_project(project: str | None) -> str | None:
     "global" is the reserved name of the shared scope, so it can never be a
     project of its own (previously `project="global"` created an isolated
     `Project_global` graph that was invisible to global traversal).
+
+    A blank string is a caller mistake, not "no project": it would silently
+    write to the shared scope while the caller visibly asked for one. It
+    raises, so the envelope names the argument (data-driven call sites catch
+    this and report the affected item individually).
     """
     if project is None:
         return None
     name = str(project).strip()
-    if not name or name.lower() == "global":
+    if not name:
+        raise ValueError(
+            "project must not be an empty or whitespace-only string: pass a "
+            "name, 'global' for the shared scope, or omit it")
+    if name.lower() == "global":
         return None
     return name
 

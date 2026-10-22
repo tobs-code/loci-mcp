@@ -142,7 +142,12 @@ def drop_project(
     """
     logger.info("drop_project project=%s dry_run=%s", project, dry_run)
     raw = str(project or "").strip()
-    name = _norm_project(project)
+    try:
+        name = _norm_project(project)
+    except ValueError:
+        # A blank name answers with the documented "project is required"
+        # failure below instead of picking up the raw-value error.
+        name = None
     if not name:
         if raw.lower() == "global":
             return fail(STATUS_ERROR,

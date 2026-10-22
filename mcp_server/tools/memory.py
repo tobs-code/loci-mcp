@@ -157,9 +157,11 @@ def remember(
                           "marked as superseded.")] = None,
     check_contradictions: Annotated[
         bool,
-        Field(description="Check the new fact against existing facts of the same "
-                          "entity (NLI) and auto-supersede contradictions. Needs "
-                          "an entity and a configured LLM provider.")] = False,
+        Field(description="Check the new fact (NLI) against the nearest active "
+                          "memories of the scope and auto-supersede "
+                          "contradictions. With an entity, that entity's "
+                          "memories are candidates first; without one, all "
+                          "entities compete. Needs a configured LLM provider.")] = False,
     fuzzy_threshold: Annotated[
         float | None,
         Field(description="Similarity threshold 0.0-1.0 for semantic dedup "
@@ -198,7 +200,10 @@ def remember(
     """
     logger.info("remember entity=%s mem_type=%s importance=%s check_contradictions=%s fuzzy=%s scope=%s dedupe=%s",
                 entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope, dedupe)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if mem_type not in MEMORY_TYPES:
         return fail(STATUS_ERROR,
                     f"Invalid mem_type. Choose from: {', '.join(sorted(MEMORY_TYPES))}")
@@ -258,7 +263,7 @@ def remember(
         contradictions = []
         contradiction_skip: str | None = None
         nli_unavailable = check_contradictions and nli_configured() is False
-        if check_contradictions and entity and not nli_unavailable:
+        if check_contradictions and not nli_unavailable:
             try:
                 contradictions = _check_contradictions(
                     cur, content, entity, store_project, emb
@@ -344,16 +349,17 @@ def remember(
                 f"invalidated). The new fact was stored as active, so both "
                 f"versions are reachable now; verify this revert is intended"
             )
-        if check_contradictions and entity and contradictions:
+        if contradictions:
             warnings.append(
-                f"superseded {len(contradictions)} contradicting memory/facts"
-            )
+                f"superseded {len(contradictions)} contradicting memory/facts")
         elif nli_unavailable:
             warnings.append("contradiction check skipped: NLI provider is not configured")
         elif contradiction_skip:
             warnings.append(f"contradiction check skipped: {contradiction_skip}")
         elif check_contradictions and not entity:
-            warnings.append("contradiction check skipped: entity required")
+            warnings.append(
+                "no entity set: the contradiction check compared the fact "
+                "against the nearest memories across all entities")
         if superseded and not check_contradictions:
             warnings.append(f"superseded {len(superseded)} memory/facts")
         if carried_keys:
@@ -375,9 +381,12 @@ def remember(
             skip = (contradiction_skip
                     or ("NLI provider is not configured"
                         if nli_unavailable
-                        else ("entity required" if not entity else None)))
+                        else None))
             if skip:
                 contradictions_payload["skipped"] = skip
+            if not entity and not skip:
+                # Transparency: the check ran, but beyond the entity tag.
+                contradictions_payload["cross_entity"] = True
             payload["contradictions"] = contradictions_payload
         return ok(STATUS_STORED, id=mem_id, warnings=warnings, **payload)
     except Exception as e:
@@ -463,8 +472,10 @@ def remember_batch(
                           "across all facts.")] = None,
     check_contradictions: Annotated[
         bool,
-        Field(description="NLI-check every fact against existing facts of the "
-                          "same entity and auto-supersede contradictions.")] = False,
+        Field(description="NLI-check every fact against the nearest active "
+                          "memories of its scope and auto-supersede "
+                          "contradictions (facts with an entity get that "
+                          "entity's memories first).")] = False,
     scope: Annotated[
         Literal["global", "project"] | None,
         Field(description="Default scope for all facts (per-fact scope wins).")]= None,
@@ -485,14 +496,19 @@ def remember_batch(
     `dedupe` selects how duplicates are detected: "exact" (default, content
     hash), "semantic" (also vector similarity) or "off".
     `scope` sets the default scope for all facts; per-fact 'scope' wins.
-    Set check_contradictions=True to NLI-check each fact against existing
-    facts of the same entity and auto-supersede contradictions.
+    Set check_contradictions=True to NLI-check each fact against the nearest
+    active memories of its scope and auto-supersede contradictions (an
+    entity-scoped fact gets that entity's memories first; without an entity
+    all entities compete).
     Invalid facts are reported individually; the remaining facts are stored.
     """
     logger.info("remember_batch count=%s skip_duplicates=%s fuzzy=%s check_contradictions=%s scope=%s dedupe=%s",
                 len(facts) if isinstance(facts, list) else -1, skip_duplicates,
                 fuzzy_threshold, check_contradictions, scope, dedupe)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if scope is not None and scope not in VALID_SCOPES:
         return fail(STATUS_ERROR,
                     f"invalid scope {scope!r}; choose from "
@@ -537,7 +553,12 @@ def remember_batch(
         if not 0.0 <= importance <= 1.0:
             prepared.append((None, "importance must be between 0.0 and 1.0"))
             continue
-        fp = _norm_project(fact.get("project", project))
+        try:
+            fp = _norm_project(fact.get("project", project))
+        except ValueError as e:
+            # The whole batch must not fail for one malformed fact.
+            prepared.append((None, str(e)))
+            continue
         fscope = fact.get("scope") or scope or ("project" if fp else "global")
         if fscope not in VALID_SCOPES:
             prepared.append((None, f"invalid scope {fscope!r}"))
@@ -621,7 +642,7 @@ def remember_batch(
 
                 contradictions = []
                 contradiction_skip: str | None = None
-                if check_contradictions and spec["entity"]:
+                if check_contradictions:
                     try:
                         contradictions = _check_contradictions(
                             cur, spec["content"], spec["entity"], store_project,
@@ -681,10 +702,12 @@ def remember_batch(
                     entry["contradictions"]["skipped"] = contradiction_skip
                     entry.setdefault("warnings", []).append(
                         f"contradiction check skipped: {contradiction_skip}")
-                if not spec["entity"]:
-                    entry["contradictions"]["skipped"] = "entity required"
+                elif not spec["entity"]:
+                    # Transparency: the check ran, but across all entities.
+                    entry["contradictions"]["cross_entity"] = True
                     entry.setdefault("warnings", []).append(
-                        "contradiction check skipped: entity required")
+                        "no entity set: the contradiction check compared the "
+                        "fact against the nearest memories across all entities")
             results.append(entry)
         conn.commit()
     except Exception as e:
@@ -735,7 +758,10 @@ def update_memory(
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
                 memory_id, content is not None, importance is not None, metadata is not None)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     sets: list[str] = []
     params: list[Any] = []
 
@@ -853,7 +879,10 @@ def restore_memory(
     memory_id = (memory_id or "").strip()
     if not memory_id:
         return fail(STATUS_ERROR, "memory_id must not be empty")
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -946,7 +975,10 @@ def forget(
     logger.info("forget memory_id=%s entity_name=%s soft=%s dry_run=%s",
                 memory_id, entity_name, soft, dry_run)
     raw_project = project
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if not memory_id and not entity_name:
         return fail(STATUS_ERROR, "memory_id or entity_name is required")
     scope_name = project if project else "global"

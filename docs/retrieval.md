@@ -93,13 +93,16 @@ The full-text leg is OR-based: a document that contains one common word of a
 six-word query is a hit. The coverage factor (matched query lexemes / all
 query lexemes) scales its score down, but a hit that only the full-text leg
 found has no similarity to vouch for it. Such a hit is therefore dropped
-when it covers less than **0.2** of the query (`FTS_MIN_COVERAGE`).
+when it covers less than **0.3** of the query (`FTS_MIN_COVERAGE`), i.e. for
+queries of four or more lexemes a single-word match no longer survives.
 
 This keeps a genuine keyword hit ("ZEBRAFISH_TOKEN" in a longer query) and
-removes the noise hit: the query *"totally unrelated quantum banana smoothie
-recipe"* no longer returns the one memory that happens to contain the word
-"unrelated". Hits that the vector retriever found are never dropped by this
-filter.
+removes the noise hit: the query *"requests per minute limit"* returns the
+memory *"The pricing tier ... is $500 per month"* only through the word "per"
+(actually not a stopword for the english dictionary, coverage 1/4 = 0.25).
+Since `FTS_MIN_COVERAGE = 0.3` it is dropped.
+Actually not a real keyword hit: hits that the vector retriever found are never
+dropped by this filter.
 
 With `min_similarity=null` the filter is disabled and near-zero hits can
 appear as "relevant". When any returned hit has `_similarity < 0.35`, the
@@ -177,10 +180,18 @@ Every memory type is a candidate: a decision that contradicts a pattern is
 just as harmful as a fact that contradicts a fact, and restricting the
 comparison to `fact` hid most real conflicts.
 
+Entity tagging is not required. With an entity, that entity's memories get the
+15 candidate seats first and the leftovers go to cross-entity neighbours, so a
+differently tagged memory cannot hide a conflict. Without an entity all
+memories of the scope compete; the response sets `contradictions.cross_entity`
+and warns about the broader comparison, so it is never silent.
+
 ### Path B: `contradictions_report`
 
-1. All **active** memories of the entity are loaded (max 200; already
-   superseded pairs are done and not re-checked).
+1. All **active** memories of the given entity are loaded (max 200; already
+   superseded pairs are done and not re-checked). Without an entity the scan
+   is scope-wide: all active memories compete, so pairs across different
+   entities are reported too.
 2. **Vector self-join**: for each memory, the 20 nearest neighbours are fetched
    via `ORDER BY embedding <=>`.
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per

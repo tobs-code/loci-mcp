@@ -92,7 +92,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 ### Maintenance & Advanced
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts per entity (LLM NLI + vector neighbor pre-filter); `resolve="newest"` keeps the newer fact and supersedes the older |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector neighbor pre-filter); per entity or scope-wide without one; `resolve="newest"` keeps the newer fact and supersedes the older |
 | `export_memories` | Backup as JSON/JSONL: ids, `superseded_by`, timestamps, project and graph are preserved; payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore JSON/JSONL (`data` accepts object or string); explicit ids make re-import idempotent; graph is restored from JSON exports |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes); `dry_run` previews the counts |
@@ -125,9 +125,12 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   weighted at `FTS_WEIGHT = 0.6`, so a single common word cannot outrank the
   best semantic hit.
 - A hit that **only** the full-text leg found has no similarity to vouch for
-  it. It is dropped when it covers less than `FTS_MIN_COVERAGE` (0.2) of the
-  query, so a one-word match of a six-word query no longer comes back as the
-  only result. Hits the vector retriever found are never dropped by this.
+  it. It is dropped when it covers less than `FTS_MIN_COVERAGE` (0.3) of the
+  query, so a one-word match of a four-word query no longer comes back as the
+  only result: "per" is NOT a stopword for the english dictionary, so the
+  memory "... $500 per month" matched the query "requests per minute limit"
+  only through that one function word (coverage 1/4 = 0.25 < 0.3) and is now
+  dropped. Hits the vector retriever found are never dropped by this.
   `recall` reports the number as `dropped_by_coverage`.
 - RRF scores are normalized to `_rrf_norm` (0..1, best hit = 1.0);
   `_rrf_score` keeps the raw fusion value. RRF ranks by position, so it
@@ -283,9 +286,20 @@ contradicts a fact, and the old filter hid most real conflicts (the
 conflicting memory is often a decision, a pattern or a convention). The
 candidate count (15) is unchanged, so the number of NLI calls stays the same.
 
+→ **Change**: The check no longer requires an entity. With an entity, that
+entity's memories get the candidate seats first and the leftovers go to
+cross-entity neighbours, so a differently tagged memory cannot hide a conflict.
+Without an entity all memories of the scope compete; the response sets
+`contradictions.cross_entity = true` and warns "no entity set: the
+contradiction check compared the fact against the nearest memories across all
+entities", so the broader comparison is never silent.
+
 ### Path B: `contradictions_report` (Standalone-Tool)
 
-1. All **active** memories of the entity are loaded (max 200; already superseded pairs are done and not re-checked)
+1. All **active** memories of the given entity are loaded (max 200; already
+   superseded pairs are done and not re-checked). Without an entity the scan
+   is scope-wide: all active memories compete, so pairs across different
+   entities are reported too.
 2. **Vector self-join**: for each memory, the 20 nearest neighbors are fetched via `ORDER BY embedding <=>`
 3. Only the deduplicated candidate pairs are checked via `/nli` (configured LLM) – one call per memory, not per pair
 4. Pairs with confidence > 0.7 count as a contradiction
@@ -346,6 +360,10 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
   identifier limit, so long names and case variants cannot share a table.
 - `global` is reserved: passing `project="global"` means "no project" (global
   scope), it never creates a project of that name.
+- A blank or whitespace-only `project` is refused with a named argument error
+  (`ok: false`) instead of silently writing to the global scope; data-driven
+  call sites report the affected item individually (`remember_batch` the fact,
+  `import_memories` the record) instead of failing the whole call.
 - The `projects` registry maps suffix → original project name, so results
   show the name the caller passed. Existing plain-identifier tables keep
   working unchanged.
@@ -442,7 +460,7 @@ it explicitly.
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
 | `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`) |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
-| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Required; checks one entity at a time; `newest` supersedes the older fact of each confirmed pair |
+| `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of each confirmed pair |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project`, `dry_run` | `counts` splits memories/entities/relations; `entity="*"` + `project` purges a whole scope; `dry_run=True` counts exactly what the real call removes |
 | `restore_memory` | `memory_id`, `project` | Reverses a soft delete; only rows with `deleted_at` set can be restored |
 | `export_memories` | `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph` | Payload is returned in `data`; graph is only included in JSON exports |

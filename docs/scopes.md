@@ -34,6 +34,10 @@ long names and case variants cannot share a table.
 `global` is reserved: `project="global"` means "no project" (the global
 scope) and never creates a project of that name.
 
+A `project` that is blank or whitespace-only is refused with a named
+argument error instead of silently writing to the global scope. Omit the
+parameter, pass `"global"` explicitly, or name a real scope.
+
 The `projects` registry maps suffix → original name, so results show the name
 the caller passed. Existing plain-identifier tables keep working unchanged.
 

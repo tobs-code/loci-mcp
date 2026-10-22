@@ -86,7 +86,7 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 
 | Tool | What it does |
 |------|--------------|
-| `contradictions_report` | Find conflicting memories of one entity |
+| `contradictions_report` | Find conflicting memories, per entity or scope-wide |
 | `export_memories` / `import_memories` | Backup and restore, including the graph |
 | `drop_project` | Remove a project scope completely |
 | `server_health` | Check Postgres and the inference API |
@@ -119,8 +119,10 @@ recency may only take 30% of the ranking score — semantics always win.
 `min_decay_score` filters for "only fresh and important".
 
 **Contradictions clean themselves up.** With `check_contradictions=true` a new
-fact is compared against the existing memories of the same entity; a
-contradiction supersedes the old one automatically.
+fact is compared against the nearest active memories of its scope; a
+contradiction supersedes the old one automatically. Entity tagging is not
+required: with an entity, its memories get the candidate seats first, without
+one all memories compete (the answer reports `contradictions.cross_entity`).
 
 **The bootstrap is not a search.** `init_context` returns the *most recently
 changed* memories, so a fact the agent just stored is always there.

@@ -67,7 +67,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `supersede` | string? | Memory id this fact replaces. |
 | `supersede_content` | string? | Exact content of the memory this fact replaces. |
 | `supersede_last` | bool | Replace the newest memory of the same entity - only if the new fact is about the same topic (similarity >= 0.5), otherwise the fact is stored additionally and a warning is returned. |
-| `check_contradictions` | bool | NLI-check against the existing memories of the same entity and auto-supersede contradictions. |
+| `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
 | `fuzzy_threshold` | number? | Similarity threshold for `dedupe="semantic"` (default 0.9). |
 
@@ -253,7 +253,7 @@ scopes without active memories.
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required; `resolve="newest"` keeps the newer fact and supersedes the older |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included); `resolve="newest"` keeps the newer fact and supersedes the older |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |

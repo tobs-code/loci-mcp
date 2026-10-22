@@ -96,11 +96,15 @@ def test_contradictions_report_answers_with_the_envelope():
             result["results"][0]["b"]["id"]} == {first, second}
 
 
-def test_contradictions_report_without_entity_is_a_failed_envelope():
+def test_contradictions_report_without_entity_scans_the_scope():
+    # `entity` became optional: without it the report cross-checks every
+    # active memory of the scope, so a blank call is a valid scan, not an
+    # argument error. With fewer than two active memories it explains why.
     result = contradictions_report()
 
-    assert result["ok"] is False
-    assert "entity" in result["error"]
+    assert result["ok"] is True
+    assert result["count"] == 0
+    assert any("nothing to compare" in w for w in result["warnings"])
 
 
 def test_server_health_answers_with_the_envelope():

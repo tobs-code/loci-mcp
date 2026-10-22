@@ -112,8 +112,9 @@ def test_contradictions_report_finds_conflicting_active_facts():
     assert pair["confidence"] == 0.95
 
 
-def test_contradictions_report_requires_an_entity():
+def test_contradictions_report_without_entity_scans_the_whole_scope():
     report = contradictions_report()
 
-    assert report["ok"] is False
-    assert "entity" in report["error"]
+    assert report["ok"] is True
+    assert report["count"] == 0
+    assert any("nothing to compare" in w for w in report["warnings"])

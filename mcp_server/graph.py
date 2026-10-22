@@ -294,7 +294,10 @@ def relate(
     boost that `graph_boost` gives to the connected memories.
     """
     logger.info("relate %s ->[%s]-> %s weight=%s", from_entity, relation_type, to_entity, weight)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if not relation_type:
         return fail(STATUS_ERROR, "relation_type is required")
 
@@ -352,7 +355,10 @@ def relate_batch(
     call is idempotent and both directions of a relation can coexist.
     """
     logger.info("relate_batch count=%s project=%s", len(edges or []), project)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if not edges:
         return ok(STATUS_OK, count=0, results=[])
     conn = get_conn()
@@ -402,7 +408,10 @@ def unrelate(
     """Delete a single directed relation between two entities."""
     logger.info("unrelate %s -[%s]-> %s project=%s",
                 from_entity, relation_type, to_entity, project)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if not relation_type:
         return fail(STATUS_ERROR, "relation_type is required")
     try:
@@ -482,7 +491,10 @@ def find_connections(
     entity_name = entity or entity_name
     logger.info("find_connections entity=%s direction=%s relation_type=%s limit=%s project=%s",
                 entity_name, direction, relation_type, limit, project)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if not entity_name:
         return fail(STATUS_ERROR, "entity is required")
     if limit < 1:
@@ -576,7 +588,10 @@ def find_paths(from_entity: Annotated[
     """
     logger.info("find_paths from=%s to=%s max_hops=%s project=%s",
                 from_entity, to_entity, max_hops, project)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     try:
         max_hops = int(max_hops)
     except (TypeError, ValueError):

@@ -131,7 +131,10 @@ def export_memories(
     unchanged.
     """
     logger.info("export_memories format=%s project=%s graph=%s", format, project, include_graph)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if format not in ("json", "jsonl"):
         return fail(STATUS_ERROR,
                     f"unsupported format {format!r}; use 'json' or 'jsonl'",
@@ -275,7 +278,10 @@ def import_memories(
     """
     logger.info("import_memories format=%s skip_duplicates=%s fuzzy=%s",
                 format, skip_duplicates, fuzzy_threshold)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if format not in ("json", "jsonl"):
         return fail(STATUS_ERROR,
                     f"unsupported format {format!r}; use 'json' or 'jsonl'",
@@ -326,8 +332,15 @@ def import_memories(
             if not content:
                 skipped += 1
                 continue
-            target = (project if project is not None
-                      else _norm_project(rec.get("project")))
+            try:
+                target = (project if project is not None
+                          else _norm_project(rec.get("project")))
+            except ValueError as exc:
+                # A record with a broken project name must not abort the
+                # whole import: it is reported and skipped, like bad metadata.
+                errors.append(f"record {rec.get('id') or imported + skipped}: {exc}")
+                skipped += 1
+                continue
             table = _mem_table(target)
             if target:
                 _ensure_project_table(cur, target)
@@ -386,7 +399,12 @@ def import_memories(
 
             def _resolve(value):
                 scope = project if project is not None else _norm_project(value)
-                return _norm_project(scope)
+                try:
+                    return _norm_project(scope)
+                except ValueError:
+                    # A blank project in a graph record stays a data problem
+                    # of that record, not of the whole import.
+                    return None
 
             for ent in _as_list(graph.get("entities", [])):
                 if not isinstance(ent, dict) or not ent.get("name"):

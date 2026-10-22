@@ -221,7 +221,13 @@ def _check_contradictions(cur, content: str, entity: str | None,
                           project: str | None,
                           embedding_vec: list[float] | None = None,
                           max_candidates: int = 15) -> list[dict]:
-    """NLI-check the new fact against active memories of the same entity.
+    """NLI-check the new fact against the nearest active memories of the scope.
+
+    With an `entity`, that entity's memories are candidates first; any seats
+    left over go to the nearest neighbours from *other* entities, so a conflict
+    with a differently tagged memory is caught too (entity tagging should not
+    hide it). Without an `entity`, every active memory of the scope competes
+    for the candidate slots.
 
     Checks the project table *and* the global one, so a contradiction between
     a project fact and a global fact is detected (previously only the store
@@ -232,37 +238,55 @@ def _check_contradictions(cur, content: str, entity: str | None,
     comparison to `mem_type = 'fact'` hid most real conflicts, because the
     conflicting memory is often a decision, a pattern or a convention.
     """
-    if not entity:
-        return []
-
     candidates: list[tuple[str, str]] = []
     seen: set[str] = set()
     new_hash = _content_hash(content)
-    for table in _retrieval_tables(cur, project):
-        if embedding_vec is not None:
-            cur.execute(
-                f"SELECT id, content FROM {table} "
-                f"WHERE entity = %s AND content_hash <> %s "
-                f"AND embedding IS NOT NULL "
-                f"AND superseded_by IS NULL AND deleted_at IS NULL "
-                f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
-                (entity, new_hash, embedding_vec, max_candidates),
-            )
-        else:
-            cur.execute(
-                f"SELECT id, content FROM {table} "
-                f"WHERE entity = %s AND content_hash <> %s "
-                f"AND superseded_by IS NULL AND deleted_at IS NULL "
-                f"ORDER BY created_at DESC LIMIT %s",
-                (entity, new_hash, max_candidates),
-            )
-        for row in cur.fetchall():
-            if row[0] in seen:
-                continue
-            seen.add(row[0])
-            candidates.append((row[0], row[1]))
-        if len(candidates) >= max_candidates:
-            break
+    remaining = max_candidates
+
+    def _fetch(sql_where: str, params: list) -> None:
+        nonlocal remaining
+        if remaining <= 0:
+            return
+        for table in _retrieval_tables(cur, project):
+            if remaining <= 0:
+                break
+            if embedding_vec is not None:
+                cur.execute(
+                    f"SELECT id, content FROM {table} "
+                    f"WHERE {sql_where} AND content_hash <> %s "
+                    f"AND embedding IS NOT NULL "
+                    f"AND superseded_by IS NULL AND deleted_at IS NULL "
+                    f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
+                    params + [new_hash, embedding_vec, remaining],
+                )
+            else:
+                cur.execute(
+                    f"SELECT id, content FROM {table} "
+                    f"WHERE {sql_where} AND content_hash <> %s "
+                    f"AND superseded_by IS NULL AND deleted_at IS NULL "
+                    f"ORDER BY created_at DESC LIMIT %s",
+                    params + [new_hash, remaining],
+                )
+            for row in cur.fetchall():
+                if row[0] in seen:
+                    continue
+                seen.add(row[0])
+                candidates.append((row[0], row[1]))
+                remaining -= 1
+            if remaining <= 0:
+                break
+
+    # 1. The entity's own memories first - conflicts inside one entity are
+    #    the ones an agent notices, so they must get the candidate seats.
+    if entity:
+        _fetch("entity = %s", [entity])
+
+    # 2. Leftover seats go to the nearest neighbours from other entities
+    #    (all entities when no entity was given).
+    if entity:
+        _fetch("entity IS DISTINCT FROM %s", [entity])
+    else:
+        _fetch("TRUE", [])
 
     candidates = candidates[:max_candidates]
     if not candidates:

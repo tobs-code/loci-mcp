@@ -49,14 +49,17 @@ FTS_WEIGHT = 0.6
 # Minimum share of the query lexemes a full-text-only hit must cover.
 #
 # The full-text leg is OR-based: a document that contains one common word of
-# a six-word query is a hit. The coverage factor already scales its score
-# down (1/6 -> 0.17), but without a floor such a hit is still returned - and
+# a four-word query is a hit. The coverage factor already scales its score
+# down (1/4 -> 0.25), but without a floor such a hit is still returned - and
 # if nothing else matches, it is the *only* result, which reads like an
 # answer. A hit that the vector retriever did not find (so it has no
 # similarity to vouch for it) must therefore cover at least this share of
-# the query. 0.2 keeps a single-word match of a five-word query and drops
-# the one-word match of a six-word query.
-FTS_MIN_COVERAGE = 0.2
+# the query. 0.3 keeps a single-word match of a three-word query (0.33) and
+# drops the one-word matches of four or more query words - that case is
+# only ever reached via the dictionary's leftover function words ("per" is
+# not a stopword for the english dictionary), which the retrieval
+# measurement showed to be pure noise.
+FTS_MIN_COVERAGE = 0.3
 
 
 # Text search configuration for the full-text retriever. The dictionary has to

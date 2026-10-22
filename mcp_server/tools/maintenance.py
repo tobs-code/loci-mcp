@@ -19,8 +19,9 @@ logger = logging.getLogger(__name__)
 
 def contradictions_report(entity: Annotated[
         str | None,
-        Field(description="Entity to check. Required: the report works on one "
-                          "entity at a time.")] = None,
+        Field(description="Entity to check. Without it every active memory in "
+                          "the scope is cross-checked against its nearest "
+                          "neighbours (pairs across entities included).")] = None,
     project: Annotated[
         str | None,
         Field(description="Project scope. Without it only global memories are "
@@ -39,16 +40,22 @@ def contradictions_report(entity: Annotated[
 
     Uses vector similarity to find candidate pairs, then NLI to confirm.
     Returns pairs with confidence scores in [0, 1] (higher = more likely contradictory).
-    With `resolve="newest"` the older memory of every confirmed pair is
-    superseded by the newer one (recency decides; the report names the ids).
-    An empty result says in `warnings` why it is empty: nothing to compare,
-    no similar pair, or no contradiction among the checked pairs.
+    Without `entity` the scan is scope-wide: all active memories compete for
+    the candidate slots, so conflicts between differently tagged entities are
+    reported too. With `resolve="newest"` the older memory of every confirmed
+    pair is superseded by the newer one (recency decides; the report names the
+    ids). An empty result says in `warnings` why it is empty: nothing to
+    compare, no similar pair, or no contradiction among the checked pairs.
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
-    project = _norm_project(project)
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    if entity is not None:
+        entity = str(entity).strip() or None
     if not entity:
-        return fail(STATUS_ERROR, "entity parameter is required. "
-                                   "contradictions_report works on one entity at a time.")
+        logger.info("contradictions_report scanning the whole scope")
     inference = health_details()
     if inference is not None and inference.get("llm_configured") is False:
         return ok(STATUS_OK, count=0, results=[], warnings=[
@@ -65,8 +72,10 @@ def contradictions_report(entity: Annotated[
                                   include_embedding=True, include_superseded=False)
         if len(facts) < 2:
             conn.commit()
+            scope_desc = (f"entity {entity!r} has" if entity
+                          else f"the scope has")
             return ok(STATUS_OK, count=0, results=[], warnings=[
-                f"nothing to compare: entity {entity!r} has "
+                f"nothing to compare: {scope_desc} "
                 f"{len(facts)} active memory/memories - a contradiction needs "
                 f"at least two"
             ])
@@ -76,6 +85,14 @@ def contradictions_report(entity: Annotated[
         # fact id -> list of (neighbour id, neighbour content)
         checked: set[tuple[str, str]] = set()
         fact_ids = {f["id"] for f in facts}
+        # The self-join only sees the entity when one was given: a
+        # scope-wide scan must be able to report pairs across entities.
+        if entity:
+            entity_sql = "AND entity = %s"
+            entity_params: list[Any] = [entity]
+        else:
+            entity_sql = ""
+            entity_params = []
 
         for f in facts:
             if not f.get("embedding"):
@@ -94,12 +111,12 @@ def contradictions_report(entity: Annotated[
                     filter_params = [f["content"]]
                 cur.execute(
                     f"SELECT id, content FROM {table} "
-                    f"WHERE id != %s AND entity = %s "
+                    f"WHERE id != %s {entity_sql} "
                     f"{filter_sql} "
                     f"AND embedding IS NOT NULL "
                     f"AND superseded_by IS NULL AND deleted_at IS NULL "
                     f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
-                    [f["id"], entity] + filter_params
+                    [f["id"]] + entity_params + filter_params
                     + [f["embedding"], neighbors_per_fact],
                 )
                 for nid, ncontent in cur.fetchall():
@@ -153,14 +170,16 @@ def contradictions_report(entity: Annotated[
     # An empty result must say *why* it is empty: nothing to compare, no
     # similar pair, or no contradiction among the pairs that were checked.
     if not contradictions and not warnings:
+        scope_desc = (f"active memories of {entity!r}"
+                      if entity else "active memories of the scope")
         if not candidates:
             warnings.append(
-                f"no candidate pairs: no two active memories of {entity!r} "
+                f"no candidate pairs: no two {scope_desc} "
                 f"are similar enough to be worth comparing")
         else:
             warnings.append(
                 f"no contradictions found: {checked_pairs} similar pair(s) of "
-                f"entity {entity!r} were checked with NLI")
+                f"{scope_desc} were checked with NLI")
 
     resolved = 0
     if resolve == "newest" and contradictions:
