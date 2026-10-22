@@ -31,6 +31,62 @@ from mcp_server.scoring import (
 
 logger = logging.getLogger(__name__)
 
+
+def _row_is_active(row: dict) -> bool:
+    """True when the row is neither superseded nor soft-forgotten."""
+    return not row.get("superseded_by") and not row.get("deleted_at")
+
+
+def _skip_active_cross_scope_duplicate(
+    row: dict, table: str, seen_active: dict[str, str]
+) -> bool:
+    """Cross-scope dedup for a stream of rows, project tables first.
+
+    Only an *active* row may hide an *active* copy in another scope. History
+    (superseded and soft-forgotten rows) is never dropped: a superseded fact
+    used to disappear from `include_superseded` because an active copy with
+    the same content lived in the other scope. Copies inside one scope stay
+    visible too - `dedupe="off"` deliberately allows them.
+    """
+    c_hash = row.get("content_hash") or ""
+    if not c_hash or not _row_is_active(row):
+        return False
+    previous = seen_active.get(c_hash)
+    if previous is not None and previous != table:
+        return True
+    seen_active[c_hash] = table
+    return False
+
+
+def _dedup_rows_across_scopes(rows: list[dict]) -> list[dict]:
+    """Drop active cross-scope copies of the same content.
+
+    Same rule as `_skip_active_cross_scope_duplicate`, but for a complete row
+    set: inactive rows survive, and copies inside the winning scope survive
+    (`dedupe="off"` deliberately allows them). An active project table wins
+    over the global one; when several project tables hold the same content the
+    first one wins, so a row set must be ordered project tables first.
+    """
+    groups: dict[str, list[dict]] = {}
+    kept: list[dict] = []
+    for row in rows:
+        c_hash = row.get("content_hash") or ""
+        if not c_hash or not _row_is_active(row):
+            kept.append(row)
+            continue
+        groups.setdefault(c_hash, []).append(row)
+    for group in groups.values():
+        def scope(row: dict) -> str:
+            table = row.get("_table")
+            if table:
+                return "global" if table == "memories" else table
+            return row.get("_project") or "global"
+        project_rows = [r for r in group if scope(r) != "global"]
+        winner = scope(project_rows[0]) if project_rows else scope(group[0])
+        kept.extend(r for r in group if scope(r) == winner)
+    return kept
+
+
 def _fts_lexemes(cur, query_text: str | None) -> list[str]:
     """The query lexemes after stemming and stop word removal.
 
@@ -203,36 +259,39 @@ def _search_memories_rrf(
     text_candidates.sort(key=lambda c: -c[0])
 
     # 3. RRF Fusion
-    vector_results: dict[str, float] = {}
-    text_results: dict[str, float] = {}
-    similarities: dict[str, float] = {}
-    text_scores: dict[str, float] = {}
-    coverages: dict[str, float] = {}
-    table_of: dict[str, str] = {}
+    # The key is (table, id): a memory id is unique per scope, not globally,
+    # and an import can copy the same id into another scope. Keying by id
+    # alone would let the two unrelated rows overwrite each other.
+    Key = tuple[str, str]
+    vector_results: dict[Key, float] = {}
+    text_results: dict[Key, float] = {}
+    similarities: dict[Key, float] = {}
+    text_scores: dict[Key, float] = {}
+    coverages: dict[Key, float] = {}
 
     for rank, (distance, row_id, table) in enumerate(vec_candidates[:50], 1):
-        vector_results[row_id] = 1.0 / (k + rank)
-        similarities[row_id] = 1.0 - distance
-        table_of.setdefault(row_id, table)
+        key = (table, row_id)
+        vector_results[key] = 1.0 / (k + rank)
+        similarities[key] = 1.0 - distance
     for rank, (_, _, row_id, table) in enumerate(text_candidates[:50], 1):
-        text_results[row_id] = FTS_WEIGHT / (k + rank)
-        table_of.setdefault(row_id, table)
+        text_results[(table, row_id)] = FTS_WEIGHT / (k + rank)
 
     max_text_rank = max((r for r, _, _, _ in text_candidates[:50]), default=0.0)
     lexeme_count = max(1, len(fts_lexemes))
-    for rank, (ts_rank, matched, row_id, _table) in enumerate(text_candidates[:50], 1):
+    for rank, (ts_rank, matched, row_id, table) in enumerate(text_candidates[:50], 1):
         # Normalized full-text evidence: the best text hit is 1.0, weaker
         # hits fall off with their text rank. Multiply by query coverage so a
         # hit that matched only one word of a multi-word query cannot look
         # like a perfect match.
         rank_norm = (ts_rank / max_text_rank) if max_text_rank else 0.0
         coverage = min(1.0, matched / lexeme_count) if fts_lexemes else 1.0
-        text_scores[row_id] = rank_norm * coverage
-        coverages[row_id] = coverage
+        key = (table, row_id)
+        text_scores[key] = rank_norm * coverage
+        coverages[key] = coverage
 
     fused_scores = {
-        row_id: vector_results.get(row_id, 0.0) + text_results.get(row_id, 0.0)
-        for row_id in set(vector_results) | set(text_results)
+        key: vector_results.get(key, 0.0) + text_results.get(key, 0.0)
+        for key in set(vector_results) | set(text_results)
     }
     # A hit that only the full-text leg found has no similarity to vouch for
     # it. If it covers only a sliver of the query it is noise, and if it is
@@ -240,11 +299,11 @@ def _search_memories_rrf(
     # vector retriever found are never dropped here.
     dropped_by_coverage = 0
     if fts_lexemes:
-        weak = [row_id for row_id in fused_scores
-                if row_id not in similarities
-                and coverages.get(row_id, 1.0) < FTS_MIN_COVERAGE]
-        for row_id in weak:
-            del fused_scores[row_id]
+        weak = [key for key in fused_scores
+                if key not in similarities
+                and coverages.get(key, 1.0) < FTS_MIN_COVERAGE]
+        for key in weak:
+            del fused_scores[key]
         dropped_by_coverage = len(weak)
     if not fused_scores:
         if stats is not None:
@@ -262,16 +321,17 @@ def _search_memories_rrf(
 
     # 4. Load details per table (project first), dropping cross-table duplicates
     rows: list[dict] = []
-    seen_hashes: set[str] = set()
+    seen_active_hashes: dict[str, str] = {}
     project_names = _project_names(cur)
     for table in tables:
-        ids = [row_id for row_id in top_ids if table_of.get(row_id) == table]
+        ids = [row_id for (cand_table, row_id) in top_ids if cand_table == table]
         if not ids:
             continue
         cur.execute(f"SELECT * FROM {table} WHERE id = ANY(%s)", (ids,))
         colnames = [desc[0] for desc in cur.description]
         by_id = {r[0]: dict(zip(colnames, r)) for r in cur.fetchall()}
         for row_id in ids:
+            key = (table, row_id)
             d = by_id.get(row_id)
             if d is None:
                 continue
@@ -279,22 +339,21 @@ def _search_memories_rrf(
                 d["_project"] = "global"
             else:
                 d["_project"] = project_names.get(table[4:], table[4:])
-            c_hash = d.get("content_hash") or ""
-            if c_hash and c_hash in seen_hashes:
+            if _skip_active_cross_scope_duplicate(
+                d, table, seen_active_hashes
+            ):
                 continue
-            if c_hash:
-                seen_hashes.add(c_hash)
-            d["_rrf_score"] = fused_scores.get(row_id, 0.0)
+            d["_rrf_score"] = fused_scores.get(key, 0.0)
             d["_rrf_norm"] = d["_rrf_score"] / max_rrf
-            d["_similarity"] = round(similarities[row_id], 4) if row_id in similarities else None
+            d["_similarity"] = round(similarities[key], 4) if key in similarities else None
             d["_distance"] = round(1.0 - d["_similarity"], 4) if d["_similarity"] is not None else None
-            if row_id in text_scores:
-                d["_text_score"] = round(text_scores[row_id], 4)
+            if key in text_scores:
+                d["_text_score"] = round(text_scores[key], 4)
             # Relevance combines both signals, so a memory found by the
             # full-text retriever alone is still ranked above a weak vector
             # match instead of being flattened into the same RRF band.
-            relevance = _relevance_score(similarities.get(row_id, 0.0),
-                                         text_scores.get(row_id, 0.0))
+            relevance = _relevance_score(similarities.get(key, 0.0),
+                                         text_scores.get(key, 0.0))
             # A project-scoped row wins over an identical global one: the
             # global scope is the fallback, not an equal peer. The boost is
             # compressed towards 1 instead of added and clamped, so strong
@@ -325,8 +384,8 @@ def _search_memories_rrf(
             "dropped_by_similarity": dropped_by_similarity,
             "dropped_by_coverage": dropped_by_coverage,
             "min_coverage": FTS_MIN_COVERAGE,
-            "fulltext_only": sum(1 for row_id in fused_scores
-                                 if row_id not in similarities),
+            "fulltext_only": sum(1 for key in fused_scores
+                                 if key not in similarities),
         })
 
     # 5. Re-rank
@@ -397,7 +456,7 @@ def _search_memories(
             "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
 
     rows: list[dict] = []
-    seen_hashes: set[str] = set()
+    seen_active_hashes: dict[str, str] = {}
     dropped_by_similarity = 0
     dropped_by_coverage = 0
 
@@ -484,11 +543,10 @@ def _search_memories(
                     dropped_by_coverage += 1
                     continue
 
-            c_hash = d.get("content_hash") or ""
-            if c_hash and c_hash in seen_hashes:
+            if _skip_active_cross_scope_duplicate(
+                d, table, seen_active_hashes
+            ):
                 continue
-            if c_hash:
-                seen_hashes.add(c_hash)
             if not include_embedding:
                 d.pop("embedding", None)
             if include_decay:
@@ -677,16 +735,19 @@ def _search_memories_graph_boost(
         if "_graph_weight" in r:
             r["_graph_boost"] = graph_boost_weight * r["_graph_weight"]
         graph_boost = r.get("_graph_boost", 0.0)
-        decay_norm = r.get("_decay_norm", 0.0) if include_decay else 0.0
         # Graph candidates were not retrieved by relevance: they count as
         # relevance 0 and are lifted by the boost only.
         relevance = r.get("_relevance_score") or 0.0
 
-        # Final score: relevance (blended with decay) plus the graph boost,
-        # always inside the documented 0..1 range.
-        r["_final_score"] = _clamp01(
-            _blend_scores(relevance, decay_norm) + graph_boost
-        )
+        # Final score: relevance (blended with decay when asked for) plus the
+        # graph boost, always inside the documented 0..1 range. Without decay
+        # the blend must not shrink relevance to 70% - that made a boosted hit
+        # score *lower* than the same hit without `graph_boost`.
+        if include_decay:
+            base = _blend_scores(relevance, r.get("_decay_norm", 0.0))
+        else:
+            base = relevance
+        r["_final_score"] = _clamp01(base + graph_boost)
 
     # Sort by final score and limit
     all_results.sort(key=lambda x: -x.get("_final_score", 0))

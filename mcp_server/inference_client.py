@@ -1,5 +1,7 @@
 import logging
 import os
+import threading
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -9,14 +11,17 @@ INFERENCE_URL = os.environ.get(
     "http://localhost:8001",
 )
 
-_session = None
+_local = threading.local()
 
 
 def _get_session():
-    global _session
-    if _session is None:
-        _session = requests.Session()
-    return _session
+    """One session per thread: `requests.Session` is not thread-safe, and
+    `contradictions_report` calls this client from a small worker pool."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _local.session = session
+    return session
 
 
 def embed(texts: list[str], mode: str = "document") -> list[list[float]]:
@@ -51,18 +56,43 @@ def nli_detailed(query: str,
         body["query_entity"] = query_entity
     if document_entities is not None:
         body["document_entities"] = document_entities
-    resp = _get_session().post(
-        f"{INFERENCE_URL}/nli",
-        json=body,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    if payload.get("error"):
+    last_error: str | None = None
+    # A provider occasionally returns unparseable JSON. That is a transient
+    # model/format hiccup, not an outage: retry once instead of reporting the
+    # whole contradiction scan as incomplete.
+    for attempt in range(2):
+        resp = _get_session().post(
+            f"{INFERENCE_URL}/nli",
+            json=body,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            last_error = f"response was not valid NLI JSON: {e}"
+            if attempt == 0:
+                logger.warning("NLI response invalid, retrying once: %s",
+                               last_error)
+                continue
+            raise RuntimeError(last_error) from e
+        error = payload.get("error")
+        scores = payload.get("contradiction_scores")
+        if not error:
+            if (isinstance(scores, list) and len(scores) == len(documents)):
+                return scores, payload.get("partial_error")
+            error = ("response did not contain one contradiction score per "
+                     "document")
+        last_error = str(error)
+        retryable = "json" in last_error.lower() or "parse" in last_error.lower()
+        if attempt == 0 and retryable:
+            logger.warning("NLI response invalid, retrying once: %s",
+                           last_error)
+            continue
         # The scores are zeros from a failed run, not a real judgment:
         # callers must surface this instead of trusting 0.0 as "neutral".
-        raise RuntimeError(payload["error"])
-    return payload["contradiction_scores"], payload.get("partial_error")
+        raise RuntimeError(last_error)
+    raise RuntimeError(last_error or "NLI failed")
 
 
 def nli(query: str, documents: list[str],

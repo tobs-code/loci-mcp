@@ -36,6 +36,7 @@ from mcp_server.scopes import (
 )
 from mcp_server.scoring import _decay_norm
 from mcp_server.search import (
+    _dedup_rows_across_scopes,
     _extra_conditions,
     _search_memories,
     _search_memories_graph_boost,
@@ -459,8 +460,9 @@ def list_memories(
         Field(description="Maximum number of results (default 20).")] = 20,
     project: Annotated[
         str | None,
-        Field(description="Project scope. Without it every scope is listed; "
-                          "'global' lists only the shared scope.")] = None,
+        Field(description="Project scope. Without it (or with '*') every "
+                          "scope is listed; 'global' lists only the shared "
+                          "scope.")] = None,
     include_superseded: Annotated[
         bool,
         Field(description="Also list superseded memories (history).")] = False,
@@ -515,8 +517,9 @@ def list_memories(
     """Browse stored memories without a search query.
 
     Newest first. Project scope also lists global memories, like `recall`.
-    Without `project` every scope is listed; `project="global"` lists only
-    the shared scope. Set `fields` to narrow the returned columns. Set
+    Without `project` (or with `project="*"`) every scope is listed;
+    `project="global"` lists only the shared scope. Set `fields` to narrow
+    the returned columns. Set
     `include_global=False` to restrict a project browse to project memories.
     `updated_after` and `metadata_filter` narrow the result set, `order_by`
     changes the sorting and `contains` filters on a literal substring of the
@@ -532,11 +535,12 @@ def list_memories(
     logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
                 entity, mem_type, limit, offset, project)
     raw_project = project
+    all_projects = project == "*"
     try:
-        project = _norm_project(project)
+        project = None if all_projects else _norm_project(project)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    global_only = _is_global_scope(raw_project)
+    global_only = not all_projects and _is_global_scope(raw_project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
     if offset < 0:
@@ -565,21 +569,22 @@ def list_memories(
                     "order_by must be one of updated_at, created_at, "
                     "access_count, importance")
     conn = get_conn()
-    rows: list[dict] = []
     warnings: list[str] = []
     try:
         cur = conn.cursor()
         unknown = _unknown_project_warning(cur, project)
         if unknown:
             warnings.append(unknown)
-        if project:
+        if all_projects:
+            tables = _all_mem_tables(cur)
+        elif project:
             tables = _retrieval_tables(cur, project)
         elif global_only:
             # The caller asked for the shared scope explicitly: only that one.
             tables = ["memories"]
         else:
             tables = _all_mem_tables(cur)
-        if project and not include_global:
+        if (project or all_projects) and not include_global:
             tables = [table for table in tables if table != "memories"]
         conditions: list[str] = []
         params: list[Any] = []
@@ -615,60 +620,70 @@ def list_memories(
         conditions.extend(extra_conditions)
         params.extend(extra_params)
         where = " AND ".join(conditions)
-        # Oversample: the same content can live in several scopes and the
-        # cross-scope dedup below removes the copies again. Without the
-        # reserve a page could come back short.
-        fetch = (offset + limit) * 2
-        total = 0
+        # Two phases. First the light columns of every match: dedup and paging
+        # must see the whole set, otherwise `total`, `has_more` and the page
+        # disagree. Only then the full rows of this page are loaded, so a
+        # large scope does not ship every embedding vector.
+        index_rows: list[dict] = []
         for table in tables:
-            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
-            total += cur.fetchone()[0]
             project_names = None if table == "memories" else _project_names(cur)
+            scope = ("global" if table == "memories"
+                     else project_names.get(table[4:], table[4:]))
             cur.execute(
-                f"SELECT * FROM {table} WHERE {where} "
-                f"ORDER BY {order_column} DESC, id LIMIT %s",
-                params + [fetch],
+                f"SELECT id, content_hash, superseded_by, deleted_at, "
+                f"{order_column} AS _order FROM {table} WHERE {where}",
+                params,
             )
-            columns = [d[0] for d in cur.description]
-            table_rows = cur.fetchall()
-            for row in table_rows:
-                item = dict(zip(columns, row))
-                if table == "memories":
-                    item["_project"] = "global"
-                else:
-                    item["_project"] = project_names.get(table[4:], table[4:])
-                rows.append(item)
+            for (row_id, c_hash, superseded_by,
+                 deleted_at, order_value) in cur.fetchall():
+                index_rows.append({
+                    "id": row_id,
+                    "content_hash": c_hash,
+                    "superseded_by": superseded_by,
+                    "deleted_at": deleted_at,
+                    "_order": order_value,
+                    "_project": scope,
+                    "_table": table,
+                })
         conn.commit()
     except Exception as e:
         conn.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    # The rows come from several tables: sort globally before trimming.
-    unique = list(rows)
-    unique.sort(key=lambda r: (r.get(order_column) is not None,
-                                r.get(order_column)), reverse=True)
-    # Cross-scope dedup: the same content can live in a project and in the
-    # global scope. The project copy wins, like it does in `recall`.
-    by_hash: dict[str, dict] = {}
-    without_hash: list[dict] = []
-    for row in unique:
-        c_hash = row.get("content_hash") or ""
-        if not c_hash:
-            without_hash.append(row)
-            continue
-        current = by_hash.get(c_hash)
-        if current is None:
-            by_hash[c_hash] = row
-            continue
-        if (current.get("_project") == "global"
-                and row.get("_project") != "global"):
-            by_hash[c_hash] = row
-    unique = list(by_hash.values()) + without_hash
-    unique.sort(key=lambda r: (r.get(order_column) is not None,
-                                r.get(order_column)), reverse=True)
-    window = unique[offset:offset + limit]
-    has_more = len(unique) > offset + limit
+    unique = _dedup_rows_across_scopes(index_rows)
+    unique.sort(key=lambda r: (r.get("_order") is not None,
+                                r.get("_order"),
+                                str(r.get("id") or "")), reverse=True)
+    total = len(unique)
+    window_index = unique[offset:offset + limit]
+    has_more = total > offset + limit
+    # Full rows for the page only, then restore the index order.
+    page: dict[tuple[str, str], dict] = {}
+    if window_index:
+        scope_by_key = {(r["_table"], r["id"]): r["_project"]
+                        for r in window_index}
+        by_table: dict[str, list[str]] = {}
+        for r in window_index:
+            by_table.setdefault(r["_table"], []).append(r["id"])
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for table, ids in by_table.items():
+                cur.execute(f"SELECT * FROM {table} WHERE id = ANY(%s)", (ids,))
+                columns = [d[0] for d in cur.description]
+                for row in cur.fetchall():
+                    item = dict(zip(columns, row))
+                    item["_project"] = scope_by_key[(table, item["id"])]
+                    page[(table, item["id"])] = item
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return fail(STATUS_ERROR, str(e))
+        finally:
+            conn.close()
+    window = [page[(r["_table"], r["id"])]
+              for r in window_index if (r["_table"], r["id"]) in page]
     projection_fields = fields
     if include_deleted:
         # Without this the caller could not tell a forgotten row from an
@@ -799,12 +814,21 @@ def get_entity(name: Annotated[
     Set fields=["id", "content"] to receive only the named memory columns.
     Set include_global=False to restrict a project lookup to project memories.
     The relation-context sentences of the entity's edges are included, even
-    though they are stored under the synthetic entity `<from>_<rel>_<to>`.
+    though they are stored under the synthetic entity `<from>_<rel>_<to>`;
+    `total` counts them too.
     The memories are paged with `limit`/`offset`; `total` counts them all, so
     a truncated answer is visible instead of looking complete.
+    `project="*"` is rejected: the answer describes exactly one entity.
     """
     target = entity or name
     logger.info("get_entity name=%s", target)
+    if project == "*":
+        return fail(
+            STATUS_ERROR,
+            "project='*' is not supported by get_entity: the answer describes "
+            "exactly one entity. Omit `project` for the global scope, pass a "
+            "project name, or use list_entities to browse every scope",
+        )
     try:
         project = _norm_project(project)
     except ValueError as e:
@@ -931,8 +955,9 @@ def list_entities(
         Field(description="Maximum number of results (default 50).")] = 50,
     project: Annotated[
         str | None,
-        Field(description="Project scope. Without it every scope is listed; "
-                          "'global' lists only the shared scope.")] = None,
+        Field(description="Project scope. Without it (or with '*') every "
+                          "scope is listed; 'global' lists only the shared "
+                          "scope.")] = None,
     include_global: Annotated[
         bool,
         Field(description="True (default) lists global entities as well; False "
@@ -948,8 +973,9 @@ def list_entities(
     Returns graph entities (created via `relate`) plus entity names that only
     exist on memories. With `project`, that project and global scope are
     listed by default; set `include_global=False` for strict project
-    isolation. Without `project` every scope is listed; `project="global"`
-    lists only the shared scope. Each row carries its `project`; `graph_node`
+    isolation. Without `project` (or with `project="*"`) every scope is
+    listed; `project="global"` lists only the shared scope. Each row carries
+    its `project`; `graph_node`
     is false for memory-only entities. The `type` column says which kind an
     entity is: 'graph' (with the raw AGE label of its scope in `label`) or
     'memory-only'. Synthetic relation-context entities
@@ -965,11 +991,12 @@ def list_entities(
     logger.info("list_entities entity_type=%s limit=%s offset=%s project=%s",
                 entity_type, limit, offset, project)
     raw_project = project
+    all_projects = project == "*"
     try:
-        project = _norm_project(project)
+        project = None if all_projects else _norm_project(project)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    global_only = _is_global_scope(raw_project)
+    global_only = not all_projects and _is_global_scope(raw_project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
     if offset < 0:
@@ -987,7 +1014,7 @@ def list_entities(
             tables = ["memories"]
         else:
             tables = _all_mem_tables(cur)
-        if project and not include_global:
+        if (project or all_projects) and not include_global:
             tables = [table for table in tables if table != "memories"]
         names = _project_names(cur)
         scope_of = {t: (names.get(t[len("mem_"):], t[len("mem_"):])
@@ -1001,6 +1028,9 @@ def list_entities(
             scope_params = [project]
         elif global_only:
             scope_conditions = ["project = 'global'"]
+            scope_params = []
+        elif all_projects and not include_global:
+            scope_conditions = ["project <> 'global'"]
             scope_params = []
         else:
             scope_conditions = ["TRUE"]

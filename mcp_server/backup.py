@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.graph import _ensure_graph_entity, _relate_edges
@@ -45,6 +46,12 @@ def _export_memories_json(cur, project: str | None,
         for row in cur.fetchall():
             rec = dict(zip(colnames, row))
             rec["project"] = scope_name
+            # The forgotten marker is internal bookkeeping, not a supersede
+            # link: exporting it would write the sentinel back on import and
+            # make a forgotten row look superseded by a fake memory id.
+            if (rec.get("deleted_at") is not None
+                    and rec.get("superseded_by") == SENTINEL_FORGOTTEN):
+                rec["superseded_by"] = None
             if "embedding" in rec and isinstance(rec["embedding"], str):
                 rec["embedding"] = json.loads(rec["embedding"])
             out.append(rec)
@@ -189,9 +196,10 @@ def export_memories(
             parts.append(f"{superseded_count} superseded")
         if forgotten_count:
             parts.append(f"{forgotten_count} forgotten")
+        where = f" of project {project!r}" if project else " across all scopes"
         warnings.append(
-            "export excludes " + " and ".join(parts) + " memories of this "
-            "scope; pass include_superseded=true for a complete backup")
+            "export excludes " + " and ".join(parts) + " memories"
+            + where + "; pass include_superseded=true for a complete backup")
     if format == "jsonl":
         data = "\n".join(json.dumps(r) for r in records)
         return ok(STATUS_OK, format=format, count=len(records), data=data,
@@ -320,7 +328,9 @@ def import_memories(
     skipped = 0
     errors: list[str] = []
     graph_entities = 0
+    graph_entities_created = 0
     graph_relations = 0
+    graph_relations_created = 0
     try:
         cur = conn.cursor()
         for rec in records:
@@ -409,8 +419,11 @@ def import_memories(
             for ent in _as_list(graph.get("entities", [])):
                 if not isinstance(ent, dict) or not ent.get("name"):
                     continue
-                _ensure_graph_entity(cur, ent["name"], _resolve(ent.get("project")),
-                                     ent.get("type"))
+                if _ensure_graph_entity(
+                    cur, ent["name"], _resolve(ent.get("project")),
+                    ent.get("type"),
+                ):
+                    graph_entities_created += 1
                 graph_entities += 1
 
             grouped: dict[Any, list[dict]] = {}
@@ -426,8 +439,10 @@ def import_memories(
                     "weight": float(rel.get("weight", 1.0)),
                 })
             for scope, edges in grouped.items():
-                _relate_edges(cur, edges, scope)
-                graph_relations += len(edges)
+                restored = _relate_edges(cur, edges, scope)
+                graph_relations += len(restored)
+                graph_relations_created += sum(
+                    1 for edge in restored if edge.get("status") == "created")
 
         conn.commit()
     except Exception as e:
@@ -440,8 +455,14 @@ def import_memories(
     result = {"imported": imported, "skipped": skipped,
               "invalid": len(errors)}
     if graph is not None:
+        # `graph_entities`/`graph_relations` count the records the import
+        # processed; the `*_created` keys count what did not exist before.
+        # MERGE updates an existing node/edge instead of duplicating it, so
+        # processing a record is not the same as creating one.
         result["graph_entities"] = graph_entities
+        result["graph_entities_created"] = graph_entities_created
         result["graph_relations"] = graph_relations
+        result["graph_relations_created"] = graph_relations_created
     if errors:
         result["errors"] = errors[:5]
     return ok(STATUS_OK, **result)

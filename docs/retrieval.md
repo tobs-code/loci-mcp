@@ -31,14 +31,18 @@ query side always match, a changed dictionary is migrated at startup.
   with a project they include that project's **and** global memories by
   default.
 - `list_memories` and `list_entities` list all scopes when `project` is
-  omitted, and project + global by default when it is set.
+  omitted or `project="*"`, and project + global by default when a project
+  name is set.
 - `project="global"` means the **shared scope** in every read tool - it is not
   "all scopes". In the two browse tools it is stricter than omitting the
   parameter; in `recall` it is the same (only the global scope is searched).
 - `init_context` uses the global scope when `project` is omitted, project +
   global when set, and all scopes with `project="*"`.
 - `recall` accepts `project="*"` too: it then searches every scope at once.
-  Without it a project search only covers that project plus the global one.
+  `get_entity` rejects `"*"`: its answer describes exactly one entity.
+- Cross-scope dedup only drops an **active** copy in another scope. Superseded
+  and soft-forgotten rows are history and stay visible; two active rows in the
+  same scope (allowed by `dedupe="off"`) both stay as well.
 - Pass `include_global=false` for project-only reads.
 
 A project that does not exist is never silently ignored: the read tools
@@ -64,7 +68,7 @@ both scopes, the project copy wins.
 | `_scope_boost` | The compressed boost a project row gets on top of `_relevance_score`: `0.05 × (1 − relevance)`, at most 0.05 for a weak hit. |
 | `_rrf_score` / `_rrf_norm` | Raw RRF fusion value and its normalized form. |
 | `_decay_score` / `_decay_norm` | Raw decay value (uncapped) and the normalized 0..1 score. |
-| `_final_score` | The ranking score in 0..1: relevance blended with decay plus the graph boost. Only present with `include_decay=true` or `graph_boost=true`. |
+| `_final_score` | The ranking score in 0..1: relevance blended with decay plus the graph boost. Without `include_decay` the base is the plain relevance, so `graph_boost` cannot lower a query hit. Only present with `include_decay=true` or `graph_boost=true`. |
 | `_graph_boost` / `_graph_source` / `_graph_weight` | Describe a graph hit: the boost, the connected entity and the edge weight. |
 
 `_relevance_score` is the number to compare hits by. It combines the two
@@ -146,9 +150,10 @@ Memories age with a half-life of 90 days.
 
 `graph_boost=true` traverses one hop in the scope graph, loads up to 5
 memories per connected entity and adds `_graph_boost = 0.3 * edge weight` on
-top of the blended relevance/decay score. Edge weights are limited to 0.0-1.0,
-so a single edge cannot dominate the ranking. Graph hits have no similarity
-and count as relevance 0 — they are lifted by the boost only.
+top of the relevance (blended with decay only when `include_decay=true`).
+Edge weights are limited to 0.0-1.0, so a single edge cannot dominate the
+ranking. Graph hits have no similarity and count as relevance 0 — they are
+lifted by the boost only.
 
 The expansion point is `graph_entity`; `entity` is the fallback. With
 `graph_entity` the query search stays unfiltered ("query hits + graph
@@ -198,7 +203,9 @@ and warns about the broader comparison, so it is never silent.
 2. **Vector self-join**: for each memory, the 20 nearest neighbours are fetched
    via `ORDER BY embedding <=>`.
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
-   memory, not one call per pair.
+   memory, not one call per pair. The calls run in a bounded pool (8 workers)
+   and are reported in candidate order; a scope-wide scan used to hit the
+   client timeout when every call ran sequentially.
 4. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
    the entity of both facts and a `cross_entity` flag.
 5. `resolve="newest"` (opt-in) keeps the most recently updated memory of

@@ -1,5 +1,6 @@
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -161,18 +162,53 @@ def contradictions_report(entity: Annotated[
     nli_failed: str | None = None
     checked_pairs = 0
     try:
-        for f, neighbours in candidates.values():
-            if len(contradictions) >= limit:
-                break
+        candidate_list = list(candidates.values())
+
+        def _score_fact(item: tuple[dict, list[tuple[str, str]]]):
+            fact, neighbours = item
             # One LLM call per fact instead of one per pair. The entity
             # labels let the NLI model judge whether both facts describe the
             # same subject - a differing port of two different services is
             # not a contradiction.
-            scores, partial = nli_detailed(
-                f["content"], [n[1] for n in neighbours],
-                query_entity=f.get("entity"),
+            return nli_detailed(
+                fact["content"], [n[1] for n in neighbours],
+                query_entity=fact.get("entity"),
                 document_entities=[n[2] for n in neighbours],
             )
+
+        # NLI is a network round trip per fact. A scope-wide scan of a few
+        # dozen memories ran into the client timeout when the calls were
+        # strictly sequential, so a small bounded pool overlaps them. The
+        # results are still consumed in candidate order, which keeps the
+        # report deterministic.
+        scores_by_fact: dict[str, tuple[list[float], str | None]] = {}
+        nli_errors: list[str] = []
+        if candidate_list:
+            workers = min(8, len(candidate_list))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_score_fact, item)
+                           for item in candidate_list]
+                for item, future in zip(candidate_list, futures):
+                    try:
+                        scores_by_fact[item[0]["id"]] = future.result()
+                    except Exception as e:  # noqa: BLE001 - reported below
+                        nli_errors.append(str(e))
+        if nli_errors:
+            nli_failed = f"NLI unavailable: {nli_errors[0]}"
+            warnings.append(
+                f"scan incomplete: {nli_failed} - the result is not a clean "
+                f"contradiction scan; retry later")
+            logger.warning("contradictions_report NLI failed: %s",
+                           nli_errors[0])
+
+        for f, neighbours in candidate_list:
+            if len(contradictions) >= limit:
+                break
+            scored = scores_by_fact.get(f["id"])
+            if scored is None:
+                # This fact's NLI call failed; its pairs were not judged.
+                continue
+            scores, partial = scored
             if partial:
                 note = f"scan partially incomplete: {partial}"
                 if note not in warnings:

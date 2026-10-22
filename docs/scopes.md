@@ -59,8 +59,9 @@ Graph tools use the global graph when `project` is omitted.
 
 The read defaults differ per tool and are listed in
 [Retrieval & Scoring](retrieval.md#read-scope-defaults). For `init_context`,
-use `project="*"` to include all scopes; `recall` understands `project="*"`
-as well and then searches every scope at once.
+`recall`, `list_memories` and `list_entities`, `project="*"` selects every
+scope at once. `get_entity` rejects `"*"`: its answer describes exactly one
+entity.
 
 A project that does not exist is never silently ignored: `recall`,
 `list_memories`, `list_entities` and `init_context` fall back to the global
@@ -68,8 +69,8 @@ scope and say so in `warnings`.
 
 `project="global"` and "no project at all" are different things in the browse
 tools: `list_memories` and `list_entities` list **every** scope when `project`
-is omitted, but only the shared scope when `project="global"` is passed
-explicitly. `recall` searches the shared scope in both cases.
+is omitted (or `"*"`), but only the shared scope when `project="global"` is
+passed explicitly. `recall` searches the shared scope in both cases.
 
 ## Memory ids are unique per scope
 

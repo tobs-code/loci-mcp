@@ -67,8 +67,12 @@ def _forget_relation_context(
     return cur.rowcount
 
 def _ensure_graph_entity(cur, name: str, project: str | None,
-                         ent_type: str | None = None) -> None:
-    """Create the AGE node and SQL entity row for one scope (idempotent)."""
+                         ent_type: str | None = None) -> bool:
+    """Create the AGE node and SQL entity row for one scope (idempotent).
+
+    Returns True when the node did not exist before, so an import can report
+    how many entities it really created instead of how many it processed.
+    """
     label = _scope_label(project)
     scope = _scope_key(project)
     ent_json = json.dumps(name)
@@ -77,7 +81,8 @@ def _ensure_graph_entity(cur, name: str, project: str | None,
         f"SELECT * FROM cypher('memory_graph', $$ "
         f"MATCH (n:{label} {{name: {ent_json}}}) RETURN n $$) AS (n agtype)"
     )
-    if not cur.fetchone():
+    created = cur.fetchone() is None
+    if created:
         cur.execute(
             f"SELECT * FROM cypher('memory_graph', $$ "
             f"CREATE (n:{label} {{name: {ent_json}, project: {scope_json}}}) RETURN n $$) AS (n agtype)"
@@ -87,6 +92,7 @@ def _ensure_graph_entity(cur, name: str, project: str | None,
         "ON CONFLICT (name, project) DO UPDATE SET type = EXCLUDED.type",
         (name, ent_type or label, scope),
     )
+    return created
 
 
 def _validate_weight(value: Any) -> float:

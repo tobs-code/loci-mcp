@@ -25,6 +25,11 @@ The JSON format (version `0.2`, `"type": "memory_export"`) contains IDs,
 record and — for JSON — the complete graph (entities with scope plus relations
 with weight and scope). JSONL is flat: one record per line, no graph.
 
+The default export is active-only and warns how many superseded/forgotten rows
+it left out. A forgotten row carries `deleted_at` and `superseded_by: null`;
+the internal `__forgotten__` sentinel is never exported (writing it back would
+make the row look superseded by a fake memory id).
+
 ## Import
 
 ```text
@@ -41,7 +46,10 @@ import_memories(data=<export data>, format="json")
 
 Records keep their `id`, timestamps and `superseded_by`, so a re-import is
 idempotent and restores the exact state. Project tables are recreated on
-demand, entities and relations are upserted with MERGE.
+demand, entities and relations are upserted with MERGE. `graph_entities` and
+`graph_relations` count the processed records; `graph_entities_created` and
+`graph_relations_created` count the ones that did not exist before (MERGE
+updates an existing node/edge instead of duplicating it).
 
 Re-importing the same file reports the existing ids as `skipped`;
 `skip_duplicates=false` inserts them again instead. Records that fail

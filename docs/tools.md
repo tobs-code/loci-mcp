@@ -127,7 +127,7 @@ memory is visible to `recall`/`list_memories` again. Find the id with
 | Tool | Description |
 |------|-------------|
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted`, `include_relation_context` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted`, `include_superseded`, `include_relation_context` |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `fields`, `limit`, `offset` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global`; `project="*"` lists every scope |
@@ -188,9 +188,12 @@ finds an id for `restore_memory`. Forgotten rows carry the machine-readable
 history stays hidden unless `include_superseded=true` is also passed - the two
 flags are orthogonal.
 
-Without `project` every scope is listed; `project="global"` lists only the
-shared scope. `include_relation_context=false` hides the relation-context
-sentences of the graph edges, which repeat what the edge already says.
+Without `project` (or with `project="*"`) every scope is listed;
+`project="global"` lists only the shared scope. `total` is computed after the
+cross-scope dedup, so `total`, `count`, `has_more` and `next_offset` always
+describe the same row set. `include_relation_context=false` hides the
+relation-context sentences of the graph edges, which repeat what the edge
+already says.
 
 ### `get_entity`
 
@@ -205,12 +208,17 @@ sentences of the entity's edges - they are stored under the synthetic entity
 `<from>_<relation>_<to>`, so without this they would not show up here at all.
 The answer reports `total`, `count`, `offset`, `has_more` and `next_offset`,
 and a truncated answer says so in `warnings` instead of looking complete.
+`total` also counts the relation-context sentences of the entity's edges.
+`project="*"` is rejected: the answer describes exactly one entity, so there
+is no single scope to report; omit `project` for the global scope or name one.
 
 ### `list_entities`
 
-`entity_type`, `project`, `include_global`, `limit`, `offset`. The list is
-sorted by name, so `offset` is stable. Synthetic relation-context entities
-(`A_KNOWS_B`) are hidden unless the name also carries a real memory.
+`entity_type`, `project`, `include_global`, `limit`, `offset`. Without
+`project` (or with `project="*"`) every scope is listed. The list is sorted by
+name, so `offset` is stable. Synthetic relation-context entities (`A_KNOWS_B`)
+are hidden unless the name also carries a real memory. The same name can occur
+in several scopes; each row carries its `project`, so they are distinct rows.
 
 `entity_type` selects one kind of entity: `graph` (every graph node),
 `memory-only`, or a raw AGE label (`Entity` for the shared scope,
@@ -245,7 +253,7 @@ scopes without active memories.
 | `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
 | `unrelate` | Delete a single directed relation |
 | `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
-| `find_paths` | Shortest paths between two existing entities (`project`-scoped); missing entities return `not_found`, no path returns a warning |
+| `find_paths` | Shortest paths between two existing entities (`project`-scoped); edges are traversed in both directions, so a path can run against an edge. Missing entities return `not_found`, no path returns a warning |
 
 - `relate` takes `from_entity`, `to_entity` (not `from`/`to`), `relation_type`
   and `weight` (0..1). The weight scales the retrieval boost of `graph_boost`.
@@ -261,7 +269,7 @@ scopes without active memories.
 |------|-------------|
 | `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older, cross-entity pairs stay active (warning) |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; warns when the default export leaves superseded/forgotten rows out |
-| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
+| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |
 | `server_health` | Check Postgres + Inference connectivity; reports `version`, `code_fingerprint` (detects a stale container) and `started_at` |
 
