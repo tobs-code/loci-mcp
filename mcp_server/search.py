@@ -10,7 +10,6 @@ from mcp_server.config import (
     PROJECT_SCOPE_BOOST,
     RRF_K,
 )
-
 from mcp_server.db import get_conn
 from mcp_server.scopes import (
     _ag_str,
@@ -103,6 +102,38 @@ def _fts_lexemes(cur, query_text: str | None) -> list[str]:
     return list(row[0] or []) if row else []
 
 
+def _metadata_conditions(metadata_filter: dict) -> tuple[list[str], list[Any]]:
+    """Compare metadata values tolerantly.
+
+    `metadata @> %s::jsonb` is JSON-type strict: a filter {"port": "8001"}
+    does not match the stored integer 8001, and the caller gets zero hits
+    with no hint why. Scalar values are therefore compared as text (numbers
+    also numerically), while objects and arrays keep the containment check
+    that nested structures need.
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+    for key, value in metadata_filter.items():
+        if isinstance(value, (dict, list)):
+            conditions.append("metadata @> %s::jsonb")
+            params.append(json.dumps({key: value}))
+        elif value is None:
+            conditions.append("jsonb_typeof(metadata->%s) = 'null'")
+            params.append(key)
+        elif isinstance(value, bool):
+            conditions.append("metadata->>%s = %s")
+            params += [key, "true" if value else "false"]
+        elif isinstance(value, (int, float)):
+            conditions.append(
+                "(metadata->>%s = %s OR (jsonb_typeof(metadata->%s) = "
+                "'number' AND (metadata->>%s)::numeric = %s))")
+            params += [key, str(value), key, key, value]
+        else:
+            conditions.append("metadata->>%s = %s")
+            params += [key, str(value)]
+    return conditions, params
+
+
 def _extra_conditions(
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
@@ -120,8 +151,9 @@ def _extra_conditions(
         conditions.append("updated_at >= %s")
         params.append(stamp)
     if metadata_filter:
-        conditions.append("metadata @> %s::jsonb")
-        params.append(json.dumps(metadata_filter))
+        meta_conditions, meta_params = _metadata_conditions(metadata_filter)
+        conditions.extend(meta_conditions)
+        params.extend(meta_params)
     return conditions, params
 
 

@@ -108,7 +108,10 @@ next to the facts that were stored. Every entry reports the `scope` and
 ### `update_memory`
 
 `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`,
-`project`. Content changes are re-embedded. Without `project` the memory is
+`project`, `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold`.
+Content changes are re-embedded; a change that would duplicate another active
+memory is refused as `duplicate` (with `duplicate_of`) and nothing is applied
+(`dedupe="off"` bypasses the check). Without `project` the memory is
 looked up in every scope; a memory id is unique per scope, so an id that
 exists in several scopes is refused and the scopes are named (see
 [Scopes](scopes.md)).
@@ -117,7 +120,7 @@ exists in several scopes is refused and the scopes are named (see
 
 `updates` is a list of objects with the same fields as `update_memory`
 (`memory_id` is required). Every entry runs in its own savepoint, so an
-invalid, unknown or ambiguous entry is reported in its result entry and the
+invalid, unknown, ambiguous or duplicate entry is reported in its result entry and the
 rest of the batch is still applied (`status: "partial"`). The answer carries
 `count` and one result per entry; `ok` is only `false` when nothing could be
 updated.
@@ -173,7 +176,7 @@ The search tool. `query` is required and non-empty.
 | `project` | string? | Scope. Without it only global memories are searched; `"*"` searches every scope. |
 | `limit` | int | Maximum number of results (default 10). |
 | `hybrid` | bool | True (default) fuses vector and full-text results (RRF). False uses a single retriever. |
-| `min_similarity` | number? | Drop vector hits below this cosine similarity (0..1, default 0.35). `null` disables the filter. |
+| `min_similarity` | number? | Drop vector hits below this cosine similarity (0..1, default 0.40). `null` disables the filter. |
 | `include_decay` | bool | Blend recency/access into the score (max 30% of it). |
 | `min_decay_score` | number? | Keep only memories with at least this normalized decay score (0..1). |
 | `include_superseded` | bool | Also return superseded memories (history). |
@@ -185,7 +188,7 @@ The search tool. `query` is required and non-empty.
 | `include_global` | bool | True (default) lets a project search also see global memories. |
 | `fields` | list? | Only return these columns, e.g. `["id", "content"]`. |
 | `updated_after` | string? | Only memories changed at or after this ISO date. |
-| `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. |
+| `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. Scalar values compare tolerantly (the string `"8001"` matches the stored number `8001`); objects and arrays use JSON containment. |
 | `include_relation_context` | bool | True (default) includes the relation-context sentences of graph edges; False hides them. |
 | `offset` | int | Skip this many ranked hits (default 0). The answer reports `has_more` and `next_offset`. |
 
@@ -283,10 +286,10 @@ scopes without active memories.
 | Tool | Description |
 |------|-------------|
 | `relate` | Directed relation via Cypher (auto-creates entities); `project` selects the project graph |
-| `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
+| `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`); an empty list is an error and self-loops are stored with a warning |
 | `unrelate` | Delete a single directed relation |
 | `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
-| `find_paths` | Shortest paths between two existing entities (`project`-scoped); edges are traversed in both directions, so a path can run against an edge. Missing entities return `not_found`, no path returns a warning |
+| `find_paths` | Shortest paths between two existing entities (`project`-scoped); edges are traversed in both directions, so a path can run against an edge. Missing entities return `not_found`, no path returns a warning; `from_entity == to_entity` answers a 0-hop path and `max_hops > 10` is clamped with a warning |
 
 - `relate` takes `from_entity`, `to_entity` (not `from`/`to`), `relation_type`
   and `weight` (0..1). The weight scales the retrieval boost of `graph_boost`.
@@ -301,7 +304,7 @@ scopes without active memories.
 | Tool | Description |
 |------|-------------|
 | `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older, cross-entity pairs stay active (warning); a partially failed NLI names the unjudged pairs in `nli_failures` (`fact_id`, `neighbor_ids`, `reason`) |
-| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; warns when the default export leaves superseded/forgotten rows out |
+| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved; an id that already exists is always skipped; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |
 | `server_health` | Check Postgres + Inference connectivity; reports `version`, `code_fingerprint` (detects a stale container) and `started_at` |

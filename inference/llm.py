@@ -224,6 +224,31 @@ def extract_text(config: LLMConfig, payload: dict) -> str:
     return ""
 
 
+def _loose_nli_object(text: str) -> dict | None:
+    """Recover label/score from a response that is not valid JSON.
+
+    Small models sometimes answer `label: contradiction, score: 0.9` or leave
+    a trailing comma. The values are unambiguous, so parsing them keeps a
+    usable judgment instead of failing the whole comparison. Only a real
+    label and a numeric score are accepted - a guessed value would be worse
+    than an honest "not judged".
+    """
+    label_match = re.search(
+        r'"?label"?\s*[:=]\s*"?([A-Za-z_ -]+)', text, re.IGNORECASE)
+    score_match = re.search(
+        r'"?score"?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)', text, re.IGNORECASE)
+    if not label_match or not score_match:
+        return None
+    label = label_match.group(1).strip().lower()
+    if label not in ("contradiction", "neutral", "entailment"):
+        return None
+    try:
+        score = float(score_match.group(1))
+    except ValueError:
+        return None
+    return {"label": label, "score": score}
+
+
 def parse_nli_json(raw: str | None) -> dict | None:
     if not raw:
         return None
@@ -234,15 +259,17 @@ def parse_nli_json(raw: str | None) -> dict | None:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
+        parsed = None
         start = text.find("{")
         end = text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            parsed = json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            return None
-    return parsed if isinstance(parsed, dict) else None
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    return _loose_nli_object(text)
 
 
 def nli_score(payload: dict | None) -> float:

@@ -27,13 +27,13 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
-from mcp_server.inference_client import embed
-from mcp_server.inference_client import nli_configured
+from mcp_server.inference_client import embed, nli_configured
 from mcp_server.scopes import (
     _all_mem_tables,
     _ensure_project_table,
     _mem_table,
     _memory_scopes,
+    _norm_entity,
     _norm_project,
     _scope_key,
     _scope_label,
@@ -178,6 +178,11 @@ class BatchUpdate(BaseModel):
                           description="New memory type. " + MEMORY_TYPE_HELP)
     project: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                          description="Overrides the batch project for this entry.")
+    dedupe: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"], "enum": ["exact", "semantic", "off", None],
+    }, description="Duplicate check for a content change: 'exact', 'semantic' or 'off'.")
+    fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
+                                 description="Similarity threshold 0.0-1.0 for semantic dedupe.")
 
 
 def _sanitize_batch_update(value: Any) -> Any:
@@ -272,6 +277,7 @@ def remember(
                 entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope, dedupe)
     try:
         project = _norm_project(project)
+        entity = _norm_entity(entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     if mem_type not in MEMORY_TYPES:
@@ -317,12 +323,36 @@ def remember(
                       else f"semantic match (similarity {similarity})")
             if mode == "exact" and dedupe == "semantic":
                 detail += "; the content hash short-circuits the semantic check"
+            warnings = [f"memory already exists; nothing stored ({detail})"]
+            superseded_now: list[str] = []
+            cross_now: list[str] = []
+            # A duplicate must not swallow a supersede instruction: the fact is
+            # already stored, but the caller still asked to invalidate a memory.
+            # Apply the replacement through the existing id and say so.
+            if supersede or supersede_content or supersede_last:
+                try:
+                    (superseded_now, _self_targets, extra_warnings,
+                     cross_now) = _apply_duplicate_supersede(
+                        cur, store_project, existing_id, entity, supersede,
+                        supersede_content, supersede_last, emb)
+                except ValueError as e:
+                    conn.rollback()
+                    return fail(STATUS_ERROR, str(e))
+                warnings.extend(extra_warnings)
+                if superseded_now:
+                    conn.commit()
+            payload: dict[str, Any] = {
+                "duplicate_mode": mode, "similarity": similarity,
+                "scope": effective_scope,
+                "project": (store_project or "global"),
+            }
+            if superseded_now:
+                payload["superseded"] = superseded_now
+                if cross_now:
+                    payload["cross_scope_superseded"] = cross_now
+                    warnings.append(_cross_scope_warning(cross_now))
             return ok(STATUS_DUPLICATE, id=existing_id,
-                      warnings=[f"memory already exists; nothing stored "
-                                f"({detail})"],
-                      duplicate_mode=mode, similarity=similarity,
-                      scope=effective_scope,
-                      project=(store_project or "global"))
+                      warnings=warnings, **payload)
 
         # No active duplicate, but the content may match a memory that was
         # superseded earlier. Storing it would silently re-activate an
@@ -469,9 +499,12 @@ def remember(
         if superseded and not check_contradictions:
             warnings.append(f"superseded {len(superseded)} memory/facts")
         if carried_keys:
+            carried_detail = ", ".join(
+                f"{key}={meta.get(key)!r}" for key in sorted(carried_keys))
             warnings.append(
-                "metadata carried over from the replaced memories: "
-                + ", ".join(sorted(carried_keys)))
+                "metadata carried over from the replaced memories (these "
+                "values come from the old fact; verify they still apply): "
+                + carried_detail)
         payload: dict[str, Any] = {"superseded": superseded,
                                    # The scope the fact really landed in. An
                                    # agent that asked for a project but wrote
@@ -561,6 +594,45 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
                 targets.append(target_id)
     # Keep order, drop duplicates.
     return list(dict.fromkeys(targets)), warnings
+
+
+def _apply_duplicate_supersede(cur, store_project: str | None,
+                               existing_id: str, entity: str | None,
+                               supersede: str | None,
+                               supersede_content: str | None,
+                               supersede_last: bool,
+                               embedding: list[float] | None
+                               ) -> tuple[list[str], list[str], list[str],
+                                          list[str]]:
+    """Apply `supersede` even when the write itself is a duplicate.
+
+    The fact is already stored under `existing_id`; the caller still asked to
+    invalidate another memory. Resolving the targets and superseding them with
+    the existing id keeps that instruction from being silently dropped. A
+    target that *is* the duplicate is not superseded by itself (that would
+    create a bogus self-link) and is reported instead.
+
+    Returns (applied, self_targets, warnings, cross_scope_ids).
+    """
+    targets, warnings = _supersede_targets(
+        cur, store_project, entity, supersede, supersede_content,
+        supersede_last, embedding)
+    applied = [t for t in targets if t != existing_id]
+    self_targets = [t for t in targets if t == existing_id]
+    for old_id in applied:
+        _supersede(cur, store_project, existing_id, old_id)
+    if self_targets:
+        warnings.append(
+            f"supersede target is the existing duplicate {existing_id} "
+            f"itself; nothing was replaced")
+    if applied:
+        warnings.append(
+            f"supersede applied via the existing duplicate {existing_id}: "
+            f"replaced {len(applied)} memory/facts")
+    cross_scope = ([old for old in applied
+                    if _scope_of_id(cur, old, store_project) == "global"]
+                   if store_project else [])
+    return applied, self_targets, warnings, cross_scope
 
 
 def remember_batch(
@@ -681,6 +753,11 @@ def remember_batch(
         if fscope == "project" and not fp:
             prepared.append((None, "project required when scope='project'"))
             continue
+        try:
+            fentity = _norm_entity(fact.get("entity"))
+        except ValueError as e:
+            prepared.append((None, str(e)))
+            continue
         ft = fact.get("fuzzy_threshold", fuzzy_threshold)
         if ft is not None and not 0.0 <= ft <= 1.0:
             prepared.append((None, "fuzzy_threshold must be between 0.0 and 1.0"))
@@ -701,7 +778,7 @@ def remember_batch(
             "importance": importance,
             "project": fp if fscope == "project" else None,
             "scope": fscope,
-            "entity": fact.get("entity"),
+            "entity": fentity,
             "fuzzy_threshold": ft,
             "dedupe": fact.get("dedupe"),
             "metadata": meta,
@@ -747,13 +824,46 @@ def remember_batch(
                                             embeddings[i], spec["fuzzy_threshold"],
                                             dedupe=fact_dedupe)
                     if existing:
+                        existing_id, mode, similarity = existing
+                        entry: dict[str, Any] = {
+                            "id": existing_id, "content": spec["content"],
+                            "status": "duplicate",
+                            "duplicate_mode": mode,
+                            "similarity": similarity,
+                            "scope": spec["scope"],
+                            "project": (store_project or "global"),
+                        }
+                        if (spec.get("supersede") or spec.get("supersede_content")
+                                or spec.get("supersede_last")):
+                            try:
+                                (superseded_now, _self_targets,
+                                 extra_warnings, cross_now) = (
+                                    _apply_duplicate_supersede(
+                                        cur, store_project, existing_id,
+                                        spec["entity"], spec.get("supersede"),
+                                        spec.get("supersede_content"),
+                                        spec.get("supersede_last"),
+                                        embeddings[i]))
+                            except ValueError as exc:
+                                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                                results.append({
+                                    "id": existing_id,
+                                    "content": spec["content"],
+                                    "status": "error", "error": str(exc),
+                                    "scope": spec["scope"],
+                                    "project": (store_project or "global"),
+                                })
+                                continue
+                            entry.setdefault("warnings", []).extend(
+                                extra_warnings)
+                            if superseded_now:
+                                entry["superseded"] = superseded_now
+                                if cross_now:
+                                    entry["cross_scope_superseded"] = cross_now
+                                    entry["warnings"].append(
+                                        _cross_scope_warning(cross_now))
                         cur.execute(f"RELEASE SAVEPOINT {savepoint}")
-                        results.append({"id": existing[0], "content": spec["content"],
-                                        "status": "duplicate",
-                                        "duplicate_mode": existing[1],
-                                        "similarity": existing[2],
-                                        "scope": spec["scope"],
-                                        "project": (store_project or "global")})
+                        results.append(entry)
                         continue
                     # No duplicate, but maybe a reworded copy: report it in
                     # the entry so a batch write cannot fork silently either.
@@ -886,6 +996,18 @@ def update_memory(
     mem_type: Annotated[
         str | None,
         Field(description="New memory type. " + MEMORY_TYPE_HELP)] = None,
+    dedupe: Annotated[
+        Literal["exact", "semantic", "off"],
+        Field(description="Duplicate check for a content change: 'exact' "
+                          "(content hash, default) refuses an edit that would "
+                          "duplicate another active memory, 'semantic' also "
+                          "checks vector similarity, 'off' skips the check. A "
+                          "near-duplicate below the dedupe threshold is only "
+                          "reported as a warning.")] = "exact",
+    fuzzy_threshold: Annotated[
+        float | None,
+        Field(description="Similarity threshold 0.0-1.0 for semantic dedupe "
+                          "(default 0.85). Only used by dedupe='semantic'.")] = None,
 ) -> dict[str, Any]:
     """Update an existing memory's content, importance, metadata, entity or type.
 
@@ -898,10 +1020,17 @@ def update_memory(
                 memory_id, content is not None, importance is not None, metadata is not None)
     try:
         project = _norm_project(project)
+        entity = _norm_entity(entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
+    if dedupe not in DEDUPE_MODES:
+        return fail(STATUS_ERROR,
+                    f"Invalid dedupe. Choose from: {', '.join(sorted(DEDUPE_MODES))}")
+    if fuzzy_threshold is not None and not 0.0 <= fuzzy_threshold <= 1.0:
+        return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
     sets: list[str] = []
     params: list[Any] = []
+    emb: list[float] | None = None
 
     if content is not None:
         content = (content or "").strip()
@@ -929,9 +1058,6 @@ def update_memory(
         sets.append("metadata = %s::jsonb")
         params.append(json.dumps(metadata))
     if entity is not None:
-        entity = (entity or "").strip()
-        if not entity:
-            return fail(STATUS_ERROR, "entity must not be empty")
         sets.append("entity = %s")
         params.append(entity)
     if mem_type is not None:
@@ -969,7 +1095,7 @@ def update_memory(
         # Locate the memory BEFORE the "nothing to update" check: an unknown
         # id must answer NOT FOUND even when no field was passed, otherwise
         # the validation message suggests the id was seen and is valid.
-        active = False
+        active_table = None
         for table in tables:
             cur.execute(
                 f"SELECT 1 FROM {table} WHERE id = %s "
@@ -977,9 +1103,9 @@ def update_memory(
                 (memory_id,),
             )
             if cur.fetchone():
-                active = True
+                active_table = table
                 break
-        if not active:
+        if active_table is None:
             conn.rollback()
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
         if not sets:
@@ -987,28 +1113,47 @@ def update_memory(
             return fail(STATUS_ERROR,
                         "nothing to update: pass content, importance, metadata, "
                         "entity or mem_type", id=memory_id)
-        updated = 0
-        updated_table = None
-        for table in tables:
-            cur.execute(
-                f"UPDATE {table} SET {', '.join(sets)} "
-                "WHERE id = %s AND superseded_by IS NULL AND deleted_at IS NULL",
-                params + [memory_id],
-            )
-            if cur.rowcount:
-                updated += cur.rowcount
-                updated_table = table
-                break
+        scope = _scope_of_table(cur, active_table)
+        near_dup = None
+        if content is not None and dedupe != "off":
+            # An edit must not fork a fact either: `remember` already refuses
+            # duplicates and warns on near-duplicates, and an update that
+            # silently creates a second active copy is the same problem.
+            dedupe_project = None if scope == "global" else scope
+            duplicate = _deduplicate(
+                cur, content, dedupe_project, emb, fuzzy_threshold,
+                dedupe=dedupe, exclude_id=memory_id)
+            if duplicate:
+                dup_id, dup_mode, dup_similarity = duplicate
+                conn.rollback()
+                detail = ("exact content hash" if dup_mode == "exact"
+                          else f"semantic match (similarity {dup_similarity})")
+                return ok(
+                    STATUS_DUPLICATE, id=memory_id, duplicate_of=dup_id,
+                    duplicate_mode=dup_mode, similarity=dup_similarity,
+                    project=scope,
+                    warnings=[f"update not applied: the new content would "
+                              f"duplicate active memory {dup_id} ({detail}); "
+                              f"nothing was changed"])
+            near_dup = _find_near_duplicate(
+                cur, content, dedupe_project, emb, exclude_id=memory_id)
+        cur.execute(
+            f"UPDATE {active_table} SET {', '.join(sets)} "
+            "WHERE id = %s AND superseded_by IS NULL AND deleted_at IS NULL",
+            params + [memory_id],
+        )
+        if not cur.rowcount:
+            conn.rollback()
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                        id=memory_id)
         conn.commit()
-        if not updated:
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
-        scope = _scope_of_table(cur, updated_table) if updated_table else None
     except Exception as e:
         conn.rollback()
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
         conn.close()
-    return ok(STATUS_UPDATED, id=memory_id, project=scope)
+    warnings = ([_near_duplicate_warning(near_dup)] if near_dup else [])
+    return ok(STATUS_UPDATED, id=memory_id, project=scope, warnings=warnings)
 
 
 def update_batch(
@@ -1024,6 +1169,17 @@ def update_batch(
         Field(description="Default project scope for all entries (per-entry "
                           "project wins). Without it every id is looked up in "
                           "every scope.")] = None,
+    dedupe: Annotated[
+        Literal["exact", "semantic", "off"],
+        Field(description="Default duplicate check for content changes "
+                          "(per-entry 'dedupe' wins). 'exact' refuses an edit "
+                          "that would duplicate another active memory, "
+                          "'semantic' also checks vector similarity, 'off' "
+                          "skips the check.")] = "exact",
+    fuzzy_threshold: Annotated[
+        float | None,
+        Field(description="Similarity threshold 0.0-1.0 for semantic dedupe "
+                          "(default 0.85).")] = None,
 ) -> dict[str, Any]:
     """Update several memories at once (savepoints per entry).
 
@@ -1044,6 +1200,14 @@ def update_batch(
         return fail(STATUS_ERROR, str(e))
     if not isinstance(updates, list) or not updates:
         return fail(STATUS_ERROR, "updates must be a non-empty list")
+    if dedupe not in DEDUPE_MODES:
+        return fail(STATUS_ERROR,
+                    f"Invalid dedupe. Choose from: "
+                    f"{', '.join(sorted(DEDUPE_MODES))}")
+    if (fuzzy_threshold is not None
+            and not 0.0 <= fuzzy_threshold <= 1.0):
+        return fail(STATUS_ERROR,
+                    "fuzzy_threshold must be between 0.0 and 1.0")
 
     updates = [u.model_dump(exclude_unset=True) if isinstance(u, BatchUpdate)
                else u for u in updates]
@@ -1093,11 +1257,10 @@ def update_batch(
                 fields["metadata"] = metadata
         entity = entry.get("entity")
         if error is None and entity is not None:
-            entity = entity.strip() if isinstance(entity, str) else ""
-            if not entity:
-                error = "entity must not be empty"
-            else:
-                fields["entity"] = entity
+            try:
+                fields["entity"] = _norm_entity(entity)
+            except ValueError as exc:
+                error = str(exc)
         mem_type = entry.get("mem_type")
         if error is None and mem_type is not None:
             if mem_type not in MEMORY_TYPES:
@@ -1105,6 +1268,21 @@ def update_batch(
                          f"{', '.join(sorted(MEMORY_TYPES))}")
             else:
                 fields["mem_type"] = mem_type
+        entry_dedupe = entry.get("dedupe") or dedupe
+        if error is None and entry_dedupe not in DEDUPE_MODES:
+            error = (f"Invalid dedupe. Choose from: "
+                     f"{', '.join(sorted(DEDUPE_MODES))}")
+        entry_fuzzy = entry.get("fuzzy_threshold")
+        if entry_fuzzy is None:
+            entry_fuzzy = fuzzy_threshold
+        if error is None and entry_fuzzy is not None:
+            try:
+                entry_fuzzy = float(entry_fuzzy)
+            except (TypeError, ValueError):
+                error = "fuzzy_threshold must be a number between 0.0 and 1.0"
+            else:
+                if not 0.0 <= entry_fuzzy <= 1.0:
+                    error = "fuzzy_threshold must be between 0.0 and 1.0"
         if error is None and not fields:
             error = ("nothing to update: pass content, importance, metadata, "
                      "entity or mem_type")
@@ -1113,7 +1291,9 @@ def update_batch(
         else:
             prepared.append(({"memory_id": memory_id,
                               "project": entry_project,
-                              "fields": fields}, None))
+                              "fields": fields,
+                              "dedupe": entry_dedupe,
+                              "fuzzy_threshold": entry_fuzzy}, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
              if spec is not None]
@@ -1174,44 +1354,72 @@ def update_batch(
                         continue
                     tables = _all_mem_tables(cur)
 
-                active = False
+                active_table = None
                 for table in tables:
                     cur.execute(
                         f"SELECT 1 FROM {table} WHERE id = %s "
                         "AND superseded_by IS NULL AND deleted_at IS NULL",
                         (memory_id,))
                     if cur.fetchone():
-                        active = True
+                        active_table = table
                         break
-                if not active:
+                if active_table is None:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     results.append({"id": memory_id, "status": "not_found",
                                     "error": f"NOT FOUND: {memory_id}"})
                     continue
-                updated_table = None
-                for table in tables:
-                    cur.execute(
-                        f"UPDATE {table} SET {', '.join(sets)} "
-                        "WHERE id = %s AND superseded_by IS NULL "
-                        "AND deleted_at IS NULL",
-                        params + [memory_id])
-                    if cur.rowcount:
-                        updated_table = table
-                        break
-                if updated_table is None:
+                scope = _scope_of_table(cur, active_table)
+                near_dup = None
+                if ("content" in spec["fields"]
+                        and spec.get("dedupe") != "off"):
+                    dedupe_project = None if scope == "global" else scope
+                    duplicate = _deduplicate(
+                        cur, spec["fields"]["content"], dedupe_project,
+                        embeddings[i], spec.get("fuzzy_threshold"),
+                        dedupe=spec.get("dedupe", "exact"),
+                        exclude_id=memory_id)
+                    if duplicate:
+                        dup_id, dup_mode, dup_similarity = duplicate
+                        detail = ("exact content hash" if dup_mode == "exact"
+                                  else f"semantic match (similarity "
+                                       f"{dup_similarity})")
+                        cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        results.append({
+                            "id": memory_id, "status": "duplicate",
+                            "duplicate_of": dup_id,
+                            "duplicate_mode": dup_mode,
+                            "similarity": dup_similarity,
+                            "project": scope,
+                            "warnings": [
+                                f"update not applied: the new content would "
+                                f"duplicate active memory {dup_id} ({detail}); "
+                                f"nothing was changed"]})
+                        continue
+                    near_dup = _find_near_duplicate(
+                        cur, spec["fields"]["content"], dedupe_project,
+                        embeddings[i], exclude_id=memory_id)
+                cur.execute(
+                    f"UPDATE {active_table} SET {', '.join(sets)} "
+                    "WHERE id = %s AND superseded_by IS NULL "
+                    "AND deleted_at IS NULL",
+                    params + [memory_id])
+                if not cur.rowcount:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     results.append({"id": memory_id, "status": "not_found",
                                     "error": f"NOT FOUND: {memory_id}"})
                     continue
-                scope = _scope_of_table(cur, updated_table)
                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             except Exception as exc:
                 cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 results.append({"id": memory_id, "status": "error",
                                 "error": str(exc)})
                 continue
-            results.append({"id": memory_id, "status": STATUS_UPDATED,
-                            "project": scope})
+            entry: dict[str, Any] = {"id": memory_id,
+                                     "status": STATUS_UPDATED,
+                                     "project": scope}
+            if near_dup:
+                entry["warnings"] = [_near_duplicate_warning(near_dup)]
+            results.append(entry)
         conn.commit()
     except Exception as e:
         conn.rollback()

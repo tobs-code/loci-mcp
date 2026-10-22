@@ -151,7 +151,7 @@ def contradictions_report(entity: Annotated[
         if len(facts) < 2:
             conn.commit()
             scope_desc = (f"entity {entity!r} has" if entity
-                          else f"the scope has")
+                          else "the scope has")
             return ok(STATUS_OK, count=0, results=[], warnings=[
                 f"nothing to compare: {scope_desc} "
                 f"{len(facts)} active memory/memories - a contradiction needs "

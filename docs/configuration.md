@@ -119,7 +119,7 @@ The tuning knobs live in `mcp_server/config.py`:
 | `DECAY_WEIGHT` | 0.3 | Maximum share of the score that decay may take. |
 | `FTS_WEIGHT` | 0.6 | Weight of the full-text signal in the relevance score. |
 | `RRF_K` | 60 | RRF smoothing constant. |
-| `DEFAULT_MIN_SIMILARITY` | 0.35 | Default vector-hit floor. |
+| `DEFAULT_MIN_SIMILARITY` | 0.40 | Default vector-hit floor. |
 | `DEFAULT_DUPLICATE_THRESHOLD` | 0.85 | Similarity threshold of `dedupe="semantic"`. |
 | `NEAR_DUPLICATE_THRESHOLD` | 0.75 | Similarity at which a stored write is reported as a near-duplicate in `warnings`. |
 | `SUPERSEDE_SIMILARITY_MIN` | 0.5 | Topic similarity below which `supersede_last` refuses. |

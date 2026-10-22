@@ -5,12 +5,12 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
-from mcp_server.db import get_conn
 from mcp_server.config import (
     DEFAULT_MIN_SIMILARITY,
     MEMORY_TYPE_HELP,
     SENTINEL_FORGOTTEN,
 )
+from mcp_server.db import get_conn
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.inference_client import embed
 from mcp_server.projection import (
@@ -26,6 +26,7 @@ from mcp_server.scopes import (
     _all_mem_tables,
     _count_entities,
     _is_global_scope,
+    _norm_entity,
     _norm_project,
     _project_names,
     _retrieval_tables,
@@ -132,7 +133,7 @@ def recall(
     min_similarity: Annotated[
         float | None,
         Field(description="Drop vector hits below this cosine similarity "
-                          "(0.0-1.0, default 0.35). Full-text hits are never "
+                          "(0.0-1.0, default 0.40). Full-text hits are never "
                           "dropped by this filter: an exact keyword match "
                           "survives even when the embedding model scores it "
                           "low. Use null to disable the filter.")] = DEFAULT_MIN_SIMILARITY,
@@ -178,7 +179,7 @@ def recall(
     used for the expansion *and* filters the search, so unrelated hits are
     dropped. Graph hits have no similarity: their `_similarity` and
     `_relevance_score` are null and they carry `_graph_boost` instead.
-    `min_similarity` defaults to 0.35 and only applies to the vector retriever;
+    `min_similarity` defaults to 0.40 and only applies to the vector retriever;
     a full-text hit is kept even when its embedding is a poor match, so an
     exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
     handles that word badly. Pass `None` to disable the filter. The response
@@ -221,6 +222,8 @@ def recall(
     all_projects = project == "*"
     try:
         project = None if all_projects else _norm_project(project)
+        entity = _norm_entity(entity)
+        graph_entity = _norm_entity(graph_entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     explicit_scope = bool(raw_project and str(raw_project).strip())
@@ -421,12 +424,13 @@ def recall(
     if min_similarity is None and rows:
         weak = [r for r in rows
                 if (r.get("_similarity") is not None
-                    and r["_similarity"] < 0.35)]
+                    and r["_similarity"] < DEFAULT_MIN_SIMILARITY)]
         if weak:
             warnings.append(
                 f"the min_similarity filter is disabled: {len(weak)} of "
-                f"{len(rows)} result(s) have _similarity < 0.35 and may be "
-                f"only marginally relevant to the query")
+                f"{len(rows)} result(s) have _similarity < "
+                f"{DEFAULT_MIN_SIMILARITY} and may be only marginally "
+                f"relevant to the query")
     payload: dict[str, Any] = {
         # `candidates` counts the hits that made it into the ranking.
         "candidates": candidates,
@@ -545,6 +549,7 @@ def list_memories(
     all_projects = project == "*"
     try:
         project = None if all_projects else _norm_project(project)
+        entity = _norm_entity(entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     global_only = not all_projects and _is_global_scope(raw_project)
@@ -691,6 +696,10 @@ def list_memories(
             conn.close()
     window = [page[(r["_table"], r["id"])]
               for r in window_index if (r["_table"], r["id"]) in page]
+    if offset > 0 and total > 0 and not window:
+        warnings.append(
+            f"no results on this page: offset={offset} is beyond the "
+            f"{total} matching memories; lower the offset")
     projection_fields = fields
     if include_deleted:
         # Without this the caller could not tell a forgotten row from an
@@ -827,6 +836,11 @@ def get_entity(name: Annotated[
     a truncated answer is visible instead of looking complete.
     `project="*"` is rejected: the answer describes exactly one entity.
     """
+    if entity and name and entity.strip() != name.strip():
+        return fail(
+            STATUS_ERROR,
+            f"entity and name were both given but differ ({entity!r} vs "
+            f"{name!r}); pass only one of the aliases")
     target = entity or name
     logger.info("get_entity name=%s", target)
     if project == "*":
@@ -838,6 +852,7 @@ def get_entity(name: Annotated[
         )
     try:
         project = _norm_project(project)
+        target = _norm_entity(target)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     if not target:
@@ -935,6 +950,10 @@ def get_entity(name: Annotated[
     memories.sort(key=lambda m: m.get("updated_at") or "", reverse=True)
     has_more = total > offset + limit
     window = memories[offset:offset + limit]
+    if offset > 0 and total > 0 and not window:
+        warnings.append(
+            f"no results on this page: offset={offset} is beyond the "
+            f"{total} memories of {target!r}; lower the offset")
     if has_more:
         warnings.append(
             f"showing {len(window)} of {total} memories of {target!r}; use "
@@ -1138,6 +1157,10 @@ def list_entities(
     rows.sort(key=lambda r: (str(r.get("name") or ""), str(r.get("project") or "")))
     window = rows[offset:offset + limit]
     has_more = total > offset + limit
+    if offset > 0 and total > 0 and not window:
+        warnings.append(
+            f"no results on this page: offset={offset} is beyond the "
+            f"{total} matching entities; lower the offset")
     return ok(STATUS_OK, count=len(window), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,

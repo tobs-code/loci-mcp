@@ -58,7 +58,8 @@ def _supersede(cur, project: str | None, new_id: str, old_id: str) -> None:
 def _deduplicate(cur, content: str, project: str | None,
                  embedding_vec: list[float] | None = None,
                  fuzzy_threshold: float | None = None,
-                 dedupe: str = "exact") -> tuple[str, str, float | None] | None:
+                 dedupe: str = "exact",
+                 exclude_id: str | None = None) -> tuple[str, str, float | None] | None:
     """Return the id of an existing memory that says the same thing.
 
     `dedupe` selects the mode: "exact" (content hash), "semantic" (hash plus
@@ -73,10 +74,12 @@ def _deduplicate(cur, content: str, project: str | None,
 
     c_hash = _content_hash(content)
     table = _mem_table(project)
+    exclude_sql = " AND id <> %s" if exclude_id else ""
+    exclude_params = [exclude_id] if exclude_id else []
     cur.execute(
         f"SELECT id FROM {table} WHERE content_hash = %s "
-        f"AND superseded_by IS NULL AND deleted_at IS NULL LIMIT 1",
-        (c_hash,),
+        f"AND superseded_by IS NULL AND deleted_at IS NULL{exclude_sql} LIMIT 1",
+        [c_hash] + exclude_params,
     )
     row = cur.fetchone()
     if row:
@@ -87,9 +90,10 @@ def _deduplicate(cur, content: str, project: str | None,
         max_dist = 1.0 - threshold
         cur.execute(
             f"SELECT id, embedding <=> %s::vector AS dist "
-            f"FROM {table} WHERE superseded_by IS NULL AND deleted_at IS NULL AND embedding IS NOT NULL "
+            f"FROM {table} WHERE superseded_by IS NULL AND deleted_at IS NULL AND embedding IS NOT NULL"
+            f"{exclude_sql} "
             f"ORDER BY dist ASC LIMIT 1",
-            (embedding_vec,),
+            [embedding_vec] + exclude_params,
         )
         row = cur.fetchone()
         if row and float(row[1]) <= max_dist:
@@ -99,7 +103,8 @@ def _deduplicate(cur, content: str, project: str | None,
 
 
 def _find_near_duplicate(cur, content: str, project: str | None,
-                         embedding_vec: list[float] | None = None) -> dict | None:
+                         embedding_vec: list[float] | None = None,
+                         exclude_id: str | None = None) -> dict | None:
     """The active memory that is closest to `content` above the near-dup floor.
 
     Runs only when `_deduplicate` found no match: the dedupe thresholds say
@@ -115,13 +120,17 @@ def _find_near_duplicate(cur, content: str, project: str | None,
         return None
     c_hash = _content_hash(content)
     table = _mem_table(project)
+    exclude_sql = " AND id <> %s" if exclude_id else ""
+    params: list[Any] = [embedding_vec, c_hash]
+    if exclude_id:
+        params.append(exclude_id)
     cur.execute(
         f"SELECT id, embedding <=> %s::vector AS dist FROM {table} "
         f"WHERE content_hash <> %s "
         f"AND superseded_by IS NULL AND deleted_at IS NULL "
-        f"AND embedding IS NOT NULL "
+        f"AND embedding IS NOT NULL{exclude_sql} "
         f"ORDER BY dist ASC LIMIT 1",
-        (embedding_vec, c_hash),
+        params,
     )
     row = cur.fetchone()
     if not row:

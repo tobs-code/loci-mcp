@@ -62,8 +62,8 @@ validation error.
 |------|-------------|
 | `remember` | Store a fact/decision/learning with auto-embedding, dedup mode (`dedupe`), supersede variants (`supersede`, `supersede_content`, `supersede_last`), optional contradiction check; the answer names the `scope`/`project` it wrote to |
 | `remember_batch` | Store multiple facts at once (savepoints); `skip_duplicates`, `dedupe`, per-fact `project`/`scope`/`supersede`/`fuzzy_threshold`, optional `check_contradictions`; every entry names its `scope`/`project` |
-| `update_memory` | Update content, importance, or metadata (re-embeds on content change) |
-| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`; invalid/unknown entries are reported individually (`partial`), the rest is still applied |
+| `update_memory` | Update content, importance, metadata, entity or type (re-embeds on content change); a content change is refused as `duplicate` when it would duplicate another active memory (`dedupe`, `fuzzy_threshold`) |
+| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `project`, `dedupe`, `fuzzy_threshold`; invalid/unknown/duplicate entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete; `entity` also removes the graph node and that scope's memories; `entity="*"` empties a whole project (soft by default: recoverable rows, the scope itself survives - `drop_project` removes the scope completely); `dry_run` previews exactly what the real call removes; `counts` reports memories/entities/relations separately |
 | `restore_memory` | Bring a soft-forgotten memory back (clears `deleted_at` and the forgotten sentinel); only soft-forgotten rows can be restored |
 | `touch_memory` | Bump `updated_at` without changing the content (refreshes the decay recency); optional `importance`; unknown ids answer `not_found` |
@@ -89,7 +89,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 | `relate_batch` | Create/update many relations in one transaction; per-edge `weight`/`context`/`project`; idempotent (MERGE) |
 | `unrelate` | Delete a single directed relation |
 | `find_connections` | Traverse graph from entity (outgoing/incoming/both); results carry `direction` |
-| `find_paths` | Find shortest paths between two entities (`project`-scoped); edges are traversed in **both** directions, so a path can run against an edge |
+| `find_paths` | Find shortest paths between two entities (`project`-scoped); edges are traversed in **both** directions, so a path can run against an edge; `from_entity == to_entity` answers a 0-hop path and `max_hops` above 10 is clamped with a warning |
 
 ### Maintenance & Advanced
 | Tool | Description |
@@ -150,7 +150,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   natural-language question that matches scores **0.62-0.95**, a bare keyword
   that occurs verbatim in the memory only **0.30-0.61** (a single token
   dilutes the query vector), unrelated facts below ~0.3.
-  `recall` defaults to `min_similarity=0.35`; pass `null` to opt out.
+  `recall` defaults to `min_similarity=0.40`; pass `null` to opt out.
 - `min_similarity` filters the **vector** retriever only. A full-text hit is
   kept even when the embedding model scores it badly — that is the case the
   full-text leg exists for (identifiers, file names, foreign words).
@@ -195,7 +195,10 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   neighbourhood"), with only `entity` the search is also restricted to that
   entity — which drops unrelated query hits.
 - `recall`/`list_memories` accept `updated_after` (ISO date) and
-  `metadata_filter` (key/value pairs the metadata must contain);
+  `metadata_filter` (key/value pairs the metadata must contain; scalar values
+  are compared tolerantly, so `{"port": "8001"}` and `{"port": 8001}` both
+  match a stored number, while objects/arrays keep the JSON containment
+  check);
   `list_memories` additionally accepts `order_by`
   (`updated_at`, `created_at`, `access_count`, `importance`), `contains`
   (case-insensitive literal substring — the right tool for "which memory
@@ -209,6 +212,8 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   `include_relation_context` (false hides the relation-context sentences of
   the graph edges, which repeat what the edge already says).
   `recall` accepts `offset` (`has_more`/`next_offset` in the answer).
+  `list_memories`, `list_entities` and `get_entity` warn when an `offset`
+  beyond the result set returns an empty page instead of leaving it silent.
   `list_memories` computes `total` **after** the cross-scope dedup, so
   `total`, `count`, `has_more` and `next_offset` always describe the same
   row set (a deduped global copy no longer made `total` larger than the
@@ -439,7 +444,9 @@ Metadata of replaced memories is not lost: keys the new fact does not set are me
   `forget`, `restore_memory`, `export_memories` and `import_memories` accept
   `project`. Read
   defaults are described above. Graph tools use the global graph when
-  `project` is omitted. `export_memories` exports all scopes when omitted;
+  `project` is omitted. `export_memories` exports all scopes when omitted,
+  while an explicit `project="global"` exports only the shared scope (memories
+  and graph, like every other tool);
   `import_memories` restores each record to its exported scope. For
   `init_context`, use `project="*"` to include all scopes. `forget(entity=...,
   project=...)` deletes only that scope's node and memories; without `project`
@@ -522,9 +529,9 @@ it explicitly.
 |------|---------------|-------|
 | `get_entity` | `entity` (`name` kept as alias), `limit`, `offset` | Entity name to fetch details for; the answer reports `total`/`has_more` and warns when it was truncated; `total` also counts the relation-context sentences of the entity's edges; `project="*"` is rejected (the answer describes exactly one entity) |
 | `relate` | `from_entity`, `to_entity` (not `from`, `to`), `weight` (0..1) | Source and target entity names; `weight` is the edge strength |
-| `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent); unlike `remember_batch` it is all-or-nothing - one invalid edge aborts the whole call |
+| `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent); unlike `remember_batch` it is all-or-nothing - one invalid edge aborts the whole call; an empty `edges` list is an error; self-loop edges are stored with a warning |
 | `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
-| `recall` | `project` (`"*"` = every scope), `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `limit`, `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `include_relation_context`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `include_relation_context=false` hides the edge sentences from the ranking; `limit` caps the ranked result (default 10) and `offset` pages (`has_more`/`next_offset`); an unknown project falls back to the global scope and says so in `warnings`; the answer names every filter that emptied the result and reports `scopes_searched` |
+| `recall` | `project` (`"*"` = every scope), `min_similarity` (0..1, default 0.40), `min_decay_score` (0..1), `limit`, `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `include_relation_context`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `include_relation_context=false` hides the edge sentences from the ranking; `limit` caps the ranked result (default 10) and `offset` pages (`has_more`/`next_offset`); an unknown project falls back to the global scope and says so in `warnings`; the answer names every filter that emptied the result and reports `scopes_searched` |
 | `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `contains`, `memory_id`, `include_deleted`, `include_superseded`, `include_relation_context` | Browse without a query; `contains` is a case-insensitive literal substring; `memory_id` is a direct lookup; `include_deleted` lists forgotten rows with `deleted_at` (superseded rows only with `include_superseded` - the two flags are orthogonal); `offset` pages, the response reports `total`/`has_more`/`next_offset` (all after dedup); without `project` or with `project="*"` every scope is listed, `project="global"` only the shared one |
 | `list_entities` | `entity_type`, `project`, `include_global`, `limit`, `offset` | Without `project` or with `project="*"`, lists all scopes; `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden; `entity_type` selects one kind ('graph', 'memory-only', or a raw AGE label); `count` equals `total`; sorted by name so `offset` is stable |
 | `init_context` | `project` (`"*"` = every scope), `include_global`, `detail`, `limit` | every memory reports its `project`; the list holds the most recently changed memories; `projects` names every covered scope (including `"global"`); `graph_entities_count` counts the covered scopes only |
@@ -532,8 +539,8 @@ it explicitly.
 | `drop_project` | `project`, `dry_run` | Removes the scope completely (table, registry, graph nodes, mirror rows); a graph-only scope is removed as well; `global` is refused (use `forget(entity="*", project="global")`) |
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set; the answer names the scope it wrote to; an unknown `supersede` id replaces nothing and warns |
 | `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored; every entry names its scope |
-| `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`); an unknown id returns `not_found` before the "nothing to update" validation |
-| `update_batch` | `updates: [{memory_id, content?, importance?, metadata?, entity?, mem_type?, project?}]` | Savepoints: an invalid/unknown/ambiguous entry is reported in its result entry (`partial`), the rest is still applied; `ok` is false only when nothing could be updated |
+| `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project`, `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold` (0..1) | Content changes are re-embedded; a content change that would duplicate another active memory answers `duplicate` with `duplicate_of` and applies nothing (`dedupe="off"` bypasses the check); an id that exists in several scopes is refused (`scopes`); an unknown id returns `not_found` before the "nothing to update" validation |
+| `update_batch` | `updates: [{memory_id, content?, importance?, metadata?, entity?, mem_type?, project?, dedupe?, fuzzy_threshold?}]` | Savepoints: an invalid/unknown/ambiguous/duplicate entry is reported in its result entry (`partial`), the rest is still applied; `ok` is false only when nothing could be updated |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
 | `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Entity optional: without it the scan checks all active memories of the scope (pairs across entities included); `newest` supersedes the older fact of **same-entity** pairs only - cross-entity pairs stay active with `cross_entity: true` and a `resolve skipped` warning; a partially failed NLI reports `nli_failures` (`fact_id`, `neighbor_ids`, `reason`) so the unjudged pairs are named |
 | `forget` | `memory_id`, `entity` (`entity_name` kept as alias), `soft`, `project`, `dry_run` | `counts` splits memories/entities/relations; `entity="*"` + `project` empties a whole scope (soft by default, hard with `soft=false`; the scope itself survives either way - `drop_project` removes it completely); `dry_run=True` counts exactly what the real call removes |

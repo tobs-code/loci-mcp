@@ -48,11 +48,11 @@ def test_invalid_argument_type_answers_with_the_envelope():
 
 
 def test_min_similarity_default_is_documented_and_not_noise():
-    assert DEFAULT_MIN_SIMILARITY == 0.35
+    assert DEFAULT_MIN_SIMILARITY == 0.40
 
     schema = app._tool_manager.get_tool("recall").parameters
     description = schema["properties"]["min_similarity"]["description"]
-    assert "0.35" in description
+    assert "0.40" in description
 
 
 def test_ambiguous_memory_id_is_reported_instead_of_guessed():

@@ -4,8 +4,8 @@ from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from pydantic import Field
 
-from mcp_server.db import get_conn
 from mcp_server.config import SENTINEL_FORGOTTEN
+from mcp_server.db import get_conn
 from mcp_server.envelope import (
     STATUS_DELETED,
     STATUS_ERROR,
@@ -19,6 +19,7 @@ from mcp_server.scopes import (
     _ag_str,
     _ensure_project_table,
     _mem_table,
+    _norm_entity,
     _norm_project,
     _retrieval_tables,
     _safe_ident,
@@ -124,8 +125,10 @@ def _entity_not_found_hint(cur, entity_name: str, project: str | None) -> str:
     for table in _retrieval_tables(cur, project):
         if not _table_exists(cur, table):
             continue
-        cur.execute(f"SELECT 1 FROM {table} WHERE entity = %s LIMIT 1",
-                    (entity_name,))
+        cur.execute(
+            f"SELECT 1 FROM {table} WHERE entity = %s "
+            "AND superseded_by IS NULL AND deleted_at IS NULL LIMIT 1",
+            (entity_name,))
         if cur.fetchone():
             memory_only = True
             break
@@ -178,8 +181,8 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
     label = _scope_label(project)
     prepared: list[dict] = []
     for edge in edges:
-        frm = edge.get("from_entity")
-        to = edge.get("to_entity")
+        frm = _norm_entity(edge.get("from_entity"))
+        to = _norm_entity(edge.get("to_entity"))
         rtype = edge.get("relation_type")
         if not frm or not to:
             raise ValueError("each edge needs 'from_entity' and 'to_entity'")
@@ -245,6 +248,7 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
             "weight": e["weight"],
             "status": "updated" if existed else "created",
             "context_memory": None,
+            "self_loop": e["from_entity"] == e["to_entity"],
         })
 
     context_edges = [(e, r) for e, r in zip(prepared, results) if e["context"]]
@@ -335,12 +339,19 @@ def relate(
         conn.close()
 
     edge = results[0]
+    warnings: list[str] = []
+    if edge.get("self_loop"):
+        warnings.append(
+            f"self-loop: {edge['from_entity']!r} points to itself via "
+            f"{edge['relation_type']!r}; graph traversal cannot leave that "
+            "node through this edge")
     return ok(edge["status"], **{
         "from_entity": edge["from_entity"],
         "to_entity": edge["to_entity"],
         "relation_type": edge["relation_type"],
         "weight": edge["weight"],
         "context_memory": edge["context_memory"],
+        "warnings": warnings,
     })
 
 
@@ -369,7 +380,8 @@ def relate_batch(
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     if not edges:
-        return ok(STATUS_OK, count=0, results=[])
+        return fail(STATUS_ERROR, "edges must not be empty: pass at least one "
+                                  "edge or omit the call")
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -397,7 +409,14 @@ def relate_batch(
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    return ok(STATUS_OK, count=len(results), results=results)
+    warnings: list[str] = []
+    self_loops = [r for r in results if r.get("self_loop")]
+    if self_loops:
+        warnings.append(
+            f"{len(self_loops)} self-loop edge(s) stored (an entity points to "
+            "itself); they are valid but cannot expand a graph traversal")
+    return ok(STATUS_OK, count=len(results), results=results,
+              warnings=warnings)
 
 
 def unrelate(
@@ -419,8 +438,12 @@ def unrelate(
                 from_entity, relation_type, to_entity, project)
     try:
         project = _norm_project(project)
+        from_entity = _norm_entity(from_entity)
+        to_entity = _norm_entity(to_entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
+    if not from_entity or not to_entity:
+        return fail(STATUS_ERROR, "from_entity and to_entity are required")
     if not relation_type:
         return fail(STATUS_ERROR, "relation_type is required")
     try:
@@ -497,11 +520,17 @@ def find_connections(
     own direction. `project` selects that project's graph; without it the
     global graph is traversed.
     """
+    if entity and entity_name and entity.strip() != entity_name.strip():
+        return fail(
+            STATUS_ERROR,
+            f"entity and entity_name were both given but differ "
+            f"({entity!r} vs {entity_name!r}); pass only one of the aliases")
     entity_name = entity or entity_name
     logger.info("find_connections entity=%s direction=%s relation_type=%s limit=%s project=%s",
                 entity_name, direction, relation_type, limit, project)
     try:
         project = _norm_project(project)
+        entity_name = _norm_entity(entity_name)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     if not entity_name:
@@ -599,15 +628,24 @@ def find_paths(from_entity: Annotated[
                 from_entity, to_entity, max_hops, project)
     try:
         project = _norm_project(project)
+        from_entity = _norm_entity(from_entity)
+        to_entity = _norm_entity(to_entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
+    if not from_entity or not to_entity:
+        return fail(STATUS_ERROR, "from_entity and to_entity are required")
     try:
         max_hops = int(max_hops)
     except (TypeError, ValueError):
         return fail(STATUS_ERROR, "max_hops must be an integer")
     if max_hops < 1:
         return fail(STATUS_ERROR, "max_hops must be >= 1")
-    max_hops = min(max_hops, 10)
+    warnings: list[str] = []
+    if max_hops > 10:
+        warnings.append(
+            f"max_hops={max_hops} was clamped to 10: longer paths are not "
+            "searched")
+        max_hops = 10
     label = _scope_label(project)
     conn = get_conn()
     try:
@@ -625,6 +663,16 @@ def find_paths(from_entity: Annotated[
             return fail(STATUS_NOT_FOUND,
                         _entity_not_found_hint(cur, missing[0], project),
                         entity=missing[0], scope=scope)
+        if from_entity == to_entity:
+            cur.execute(
+                "SELECT id FROM entities WHERE project = %s AND name = %s",
+                (scope, from_entity))
+            row = cur.fetchone()
+            conn.rollback()
+            return ok(STATUS_OK, count=1, warnings=warnings, results=[{
+                "nodes": [{"id": row[0] if row else None, "name": from_entity,
+                           "label": label}],
+                "relations": [], "hops": 0}])
         cur.execute("SET search_path TO ag_catalog, public")
         fe_json = json.dumps(from_entity)
         te_json = json.dumps(to_entity)
@@ -691,9 +739,9 @@ def find_paths(from_entity: Annotated[
         shortest_hops = min(path["hops"] for path in paths)
         paths = [path for path in paths if path["hops"] == shortest_hops]
     else:
-        return ok(STATUS_OK, count=0, results=[], warnings=[
+        warnings.append(
             f"no path found between {from_entity!r} and {to_entity!r} "
             f"(at most {max_hops} hop(s) in the {scope} graph): the two "
-            f"entities are not connected"
-        ])
-    return ok(STATUS_OK, count=len(paths), results=paths)
+            f"entities are not connected")
+        return ok(STATUS_OK, count=0, results=[], warnings=warnings)
+    return ok(STATUS_OK, count=len(paths), results=paths, warnings=warnings)

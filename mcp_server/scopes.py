@@ -38,6 +38,24 @@ def _norm_project(project: str | None) -> str | None:
     return name
 
 
+def _norm_entity(entity: str | None) -> str | None:
+    """Canonical entity name: trimmed, or None when no entity was given.
+
+    A blank string is a caller mistake, not "no entity": it would create a
+    graph node whose name is invisible in every listing that trims. It raises,
+    so the envelope names the argument (data-driven call sites catch this and
+    report the affected item individually).
+    """
+    if entity is None:
+        return None
+    name = str(entity).strip()
+    if not name:
+        raise ValueError(
+            "entity must not be an empty or whitespace-only string: pass a "
+            "name or omit it")
+    return name
+
+
 def _is_global_scope(project: str | None) -> bool:
     """True when the caller explicitly asked for the shared global scope.
 

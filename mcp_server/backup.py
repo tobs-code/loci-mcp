@@ -12,6 +12,7 @@ from mcp_server.graph import _ensure_graph_entity, _relate_edges
 from mcp_server.inference_client import embed
 from mcp_server.scopes import (
     _ensure_project_table,
+    _is_global_scope,
     _mem_table,
     _norm_project,
     _project_names,
@@ -25,10 +26,16 @@ logger = logging.getLogger(__name__)
 
 def _export_memories_json(cur, project: str | None,
                           include_superseded: bool = False,
-                          include_embeddings: bool = False) -> list[dict]:
+                          include_embeddings: bool = False,
+                          only_global: bool = False) -> list[dict]:
     names = _project_names(cur)
     if project:
         tables = [(_mem_table(project), project)]
+    elif only_global:
+        # An explicit project="global" means the shared scope, exactly like it
+        # does in every other tool. Without this branch it widened to "every
+        # scope" and a "global only" backup silently contained project rows.
+        tables = [("memories", "global")]
     else:
         tables = [("memories", "global")]
         tables += [(t, names.get(t[len("mem_"):], t[len("mem_"):]))
@@ -59,10 +66,13 @@ def _export_memories_json(cur, project: str | None,
     return out
 
 
-def _export_excluded_counts(cur, project: str | None) -> tuple[int, int]:
+def _export_excluded_counts(cur, project: str | None,
+                            only_global: bool = False) -> tuple[int, int]:
     """Count rows a default export leaves out: (superseded, forgotten)."""
     if project:
         tables = [_mem_table(project)]
+    elif only_global:
+        tables = ["memories"]
     else:
         tables = ["memories"] + list(_project_tables(cur))
     superseded = 0
@@ -81,16 +91,18 @@ def _export_excluded_counts(cur, project: str | None) -> tuple[int, int]:
     return superseded, forgotten
 
 
-def _export_graph(cur, project: str | None) -> dict:
+def _export_graph(cur, project: str | None,
+                  only_global: bool = False) -> dict:
     """Entities and relations for the backup (scoped when project is given)."""
-    scope_filter = "WHERE project = %s" if project else ""
-    params: tuple[Any, ...] = (project,) if project else ()
+    scope_name = "global" if only_global else project
+    scope_filter = "WHERE project = %s" if scope_name else ""
+    params: tuple[Any, ...] = (scope_name,) if scope_name else ()
     cur.execute(
         f"SELECT name, type, project FROM entities {scope_filter} ORDER BY project, name",
         params,
     )
     entities = [{"name": r[0], "type": r[1], "project": r[2]} for r in cur.fetchall()]
-    rel_filter = "WHERE e1.project = %s" if project else ""
+    rel_filter = "WHERE e1.project = %s" if scope_name else ""
     cur.execute(
         f"SELECT e1.name, e2.name, r.relation_type, r.weight, e1.project "
         f"FROM relations r "
@@ -116,8 +128,9 @@ def export_memories(
                           "(no graph).")]= "json",
     project: Annotated[
         str | None,
-        Field(description="Scope to export. Without it every scope is exported "
-                          "and each record carries its project.")] = None,
+        Field(description="Scope to export. 'global' exports only the shared "
+                          "scope; without it every scope is exported and each "
+                          "record carries its project.")] = None,
     include_embeddings: Annotated[
         bool,
         Field(description="Include the vector of every memory (large).")] = False,
@@ -138,6 +151,10 @@ def export_memories(
     unchanged.
     """
     logger.info("export_memories format=%s project=%s graph=%s", format, project, include_graph)
+    # `_norm_project("global")` returns None, which also means "no scope
+    # given". Remember the explicit shared-scope request before normalizing,
+    # so it does not widen to every scope.
+    only_global = _is_global_scope(project)
     try:
         project = _norm_project(project)
     except ValueError as e:
@@ -150,10 +167,12 @@ def export_memories(
     try:
         cur = conn.cursor()
         rows = _export_memories_json(cur, project, include_superseded,
-                                     include_embeddings)
-        graph = _export_graph(cur, project) if (include_graph and format != "jsonl") else None
+                                     include_embeddings,
+                                     only_global=only_global)
+        graph = (_export_graph(cur, project, only_global=only_global)
+                 if (include_graph and format != "jsonl") else None)
         excluded = ((0, 0) if include_superseded
-                    else _export_excluded_counts(cur, project))
+                    else _export_excluded_counts(cur, project, only_global))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -196,7 +215,12 @@ def export_memories(
             parts.append(f"{superseded_count} superseded")
         if forgotten_count:
             parts.append(f"{forgotten_count} forgotten")
-        where = f" of project {project!r}" if project else " across all scopes"
+        if only_global:
+            where = " of the global scope"
+        elif project:
+            where = f" of project {project!r}"
+        else:
+            where = " across all scopes"
         warnings.append(
             "export excludes " + " and ".join(parts) + " memories"
             + where + "; pass include_superseded=true for a complete backup")
@@ -299,11 +323,36 @@ def import_memories(
                     imported=0, skipped=0)
     graph: dict | None = None
     try:
+        if format == "jsonl" and isinstance(data, dict):
+            return fail(
+                STATUS_ERROR,
+                "format='jsonl' but data is an object; pass a JSONL string "
+                "(one record per line), a list of records, or format='json'",
+                imported=0, skipped=0)
         if isinstance(data, dict):
             parsed = data
         elif format == "jsonl":
-            parsed = [json.loads(line) for line in str(data).strip().split("\n")
-                      if line.strip()]
+            lines = [line for line in str(data).strip().split("\n")
+                     if line.strip()]
+            parsed = []
+            for lineno, line in enumerate(lines, 1):
+                try:
+                    parsed.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    return fail(
+                        STATUS_ERROR,
+                        f"invalid jsonl data at line {lineno}: {exc}",
+                        imported=0, skipped=0)
+            if (len(parsed) == 1 and isinstance(parsed[0], dict)
+                    and "records" in parsed[0]):
+                # A single line that is a whole export object is not JSONL.
+                # Importing it as a list used to yield a silent 0/0 "success".
+                return fail(
+                    STATUS_ERROR,
+                    "format='jsonl' but data is a JSON export object (it has "
+                    "'records'); pass format='json' or send one record per "
+                    "line",
+                    imported=0, skipped=0)
         else:
             parsed = json.loads(data)
         if isinstance(parsed, dict) and "records" in parsed:
@@ -347,7 +396,14 @@ def import_memories(
                 errors.append("record is not an object")
                 skipped += 1
                 continue
-            content = rec.get("content") or rec.get("text") or ""
+            raw_content = rec.get("content")
+            if raw_content is None:
+                raw_content = rec.get("text")
+            # Whitespace-only content must be refused exactly like `remember`
+            # refuses it: the old check used truthiness, so "   " was imported
+            # as an unsearchable row that no read tool could ever explain.
+            content = (raw_content.strip()
+                       if isinstance(raw_content, str) else "")
             if not content:
                 skipped += 1
                 skipped_empty_content += 1
@@ -484,6 +540,10 @@ def import_memories(
         reasons["duplicate_content"] = skipped_duplicate_content
     if skipped_empty_content:
         reasons["empty_content"] = skipped_empty_content
+    if errors:
+        # Invalid records were skipped too; without this key the reasons did
+        # not add up to `skipped` and an import that lost rows looked clean.
+        reasons["invalid"] = len(errors)
     if reasons:
         result["skipped_reasons"] = reasons
     # A non-empty `skipped` must never be silent: "already imported" (fine and

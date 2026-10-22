@@ -12,7 +12,7 @@ MEMORY_TYPES = {
 # here?" is asked. The names alone do not tell an agent that, so the tool
 # descriptions spell out the difference.
 MEMORY_TYPE_HELP = (
-    "Kind of the memory (default: fact). "
+    "Kind of the memory. "
     "fact: a verifiable statement about the system. "
     "decision: a choice that was made, ideally with its reason. "
     "learning: a lesson drawn from experience. "
@@ -93,9 +93,12 @@ NEAR_DUPLICATE_THRESHOLD = 0.75
 # verbatim in the fact only scores 0.30-0.61 (single tokens dilute the query
 # vector). 0.4 therefore cut off roughly every third true keyword hit, so the
 # default sits lower; full-text matches are never filtered by this value.
-# 0.35 is the compromise: the bottom tail of the keyword range (0.30-0.35) is
-# mostly noise, everything above it is kept.
-DEFAULT_MIN_SIMILARITY = 0.35
+# 0.40 is the compromise: the bottom tail of the keyword range (0.30-0.40) is
+# mostly noise, and a weak vector-only hit that merely shares a function word
+# ("... $500 per month" for "requests per minute limit", similarity 0.38) is
+# dropped. Full-text hits still survive regardless, so exact identifiers are
+# not lost with this value.
+DEFAULT_MIN_SIMILARITY = 0.40
 
 
 PROJECT_SCOPE_BOOST = 0.05

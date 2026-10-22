@@ -82,7 +82,7 @@ ranking is then `_relevance_score`, and the result is ordered by it.
 
 ## The similarity filter
 
-`min_similarity` defaults to **0.35** and filters the **vector** retriever
+`min_similarity` defaults to **0.40** and filters the **vector** retriever
 only. A full-text hit is kept even when the embedding model scores it badly —
 that is the case the full-text leg exists for.
 
@@ -113,7 +113,7 @@ Actually not a real keyword hit: hits that the vector retriever found are never
 dropped by this filter.
 
 With `min_similarity=null` the filter is disabled and near-zero hits can
-appear as "relevant". When any returned hit has `_similarity < 0.35`, the
+appear as "relevant". When any returned hit has `_similarity < 0.40`, the
 response warns about it (`the min_similarity filter is disabled: N of M
 result(s) ...`), so agents notice the weak hits instead of reading them as
 confident matches.
