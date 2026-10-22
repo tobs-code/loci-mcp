@@ -131,7 +131,9 @@ def test_init_context_summarizes_the_selected_project():
 
     assert result["total_memories"] >= 1
     assert result["active_memories"] >= 1
-    assert result["projects"] == ["alpha"]
+    # The bootstrap covers the project and the shared scope, so both are
+    # named in `projects`.
+    assert result["projects"] == ["alpha", "global"]
     assert any("Context fact" in m["content"] for m in result["recent_memories"])
     assert result["inference_healthy"] is True
     assert isinstance(result["graph_entities_count"], int)

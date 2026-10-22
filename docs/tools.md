@@ -79,7 +79,9 @@ mode that matched (`duplicate_mode`) and the measured similarity.
 
 `facts` is a list of objects; only `content` is required, everything else works
 like in `remember`. Invalid facts are reported individually, the rest is still
-stored (`status: "partial"`).
+stored (`status: "partial"`). A fact without `content` or one that is not an
+object at all does not abort the batch - it is reported as an error entry
+next to the facts that were stored.
 
 ### `update_memory`
 
@@ -95,7 +97,8 @@ exists in several scopes is refused and the scopes are named (see
 `true`), `project`, `dry_run`.
 
 - `entity="*"` plus `project` empties a whole scope; `project` is required for
-  that, so a stray call cannot wipe the database.
+  that, so a stray call cannot wipe the database. The shared scope is
+  addressed with `project="global"`.
 - `dry_run=true` only reports the counts.
 - The answer carries `counts` (memories/entities/relations separately) and
   `scopes` (the scopes the id was found in).
@@ -112,11 +115,11 @@ memory is visible to `recall`/`list_memories` again. Find the id with
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`, `include_global`, `graph_boost`/`graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project`, `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id`, `include_deleted` |
-| `get_entity` | Entity details (including graph connections) + all linked memories; `include_global`, `include_superseded`, `fields` |
+| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `fields` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); memory-only entities carry `type="memory-only"`; synthetic `A_KNOWS_B` entities are hidden |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global`; `project="*"` lists `"global"` in `projects` |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, projects, graph entity count, health; `detail="slim"\|"full"`, `include_global`; `project="*"` lists every scope |
 | `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
 ### `recall`
@@ -126,7 +129,7 @@ The search tool. `query` is required and non-empty.
 | Parameter | Type | Meaning |
 |-----------|------|---------|
 | `query` | string | Search text, embedded as a query and matched against the vector and full-text indexes. |
-| `project` | string? | Scope. Without it only global memories are searched. |
+| `project` | string? | Scope. Without it only global memories are searched; `"*"` searches every scope. |
 | `limit` | int | Maximum number of results (default 10). |
 | `hybrid` | bool | True (default) fuses vector and full-text results (RRF). False uses a single retriever. |
 | `min_similarity` | number? | Drop vector hits below this cosine similarity (0..1, default 0.35). `null` disables the filter. |
@@ -148,6 +151,9 @@ The answer reports `candidates` and `dropped_by_similarity` (the number of
 vector hits the filter removed), plus `fulltext_only` when a hit came only from
 the full-text leg. See [Retrieval](retrieval.md) for the score fields.
 
+A project that does not exist is not silently ignored: the search falls back
+to the global scope and the answer says so in `warnings`.
+
 ### `list_memories`
 
 Browse without a search. `order_by` is `updated_at` (default), `created_at`,
@@ -167,7 +173,9 @@ finds an id for `restore_memory`. Forgotten rows carry the machine-readable
 `include_superseded`, `fields`. Memory-only entities have no graph node;
 `details.type` is then `memory-only`. A missing entity answers with
 `status: "not_found"`. The `memories` list is sorted by `updated_at`
-descending, newest change first.
+descending, newest change first. It also contains the relation-context
+sentences of the entity's edges - they are stored under the synthetic entity
+`A_REL_B`, so without this they would not show up here at all.
 
 ### `list_entities`
 
@@ -175,17 +183,28 @@ descending, newest change first.
 sorted by name, so `offset` is stable. Synthetic relation-context entities
 (`A_KNOWS_B`) are hidden unless the name also carries a real memory.
 
+`entity_type` selects one kind of entity: a graph node (whose type is the AGE
+label of its scope - `Entity` for the shared scope, `Project_<suffix>` for a
+project) or a memory-only entity (`memory-only`). `count` and `total` always
+agree, and an entity that has a graph node is never reported as memory-only.
+
 ### `init_context`
 
-The session bootstrap. `project="*"` includes all projects (and `"global"` in
-the `projects` list), `detail="full"` returns every column except the internal
-ones and the search score annotations, `include_global=false` excludes global
-memories.
+The session bootstrap. `project="*"` includes all projects, `detail="full"`
+returns every column except the internal ones and the search score
+annotations, `include_global=false` excludes global memories.
+
+`projects` names every scope the answer covers, including the shared one
+(`"global"`). `active_memories` counts the rows a search would return,
+`total_memories` counts every row of the scope - the difference is
+`superseded_memories` plus `forgotten_memories`. `graph_entities_count` counts
+the graph nodes of the covered scopes, not of the whole database.
 
 ### `list_projects`
 
-Lists every scope with `memories`, `total_memories`, `entities` and
-`relations`. `include_empty=false` hides scopes without active memories.
+Lists every scope with `memories`, `total_memories`, `superseded_memories`,
+`forgotten_memories`, `entities` and `relations`. `include_empty=false` hides
+scopes without active memories.
 
 ## Graph tools
 
@@ -195,7 +214,7 @@ Lists every scope with `memories`, `total_memories`, `entities` and
 | `relate_batch` | Many relations in one transaction (MERGE, idempotent, per-edge `weight`/`context`/`project`) |
 | `unrelate` | Delete a single directed relation |
 | `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction` |
-| `find_paths` | Shortest paths between two existing entities (`project`-scoped); missing entities return `not_found` |
+| `find_paths` | Shortest paths between two existing entities (`project`-scoped); missing entities return `not_found`, no path returns a warning |
 
 - `relate` takes `from_entity`, `to_entity` (not `from`/`to`), `relation_type`
   and `weight` (0..1). The weight scales the retrieval boost of `graph_boost`.
@@ -212,7 +231,7 @@ Lists every scope with `memories`, `total_memories`, `entities` and
 | `contradictions_report` | Detect conflicting facts for **one entity** (LLM NLI + vector pre-filter); `entity` is required; `resolve="newest"` keeps the newer fact and supersedes the older |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`); payload in `data`; warns when the default export leaves superseded/forgotten rows out |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`); IDs are preserved |
-| `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews |
+| `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |
 | `server_health` | Check Postgres + Inference connectivity |
 
 See [Backup & Restore](backup.md) for the export/import contract and

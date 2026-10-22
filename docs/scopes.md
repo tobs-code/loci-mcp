@@ -55,7 +55,12 @@ Graph tools use the global graph when `project` is omitted.
 
 The read defaults differ per tool and are listed in
 [Retrieval & Scoring](retrieval.md#read-scope-defaults). For `init_context`,
-use `project="*"` to include all scopes.
+use `project="*"` to include all scopes; `recall` understands `project="*"`
+as well and then searches every scope at once.
+
+A project that does not exist is never silently ignored: `recall`,
+`list_memories`, `list_entities` and `init_context` fall back to the global
+scope and say so in `warnings`.
 
 ## Memory ids are unique per scope
 
@@ -79,9 +84,9 @@ was changed. `forget(entity=...)` keeps removing the entity from every scope.
 
 | Tool | Effect |
 |------|--------|
-| `list_projects` | Lists every scope with `memories`, `total_memories`, `entities` and `relations`. |
-| `forget(entity="*", project=…)` | **Empties** the scope: memories, graph nodes and mirror rows are removed, the scope itself survives. |
-| `drop_project(project=…)` | **Removes** the scope completely: memory table, registry entry, graph nodes and mirror rows. `dry_run=true` previews the counts. |
+| `list_projects` | Lists every scope with `memories`, `total_memories`, `superseded_memories`, `forgotten_memories`, `entities` and `relations`. |
+| `forget(entity="*", project=…)` | **Empties** the scope: memories, graph nodes and mirror rows are removed, the scope itself survives. The shared scope is addressed with `project="global"`. |
+| `drop_project(project=…)` | **Removes** the scope completely: memory table, registry entry, graph nodes and mirror rows. `dry_run=true` previews the counts. `global` is refused. |
 
 `forget(entity="*", project="global")` empties the shared global scope the
 same way (soft or hard); the wildcard without any `project` is refused, so a

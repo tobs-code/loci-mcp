@@ -34,12 +34,19 @@ query side always match, a changed dictionary is migrated at startup.
   omitted, and project + global by default when it is set.
 - `init_context` uses the global scope when `project` is omitted, project +
   global when set, and all scopes with `project="*"`.
+- `recall` accepts `project="*"` too: it then searches every scope at once.
+  Without it a project search only covers that project plus the global one.
 - Pass `include_global=false` for project-only reads.
+
+A project that does not exist is never silently ignored: the read tools
+(`recall`, `list_memories`, `list_entities`, `init_context`) fall back to the
+global scope and say so in `warnings`, so a typo in the project name cannot
+look like a successful search.
 
 `recall` searches the project table (if `project` is set) **and** the global
 `memories` table, so global facts remain visible inside a project. Project
-hits receive a small scope tie-breaker. When the same content exists in both
-scopes, the project copy wins.
+hits receive a small scope tie-breaker (`_scope_boost`, 0.05). When the same
+content exists in both scopes, the project copy wins.
 
 ## Score fields
 
@@ -49,9 +56,10 @@ scopes, the project copy wins.
 | `_distance` | Raw cosine distance to the query. |
 | `_text_score` | Normalized rank of the full-text hit (1.0 = best). |
 | `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. |
+| `_scope_boost` | The 0.05 that a project row gets on top of `_relevance_score`. |
 | `_rrf_score` / `_rrf_norm` | Raw RRF fusion value and its normalized form. |
 | `_decay_score` / `_decay_norm` | Raw decay value (uncapped) and the normalized 0..1 score. |
-| `_final_score` | The ranking score in 0..1: relevance blended with decay plus the graph boost. |
+| `_final_score` | The ranking score in 0..1: relevance blended with decay plus the graph boost. Only present with `include_decay=true` or `graph_boost=true`. |
 | `_graph_boost` / `_graph_source` / `_graph_weight` | Describe a graph hit: the boost, the connected entity and the edge weight. |
 
 `_relevance_score` is the number to compare hits by. It combines the two
@@ -59,6 +67,9 @@ retrievers as independent chances to match, so a memory that *both* retrievers
 found scores higher than either signal alone. Plain RRF cannot do that: it
 ranks by position, so the third hit is almost as good as the first (0.97 vs
 1.0) even when its similarity is 0.42 against 0.71.
+
+Without `include_decay` and `graph_boost` there is no `_final_score`: the
+ranking is then `_relevance_score`, and the result is ordered by it.
 
 ## The similarity filter
 

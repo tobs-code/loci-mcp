@@ -136,6 +136,29 @@ def _entity_not_found_hint(cur, entity_name: str, project: str | None) -> str:
             f"project=<name> if the entity lives in a project)")
 
 
+def _sync_context_weight(cur, project: str | None, from_entity: str,
+                         to_entity: str, relation_type: str,
+                         weight: float) -> None:
+    """Keep the weight in a relation context memory in sync with its edge.
+
+    `relate(context=...)` stores the edge weight in the metadata of the
+    context sentence. When the edge is re-weighted later, the sentence must
+    follow - otherwise it reports a strength the graph no longer has.
+    """
+    table = _mem_table(project)
+    if not _table_exists(cur, table):
+        return
+    cur.execute(
+        f"UPDATE {table} SET metadata = jsonb_set(metadata, '{{weight}}', %s::jsonb) "
+        "WHERE deleted_at IS NULL AND superseded_by IS NULL "
+        "AND metadata->>'relation_context' = 'true' "
+        "AND metadata->>'from' = %s "
+        "AND metadata->>'to' = %s "
+        "AND metadata->>'relation_type' = %s",
+        (json.dumps(weight), from_entity, to_entity, relation_type),
+    )
+
+
 def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
     """Create/update directed AGE edges and the SQL mirror rows.
 
@@ -201,6 +224,11 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
             "ON CONFLICT (source_id, target_id, relation_type) DO UPDATE SET weight = EXCLUDED.weight",
             (rtype, e["weight"], e["from_entity"], e["to_entity"], scope, scope),
         )
+        # The context sentence of an edge carries the edge weight in its
+        # metadata. A later weight change would leave the old value behind
+        # and contradict the graph, so the two are kept in sync.
+        _sync_context_weight(cur, project, e["from_entity"], e["to_entity"],
+                             rtype, e["weight"])
         results.append({
             "from_entity": e["from_entity"],
             "to_entity": e["to_entity"],
@@ -538,6 +566,8 @@ def find_paths(from_entity: Annotated[
 
     The canonical collection is ``results``.
     `project` selects that project's graph; without it the global graph is used.
+    When no path is found the response says so in `warnings`: an empty
+    `results` list then means "no connection", not "nothing looked up".
     """
     logger.info("find_paths from=%s to=%s max_hops=%s project=%s",
                 from_entity, to_entity, max_hops, project)
@@ -631,4 +661,10 @@ def find_paths(from_entity: Annotated[
     if paths:
         shortest_hops = min(path["hops"] for path in paths)
         paths = [path for path in paths if path["hops"] == shortest_hops]
+    else:
+        return ok(STATUS_OK, count=0, results=[], warnings=[
+            f"no path found between {from_entity!r} and {to_entity!r} "
+            f"(at most {max_hops} hop(s) in the {scope} graph): the two "
+            f"entities are not connected"
+        ])
     return ok(STATUS_OK, count=len(paths), results=paths)

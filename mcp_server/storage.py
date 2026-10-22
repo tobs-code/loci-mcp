@@ -259,11 +259,13 @@ def _check_contradictions(cur, content: str, entity: str | None,
     return contradictions
 
 
-def _log_access(cur, mem_ids: list[str], project: str | None) -> None:
+def _log_access(cur, mem_ids: list[str], project: str | None,
+                tables: list[str] | None = None) -> None:
     if not mem_ids:
         return
     # Hits may come from the project table as well as from the global one.
-    tables = _retrieval_tables(cur, project)
+    if tables is None:
+        tables = _retrieval_tables(cur, project)
     for table in tables:
         cur.execute(
             f"UPDATE {table} SET access_count = COALESCE(access_count, 0) + 1 "

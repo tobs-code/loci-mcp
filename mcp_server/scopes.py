@@ -280,6 +280,19 @@ def _scope_of_table(cur, table: str) -> str:
     return names.get(suffix, suffix)
 
 
+def _scopes_of_tables(cur, tables: list[str]) -> list[str]:
+    """Readable scope names of a list of memory tables, in the same order."""
+    names = _project_names(cur)
+    out: list[str] = []
+    for table in tables:
+        if table == "memories":
+            out.append("global")
+        else:
+            suffix = table[len("mem_"):]
+            out.append(names.get(suffix, suffix))
+    return out
+
+
 def _memory_scopes(cur, memory_id: str) -> list[str]:
     """Scopes that hold a memory with this id.
 
@@ -296,13 +309,53 @@ def _memory_scopes(cur, memory_id: str) -> list[str]:
     return found
 
 
-def _count_entities() -> int:
+def _count_entities(scopes: list[str] | None = None) -> int:
+    """Number of graph entities.
+
+    Without `scopes` every scope is counted. With `scopes` only the nodes
+    of those scopes are counted, so a scope-scoped report does not leak the
+    size of the whole database.
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM entities")
+        if scopes is None:
+            cur.execute("SELECT COUNT(*) FROM entities")
+        elif not scopes:
+            return 0
+        else:
+            cur.execute(
+                "SELECT COUNT(*) FROM entities WHERE project = ANY(%s)",
+                (scopes,),
+            )
         return cur.fetchone()[0]
     except Exception:
         return 0
     finally:
         conn.close()
+
+
+def _project_has_memories(cur, project: str | None) -> bool:
+    """True when the project scope has its own memory table."""
+    if not project:
+        return True
+    return _table_exists(cur, f"mem_{_project_suffix(project)}")
+
+
+def _unknown_project_warning(cur, project: str | None) -> str | None:
+    """A warning for a project scope that holds no memories of its own.
+
+    The read tools fall back to the global scope when the requested project
+    does not exist. Without this hint a typo in the project name looks like
+    a successful search in an empty scope.
+    """
+    if not project:
+        return None
+    if _project_has_memories(cur, project):
+        return None
+    cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s", (project,))
+    if cur.fetchone()[0]:
+        return (f"project {project!r} has no memories yet (only graph data); "
+                f"only the global scope was searched")
+    return (f"project {project!r} does not exist; only the global scope was "
+            f"searched - check the name with list_projects")

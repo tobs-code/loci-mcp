@@ -40,6 +40,8 @@ def list_projects(include_empty: Annotated[
     projects exist. Every row carries the project name, the number of active
     and total memories, the number of graph entities and relations, and
     whether the scope is the shared global scope.
+    `memories` counts the active rows, `total_memories` every row of the
+    scope; the difference is `superseded_memories` plus `forgotten_memories`.
     """
     logger.info("list_projects include_empty=%s", include_empty)
     conn = get_conn()
@@ -48,27 +50,36 @@ def list_projects(include_empty: Annotated[
         names = _project_names(cur)
         rows: list[dict[str, Any]] = []
 
-        def _scope_stats(tables: list[str]) -> tuple[int, int]:
+        def _scope_stats(tables: list[str]) -> tuple[int, int, int, int]:
             total = 0
             active = 0
+            superseded = 0
+            forgotten = 0
             for table in tables:
                 if not _table_exists(cur, table):
                     continue
                 cur.execute(
-                    f"SELECT COUNT(*), COUNT(*) FILTER (WHERE superseded_by IS NULL "
-                    f"AND deleted_at IS NULL) FROM {table}"
+                    f"SELECT COUNT(*), "
+                    f"COUNT(*) FILTER (WHERE superseded_by IS NULL "
+                    f"AND deleted_at IS NULL), "
+                    f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL "
+                    f"AND deleted_at IS NULL), "
+                    f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
+                    f"FROM {table}"
                 )
-                t, a = cur.fetchone()
+                t, a, s, f = cur.fetchone()
                 total += t
                 active += a
-            return total, active
+                superseded += s
+                forgotten += f
+            return total, active, superseded, forgotten
 
         for table in _all_mem_tables(cur):
             if table == "memories":
                 scope = "global"
             else:
                 scope = names.get(table[len("mem_"):], table[len("mem_"):])
-            total, active = _scope_stats([table])
+            total, active, superseded, forgotten = _scope_stats([table])
             if not include_empty and not active:
                 continue
             cur.execute(
@@ -87,6 +98,8 @@ def list_projects(include_empty: Annotated[
                 "scope": "global" if scope == "global" else "project",
                 "memories": active,
                 "total_memories": total,
+                "superseded_memories": superseded,
+                "forgotten_memories": forgotten,
                 "entities": entities,
                 "relations": relations,
             })
@@ -118,13 +131,19 @@ def drop_project(
     from every listing.
 
     Use `dry_run=True` first if you want to see the counts.
+
+    'global' is the shared scope and cannot be dropped. To empty it, use
+    `forget(entity="*", project="global")`.
     """
     logger.info("drop_project project=%s dry_run=%s", project, dry_run)
+    raw = str(project or "").strip()
     name = _norm_project(project)
     if not name:
-        return fail(STATUS_ERROR,
-                    "project is required: 'global' is the shared scope and "
-                    "cannot be dropped")
+        if raw.lower() == "global":
+            return fail(STATUS_ERROR,
+                        "'global' is the shared scope and cannot be dropped; "
+                        "use forget(entity='*', project='global') to empty it")
+        return fail(STATUS_ERROR, "project is required")
     table = _mem_table(name)
     suffix = _project_suffix(name)
     label = _scope_label(name)

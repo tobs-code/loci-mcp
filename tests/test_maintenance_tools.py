@@ -114,5 +114,6 @@ def test_server_health_and_stats_resource():
     stats = json.loads(stats_resource())
     assert stats["total_memories"] == 1
     assert stats["active_memories"] == 1
-    assert stats["projects"] == ["alpha"]
+    # The shared scope is a scope like every other one and is listed too.
+    assert stats["projects"] == ["alpha", "global"]
     assert stats["inference_healthy"] is True

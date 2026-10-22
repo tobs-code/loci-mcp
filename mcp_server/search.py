@@ -5,7 +5,13 @@ from typing import Any
 
 from mcp_server.config import FTS_LANGUAGE, FTS_WEIGHT, PROJECT_SCOPE_BOOST, RRF_K
 from mcp_server.db import get_conn
-from mcp_server.scopes import _ag_str, _project_names, _retrieval_tables, _scope_label
+from mcp_server.scopes import (
+    _ag_str,
+    _all_mem_tables,
+    _project_names,
+    _retrieval_tables,
+    _scope_label,
+)
 from mcp_server.scoring import (
     _blend_scores,
     _clamp01,
@@ -251,7 +257,10 @@ def _search_memories_rrf(
             # match instead of being flattened into the same RRF band.
             relevance = _relevance_score(similarities.get(row_id, 0.0),
                                          text_scores.get(row_id, 0.0))
-            if project and table != "memories":
+            # A project-scoped row wins over an identical global one: the
+            # global scope is the fallback, not an equal peer. The boost is
+            # published as `_scope_boost` so the ranking stays explainable.
+            if table != "memories":
                 relevance = min(1.0, relevance + PROJECT_SCOPE_BOOST)
                 d["_scope_boost"] = PROJECT_SCOPE_BOOST
             d["_relevance_score"] = round(relevance, 4)
@@ -473,6 +482,7 @@ def _search_memories_graph_boost(
     include_global: bool = True,
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
+    all_projects: bool = False,
 ) -> list[dict]:
     """
     Augments search results with memories from connected entities via the graph.
@@ -488,23 +498,40 @@ def _search_memories_graph_boost(
     conn = get_conn()
     try:
         cur = conn.cursor()
-        tables = _retrieval_tables(cur, project)
-        if project and not include_global:
-            tables = [table for table in tables if table != "memories"]
+        if all_projects:
+            # Every scope has its own AGE label, so the traversal walks all
+            # of them.
+            tables = _all_mem_tables(cur)
+            if not include_global:
+                tables = [t for t in tables if t != "memories"]
+            labels = ["Entity"] if include_global else []
+            for table in tables:
+                if table == "memories":
+                    continue
+                suffix = table[len("mem_"):]
+                labels.append(f"Project_{suffix}")
+        else:
+            tables = _retrieval_tables(cur, project)
+            if project and not include_global:
+                tables = [table for table in tables if table != "memories"]
+            labels = [_scope_label(project)]
 
         # 1. Find connected entities via Apache AGE (any edge direction/type)
         cur.execute("SET search_path TO ag_catalog, public")
-        label = _scope_label(project)
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (a:{label} {{name: {name_json}}})-[r]-(b) "
-            f"RETURN b.name, coalesce(r.weight, 1.0) LIMIT 10 $$) AS "
-            f"(name agtype, weight agtype)"
-        )
-        graph_entities = [
-            (_ag_str(name), float(str(weight)))
-            for name, weight in cur.fetchall()
-        ]
+        seen_nodes: set[str] = set()
+        for label in labels:
+            cur.execute(
+                f"SELECT * FROM cypher('memory_graph', $$ "
+                f"MATCH (a:{label} {{name: {name_json}}})-[r]-(b) "
+                f"RETURN b.name, coalesce(r.weight, 1.0) LIMIT 10 $$) AS "
+                f"(name agtype, weight agtype)"
+            )
+            for name, weight in cur.fetchall():
+                node = _ag_str(name)
+                if node in seen_nodes:
+                    continue
+                seen_nodes.add(node)
+                graph_entities.append((node, float(str(weight))))
 
         # 2. Fetch memories of connected entities
         extra_conditions, extra_params = _extra_conditions(updated_after,

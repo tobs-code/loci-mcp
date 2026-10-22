@@ -77,7 +77,7 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
 | `recall` | Hybrid vector + FTS search (RRF fusion, project + global tables); `hybrid`, `min_similarity` to drop weak vector matches; optional cognitive decay weighting; `include_superseded` / `only_superseded`; `graph_boost` (with `graph_entity`) to include connected entities; `fields` to narrow columns; `offset` pages through ranked hits; logs `access_count`; reports `candidates` / `dropped_by_similarity` |
 | `list_memories` | Browse memories without a query (newest first); filters: `entity`, `mem_type`, `project`, `include_global`, `fields`, `contains`, `memory_id` (direct id lookup), `include_deleted` (soft-forgotten rows), `updated_after`, `metadata_filter`, `order_by`; `offset` pages through a scope |
 | `get_entity` | Get entity details + all linked memories + graph connections; `include_global`, `include_superseded`, `fields` |
-| `list_entities` | Browse entities; filters: `entity_type`, `project`, `include_global`; `offset` pages through the list; synthetic relation-context entities (`A_KNOWS_B`) are hidden |
+| `list_entities` | Browse entities; filters: `entity_type`, `project`, `include_global`; `offset` pages through the list; synthetic relation-context entities (`A_KNOWS_B`) are hidden; `entity_type` selects one kind of entity (a graph node or a memory-only one) and `count` always equals `total` |
 | `init_context` | Bootstrap: recent memories + entity count + health; global by default, project + global when `project` is set, all scopes with `project="*"` (`projects` then includes `"global"`); `detail="slim"` (default, deduped) or `"full"` |
 | `list_projects` | List the known project scopes with their sizes (memories, entities, relations) |
 
@@ -144,9 +144,12 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   (`_text_score`). A memory that both retrievers found scores higher than
   either signal alone. It is `null` for graph-only hits, which were not
   retrieved by relevance.
+- `_scope_boost` (0.05) is added to `_relevance_score` for a project row, so
+  a project memory outranks an equally relevant global one.
 - `_final_score` is the ranking score in **0..1**: relevance blended with
-  decay plus the graph boost, clamped. `_distance` is the raw cosine distance
-  to the query.
+  decay plus the graph boost, clamped. It is only present with
+  `include_decay=true` or `graph_boost=true`; without them the ranking is
+  `_relevance_score`. `_distance` is the raw cosine distance to the query.
 - Graph hits carry `_graph_boost` (0.3 × edge weight), `_graph_source` (the
   connected entity) and `_graph_weight` (the edge weight). They count as
   relevance 0 and are lifted by the boost only.
@@ -178,6 +181,14 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   `detail="full"` returns every column except the internal ones and the
   search score annotations (`_decay_score`, `_final_score`, ...): the
   bootstrap is not a search result, it is sorted by the last update.
+  `projects` names every scope the answer covers, including the shared one
+  (`"global"`); `active_memories` counts the searchable rows, `total_memories`
+  every row (so `total = active + superseded + forgotten`);
+  `graph_entities_count` counts the graph nodes of the covered scopes, not of
+  the whole database.
+- A project that does not exist is never silently ignored: `recall`,
+  `list_memories`, `list_entities` and `init_context` fall back to the global
+  scope and say so in `warnings`.
 - The full-text retriever uses the English dictionary (`FTS_LANGUAGE` in
   `config.py`). Index and query side always use the same dictionary; a
   changed dictionary is migrated at startup.
@@ -207,7 +218,11 @@ Valid `mem_type` values: `fact`, `decision`, `learning`, `preference`,
   reads. `only_superseded=true` in `recall` returns the invalidated facts only.
 - `list_entities` hides synthetic relation-context entities (`A_KNOWS_B`) that
   exist only to make an edge context searchable; an entity that also has a
-  real memory stays listed.
+  real memory stays listed. `entity_type` selects one kind of entity (a graph
+  node or a memory-only one), and `count` always equals `total`.
+- The relation-context sentence of an edge is stored under the synthetic
+  entity `A_REL_B`. `get_entity` returns it for both endpoints of the edge,
+  and its metadata `weight` follows the edge when the edge is re-weighted.
 - Results are projected: by default a row shows the public fields plus the
   score annotations, never `content_hash`, `deleted_at` or the embedding.
   `fields=["id", "content"]` returns exactly the named columns; `deleted_at`
@@ -390,14 +405,14 @@ it explicitly.
 | `relate` | `from_entity`, `to_entity` (not `from`, `to`), `weight` (0..1) | Source and target entity names; `weight` is the edge strength |
 | `relate_batch` | `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` | One transaction, MERGE-based (idempotent) |
 | `unrelate` | `from_entity`, `to_entity`, `relation_type`, `project` | Deletes one directed edge |
-| `recall` | `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `offset` pages (`has_more`/`next_offset`) |
+| `recall` | `project` (`"*"` = every scope), `min_similarity` (0..1, default 0.35), `min_decay_score` (0..1), `hybrid`, `include_decay`, `include_superseded`, `only_superseded`, `graph_boost`, `graph_entity`, `fields`, `updated_after`, `metadata_filter`, `offset` | Drops weak **vector** hits / stale hits; full-text hits are never dropped by `min_similarity`; `graph_boost` expands from `graph_entity` (fallback `entity`); `offset` pages (`has_more`/`next_offset`); an unknown project falls back to the global scope and says so in `warnings` |
 | `list_memories` | `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `contains`, `memory_id`, `include_deleted` | Browse without a query; `contains` is a case-insensitive literal substring; `memory_id` is a direct lookup; `include_deleted` lists forgotten rows with `deleted_at`; `offset` pages, the response reports `total`/`has_more`/`next_offset` |
-| `list_entities` | `entity_type`, `project`, `include_global`, `limit`, `offset` | Without `project`, lists all scopes; memory-only rows carry `type="memory-only"`; synthetic `A_KNOWS_B` entities are hidden; sorted by name so `offset` is stable |
-| `init_context` | `project`, `include_global`, `detail`, `limit` | `project="*"` includes all projects (and `"global"` in `projects`); every memory reports its `project`; the list holds the most recently changed memories |
-| `list_projects` | `include_empty` | Lists every scope with memories/entities/relations counts |
-| `drop_project` | `project`, `dry_run` | Removes the scope completely (table, registry, graph nodes, mirror rows); `global` is refused |
+| `list_entities` | `entity_type`, `project`, `include_global`, `limit`, `offset` | Without `project`, lists all scopes; memory-only rows carry `type="memory-only"`; synthetic `A_KNOWS_B` entities are hidden; `entity_type` selects one kind of entity; `count` equals `total`; sorted by name so `offset` is stable |
+| `init_context` | `project` (`"*"` = every scope), `include_global`, `detail`, `limit` | every memory reports its `project`; the list holds the most recently changed memories; `projects` names every covered scope (including `"global"`); `graph_entities_count` counts the covered scopes only |
+| `list_projects` | `include_empty` | Lists every scope with memories/entities/relations counts; `total_memories` splits into `active`/`superseded`/`forgotten` |
+| `drop_project` | `project`, `dry_run` | Removes the scope completely (table, registry, graph nodes, mirror rows); `global` is refused (use `forget(entity="*", project="global")`) |
 | `remember` | `scope: "project" \| "global"`, `dedupe: "exact" \| "semantic" \| "off"`, `fuzzy_threshold` (0..1), `supersede`, `supersede_content`, `supersede_last` | `global` stores in `memories` even when `project` is set |
-| `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts are reported individually |
+| `remember_batch` | `facts: [{content, project?, scope?, supersede?, fuzzy_threshold?, dedupe?, ...}]` | Savepoints; invalid facts (missing `content`, wrong shape) are reported individually, the rest is still stored |
 | `update_memory` | `memory_id`, `content`, `importance` (0..1), `metadata`, `entity`, `mem_type`, `project` | Content changes are re-embedded; an id that exists in several scopes is refused (`scopes`) |
 | `find_connections` | `entity` (`entity_name` kept as alias) | Entity to traverse from; a missing entity names the scope it searched |
 | `contradictions_report` | `entity`, `resolve` (`"none"`/`"newest"`) | Required; checks one entity at a time; `newest` supersedes the older fact of each confirmed pair |

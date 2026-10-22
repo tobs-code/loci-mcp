@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from mcp_server.config import (
     DEDUPE_MODES,
@@ -59,6 +59,21 @@ class BatchFact(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _allow_missing_content(cls, data: Any) -> Any:
+        """A fact without `content` must not abort the whole batch.
+
+        The schema still marks `content` as required, so a client that
+        follows it never hits this path. But an agent that builds the
+        facts programmatically must not lose the whole batch because one
+        entry is malformed: the runtime validation reports that fact
+        individually ("content is required") and stores the rest.
+        """
+        if isinstance(data, dict) and "content" not in data:
+            return {**data, "content": None}
+        return data
+
     content: Any = Field(json_schema_extra={"type": "string"},
                           description="The fact to store (required, non-empty).")
     mem_type: Any = Field(default="fact", json_schema_extra={
@@ -92,6 +107,21 @@ class BatchFact(BaseModel):
     dedupe: Any = Field(default=None, json_schema_extra={
         "type": ["string", "null"], "enum": ["exact", "semantic", "off", None],
     }, description="Duplicate detection: 'exact' (content hash), 'semantic' (vector similarity) or 'off'.")
+
+
+def _sanitize_batch_fact(value: Any) -> Any:
+    """Accept a malformed entry without losing the whole batch.
+
+    A fact that is not an object at all must not abort the batch with a
+    schema error: it is reported individually ("fact must be an object")
+    and the other facts are still stored.
+    """
+    if isinstance(value, (dict, BatchFact)):
+        return value
+    return {"content": None, "_not_an_object": True}
+
+
+BatchFactInput = Annotated[BatchFact, BeforeValidator(_sanitize_batch_fact)]
 
 
 def remember(
@@ -390,7 +420,7 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
 
 def remember_batch(
     facts: Annotated[
-        list[BatchFact],
+        list[BatchFactInput],
         Field(description="Facts to store. Each dict needs 'content'; invalid "
                           "entries are reported individually and the rest is "
                           "still stored.")],
@@ -460,6 +490,9 @@ def remember_batch(
     prepared: list[tuple[dict | None, str | None]] = []
     for fact in facts:
         if not isinstance(fact, dict):
+            prepared.append((None, "fact must be an object"))
+            continue
+        if fact.get("_not_an_object"):
             prepared.append((None, "fact must be an object"))
             continue
         content = fact.get("content")
