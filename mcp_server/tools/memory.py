@@ -253,6 +253,31 @@ def _hidden_state_reason(cur, memory_id: str,
     return None
 
 
+def _coerce_metadata(value: Any) -> tuple[dict | None, str | None]:
+    """Accept a metadata argument as an object or as a JSON-encoded string.
+
+    LLM callers sometimes send `metadata` as a string instead of a dict.
+    `remember_batch` already parsed that (and `metadata_filter` accepts both
+    shapes too), so the write tools do the same: an object passes through, a
+    JSON string of an object is parsed, anything else fails with a message
+    that names the expected shape.
+    """
+    if isinstance(value, dict):
+        return value, None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None, ("metadata is neither an object nor valid JSON - "
+                          "pass an object like {\"env\": \"test\"}")
+        if isinstance(parsed, dict):
+            return parsed, None
+        return None, (f"metadata must be a JSON object, e.g. "
+                      f"{{\"env\": \"test\"}} (got {type(parsed).__name__})")
+    return None, ("metadata must be an object, e.g. {\"env\": \"test\"} - "
+                  "a plain string is not accepted")
+
+
 def _cross_scope_warning(ids: list[str]) -> str:
     """Warning for a project write that invalidated shared (global) facts:
     they are hidden in EVERY scope now, not only in the project."""
@@ -286,7 +311,10 @@ class BatchUpdate(BaseModel):
     importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                             description="New importance in 0.0-1.0.")
     metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]},
-                          description="Replacement metadata object.")
+                          description="Replacement metadata object, e.g. "
+                                      "{\"env\": \"test\"}. A JSON-encoded "
+                                      "string of an object is accepted and "
+                                      "parsed.")
     entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                         description="New entity the memory belongs to.")
     mem_type: Any = Field(default=None, json_schema_extra={"type": "string"},
@@ -335,8 +363,12 @@ def remember(
         Field(description="Importance in 0.0-1.0 (default 1.0). Scales the decay "
                           "weight, so low-importance memories fade faster.")] = 1.0,
     metadata: Annotated[
-        dict[str, Any] | None,
-        Field(description="Free-form JSON object stored with the memory.")] = None,
+        Any,
+        Field(json_schema_extra={"type": ["object", "null"]},
+              description="Free-form JSON object stored with the memory, "
+                          "e.g. {\"env\": \"test\"}. Must be an object; a "
+                          "JSON-encoded string of an object is accepted and "
+                          "parsed.")] = None,
     scope: Annotated[
         Literal["global", "project"] | None,
         Field(description="Where to store the memory: 'project' (requires a "
@@ -448,6 +480,8 @@ def remember(
     are warnings, never a lost fact.
 
     Returns the standard envelope: {"ok", "status", "id", "error", "warnings"}.
+    `metadata` must be a JSON object, e.g. {"env": "test"} - a JSON-encoded
+    string of an object is also accepted; any other type fails.
     """
     logger.info("remember entity=%s mem_type=%s importance=%s check_contradictions=%s fuzzy=%s scope=%s dedupe=%s",
                 entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope, dedupe)
@@ -493,8 +527,10 @@ def remember(
             return fail(STATUS_ERROR,
                         "expires_at must be an ISO 8601 timestamp "
                         "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
-    if metadata is not None and not isinstance(metadata, dict):
-        return fail(STATUS_ERROR, "metadata must be an object")
+    if metadata is not None:
+        metadata, meta_error = _coerce_metadata(metadata)
+        if meta_error:
+            return fail(STATUS_ERROR, meta_error)
     per_link_errors = _validate_links(links, entity)
     if per_link_errors:
         return fail(STATUS_ERROR, "; ".join(per_link_errors))
@@ -1069,7 +1105,8 @@ def remember_batch(
                           "entity's memories first).")] = False,
     scope: Annotated[
         Literal["global", "project"] | None,
-        Field(description="Default scope for all facts (per-fact scope wins).")]= None,
+        Field(description="Default scope for all facts (per-fact scope wins). "
+                          "scope='project' requires a top-level project.")] = None,
     dedupe: Annotated[
         Literal["exact", "semantic", "off"],
         Field(description="Duplicate detection: 'exact' (default), 'semantic' or "
@@ -1083,7 +1120,9 @@ def remember_batch(
     """Store multiple facts at once. Each dict needs 'content'.
 
     Optional keys: mem_type (one of the memory types), entity, importance,
-    metadata, scope ("project" or "global"), project, supersede (memory id
+    metadata (a JSON object - a JSON-encoded string of an object is accepted),
+    scope ("project" or "global"; 'project' requires a project), project,
+    supersede (memory id
     or content), supersede_content, supersede_last, on_near_duplicate
     ("warn"/"supersede"/"reject"),
     auto_supersede_near_duplicate, expires_at (ISO 8601 TTL timestamp),
@@ -1194,10 +1233,16 @@ def remember_batch(
             try:
                 meta = json.loads(meta)
             except json.JSONDecodeError:
-                prepared.append((None, "metadata must be valid JSON"))
+                prepared.append((None,
+                                 ("metadata is neither an object nor valid "
+                                  "JSON - pass an object like "
+                                  "{\"env\": \"test\"}")))
                 continue
         if not isinstance(meta, dict):
-            prepared.append((None, "metadata must be an object"))
+            prepared.append((None,
+                             ("metadata must be a JSON object, e.g. "
+                              "{\"env\": \"test\"} "
+                              f"(got {type(meta).__name__})")))
             continue
         fexpires = fact.get("expires_at")
         if fexpires is not None:
@@ -1557,8 +1602,11 @@ def update_memory(
         float | None,
         Field(description="New importance in 0.0-1.0.")] = None,
     metadata: Annotated[
-        dict | None,
-        Field(description="Replacement metadata object.")] = None,
+        Any,
+        Field(json_schema_extra={"type": ["object", "null"]},
+              description="Replacement metadata object, e.g. "
+                          "{\"env\": \"test\"}. A JSON-encoded string of an "
+                          "object is accepted and parsed.")] = None,
     project: Annotated[
         str | None,
         Field(description="Project scope. Without it the id is looked up in "
@@ -1671,8 +1719,9 @@ def update_memory(
         sets.append("importance = %s")
         params.append(importance)
     if metadata is not None:
-        if not isinstance(metadata, dict):
-            return fail(STATUS_ERROR, "metadata must be an object")
+        metadata, meta_error = _coerce_metadata(metadata)
+        if meta_error:
+            return fail(STATUS_ERROR, meta_error)
         sets.append("metadata = %s::jsonb")
         params.append(json.dumps(metadata))
     if entity is not None:
@@ -1892,8 +1941,9 @@ def update_batch(
                     fields["importance"] = importance
         metadata = entry.get("metadata")
         if error is None and metadata is not None:
-            if not isinstance(metadata, dict):
-                error = "metadata must be an object"
+            metadata, meta_error = _coerce_metadata(metadata)
+            if meta_error:
+                error = meta_error
             else:
                 fields["metadata"] = metadata
         entity = entry.get("entity")
