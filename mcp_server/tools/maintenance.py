@@ -139,9 +139,9 @@ def _shares_subject(a: str, b: str) -> bool:
 # transport timeout and the caller sees neither the pairs judged so far nor a
 # machine-readable failure list. The budget keeps the call inside the
 # transport window and turns the cut-off into `nli_failures` + a warning.
-DEFAULT_SCAN_BUDGET_SECONDS = 25.0
-DEFAULT_NEIGHBORS_PER_FACT = 8
-DEFAULT_NLI_WORKERS = 4
+DEFAULT_SCAN_BUDGET_SECONDS = 40.0
+DEFAULT_NEIGHBORS_PER_FACT = 6
+DEFAULT_NLI_WORKERS = 6
 
 
 def _env_float(name: str, default: float, low: float, high: float) -> float:
@@ -199,7 +199,7 @@ def contradictions_report(entity: Annotated[
     budget_seconds: Annotated[
         float | None,
         Field(description="Wall-clock budget for the NLI leg (default: "
-                          "CONTRADICTION_SCAN_BUDGET_SECONDS or 25s). When "
+                          "CONTRADICTION_SCAN_BUDGET_SECONDS or 40s). When "
                           "it runs out, the scan stops early and the pairs "
                           "that were NOT judged are listed in `nli_failures` "
                           "with `skipped: NLI time budget exhausted` instead "
@@ -256,6 +256,7 @@ def contradictions_report(entity: Annotated[
     lower `limit` or raise the budget to check more.
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
+    started_at = time.monotonic()
     try:
         project = _norm_project(project)
     except ValueError as e:
@@ -341,16 +342,17 @@ def contradictions_report(entity: Annotated[
                     filter_sql = "AND content <> %s"
                     filter_params = [f["content"]]
                 cur.execute(
-                    f"SELECT id, content, entity FROM {table} "
+                    f"SELECT id, content, entity, "
+                    f"(embedding <=> %s::vector) AS distance FROM {table} "
                     f"WHERE id != %s {entity_sql} "
                     f"{filter_sql} "
                     f"AND embedding IS NOT NULL "
                     f"AND " + ACTIVE_ROW_SQL + " "
-                    f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
-                    [f["id"]] + entity_params + filter_params
-                    + [f["embedding"], neighbors_per_fact],
+                    f"ORDER BY distance ASC LIMIT %s",
+                    [f["embedding"], f["id"]] + entity_params + filter_params
+                    + [neighbors_per_fact],
                 )
-                for nid, ncontent, nentity in cur.fetchall():
+                for nid, ncontent, nentity, ndistance in cur.fetchall():
                     # Seeds are the entity's memories; an untagged neighbour
                     # is not in `fact_ids` but is a valid counterpart.
                     if nid not in fact_ids and nentity is not None:
@@ -358,8 +360,13 @@ def contradictions_report(entity: Annotated[
                     pair = tuple(sorted([f["id"], nid]))
                     if pair not in checked:
                         checked.add(pair)
-                        found.append((nid, ncontent, nentity))
+                        found.append((nid, ncontent, nentity,
+                                      float(ndistance)))
             if found:
+                # Judge the most similar pairs first: a budget cut must hit
+                # the least suspicious groups, not the near-identical ones
+                # that are most likely to be a real contradiction.
+                found.sort(key=lambda item: item[3])
                 candidates[f["id"]] = (f, found)
 
         conn.commit()
@@ -382,6 +389,7 @@ def contradictions_report(entity: Annotated[
     skipped_fact_ids: set[str] = set()
     try:
         candidate_list = list(candidates.values())
+        candidate_list.sort(key=lambda item: item[1][0][3])
         budget = _scan_budget_seconds(budget_seconds)
         deadline = time.monotonic() + budget
         # Cap one HTTP request below the whole budget: a single slow provider
@@ -570,7 +578,8 @@ def contradictions_report(entity: Annotated[
                     "neighbor_ids": [neighbours[i][0] for i in failed_indices
                                      if 0 <= i < len(neighbours)],
                     "reason": _partial_reason(partial) or "NLI unavailable"})
-            for (nid, ncontent, nentity), score in zip(neighbours, scores):
+            for (nid, ncontent, nentity, _distance), score in zip(
+                    neighbours, scores):
                 if len(contradictions) >= limit:
                     break
                 if score > 0.7:
@@ -743,6 +752,8 @@ def contradictions_report(entity: Annotated[
                               "resolved": resolved,
                               "checked_pairs": checked_pairs,
                               "budget_exhausted": bool(skipped_fact_ids),
+                              "elapsed_seconds": round(
+                                  time.monotonic() - started_at, 2),
                               "warnings": warnings}
     if resolve == "newest" and dry_run:
         result["would_resolve"] = would_resolve

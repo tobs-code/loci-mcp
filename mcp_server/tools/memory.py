@@ -90,12 +90,14 @@ class BatchFact(BaseModel):
 
     content: Any = Field(json_schema_extra={"type": "string"},
                           description="The fact to store (required, non-empty).")
-    mem_type: Any = Field(default="fact", json_schema_extra={
-        "type": "string",
+    mem_type: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"],
         "enum": ["fact", "decision", "learning", "preference", "pattern",
                  "incident", "runbook", "context", "observation", "convention",
-                 "command", "note"],
-    }, description=MEMORY_TYPE_HELP)
+                 "command", "note", None],
+    }, description=MEMORY_TYPE_HELP + " Omit it when the fact replaces another "
+                                       "memory: the replaced memory's type is "
+                                       "carried over.")
     entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                          description="Entity this memory belongs to; links it in the graph.")
     importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
@@ -658,8 +660,11 @@ def remember(
     content: Annotated[str, Field(description="The fact to remember (non-empty).")],
     mem_type: Annotated[
         Literal["fact", "decision", "learning", "preference", "pattern", "incident",
-                "runbook", "context", "observation", "convention", "command", "note"],
-        Field(description=MEMORY_TYPE_HELP)] = "fact",
+                "runbook", "context", "observation", "convention", "command",
+                "note"] | None,
+        Field(description=MEMORY_TYPE_HELP + " Omit it when the fact replaces "
+                          "another memory: the replaced memory's type is "
+                          "carried over, so a decision stays a decision.")] = None,
     entity: Annotated[
         str | None,
         Field(description="Entity this memory belongs to; connects it in the graph "
@@ -803,7 +808,7 @@ def remember(
         entity = _norm_entity(entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    if mem_type not in MEMORY_TYPES:
+    if mem_type is not None and mem_type not in MEMORY_TYPES:
         return fail(STATUS_ERROR,
                     f"Invalid mem_type. Choose from: {', '.join(sorted(MEMORY_TYPES))}")
     if scope is not None and scope not in VALID_SCOPES:
@@ -969,6 +974,8 @@ def remember(
         except ValueError as e:
             conn.rollback()
             return fail(STATUS_ERROR, str(e))
+
+        mem_type = _resolve_mem_type(cur, mem_type, superseded, store_project)
 
         cross_duplicates = [
             dup for dup in _cross_scope_duplicates(cur, content, store_project)
@@ -1295,6 +1302,38 @@ def _apply_remember_links(
     return results, warnings
 
 
+def _mem_type_of(cur, memory_id: str,
+                 store_project: str | None) -> str | None:
+    """The mem_type of one stored memory (project first, then global)."""
+    cur.execute(
+        f"SELECT mem_type FROM {_mem_table(store_project)} WHERE id = %s",
+        (memory_id,))
+    row = cur.fetchone()
+    if not row and store_project:
+        cur.execute("SELECT mem_type FROM memories WHERE id = %s", (memory_id,))
+        row = cur.fetchone()
+    value = row[0] if row else None
+    return value if value in MEMORY_TYPES else None
+
+
+def _resolve_mem_type(cur, requested: str | None, targets: list[str],
+                      store_project: str | None) -> str:
+    """Resolve the type of a new fact.
+
+    An explicitly passed type always wins. Without one, the type of the
+    replaced memory is carried over: turning a `decision` into a plain
+    `fact` just because the caller omitted `mem_type` lost the kind of the
+    memory on every update.
+    """
+    if requested is not None:
+        return requested
+    for target_id in targets:
+        inherited = _mem_type_of(cur, target_id, store_project)
+        if inherited:
+            return inherited
+    return "fact"
+
+
 def _supersede_targets(cur, store_project: str | None, entity: str | None,
                        supersede: str | None, supersede_content: str | None,
                        supersede_last: bool,
@@ -1324,15 +1363,15 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
             )
     if supersede_content:
         found = _find_by_content(cur, supersede_content, store_project, entity)
-        if not found and store_project and not entity:
+        if not found and store_project:
             # A global fact is replaced by its exact content from inside a
             # project too (like `supersede=<id>` already does with ids); the
             # replacement hides the global fact in every scope, which the
-            # response names. The entity filter stays out of the fallback:
-            # the caller said "replace this text", and the exact content is
-            # the identity of the target.
+            # response names. The exact content is the identity of the
+            # target, so an entity tag must not block the fallback: the same
+            # text without (or with another) tag is still the intended fact.
             c_hash = _content_hash((supersede_content or "").strip())
-            found = _by_content_hash(cur, "memories", c_hash, None)
+            found = _by_content_hash(cur, "memories", c_hash, entity)
         if found:
             targets.append(found)
         else:
@@ -1564,8 +1603,8 @@ def remember_batch(
         if not content:
             prepared.append((None, "content is required"))
             continue
-        mem_type = fact.get("mem_type", "fact")
-        if mem_type not in MEMORY_TYPES:
+        mem_type = fact.get("mem_type")
+        if mem_type is not None and mem_type not in MEMORY_TYPES:
             prepared.append((None, f"invalid mem_type {mem_type!r}"))
             continue
         try:
@@ -1823,8 +1862,10 @@ def remember_batch(
                     if dup["id"] not in superseded
                 ]
 
+                fact_mem_type = _resolve_mem_type(
+                    cur, spec["mem_type"], superseded, store_project)
                 mid = _store_memory(
-                    cur, spec["content"], embeddings[i], spec["mem_type"],
+                    cur, spec["content"], embeddings[i], fact_mem_type,
                     spec["entity"], spec["importance"], spec["metadata"],
                     store_project, scope=spec["scope"],
                     expires_at=spec.get("expires_at"),
@@ -2134,6 +2175,8 @@ def update_memory(
     `expires_at` sets a new TTL (`clear_expires_at=True` removes it).
     `touch=True` only refreshes the decay age (no content change);
     `restore=True` undoes a soft delete (the inverse of `forget(soft=True)`).
+    An expired row is inactive and answers `conflict` like a superseded one;
+    revive it deliberately with a future `expires_at` or `clear_expires_at`.
     A real `superseded_by` is never cleared by a restore.
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
@@ -2173,6 +2216,12 @@ def update_memory(
             return fail(STATUS_ERROR,
                         "expires_at must be an ISO 8601 timestamp "
                         "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
+    # An expired row is inactive. Editing its content or metadata would
+    # silently reactivate a fact whose TTL said "stop using this", so the
+    # caller has to revive it explicitly: a future `expires_at` or
+    # `clear_expires_at`. A plain `touch` on an expired row is refused too.
+    revive_expired = bool(clear_expires_at) or (
+        expires_value is not None and not _is_past(expires_value))
     if restore:
         if (content is not None or importance is not None
                 or metadata is not None or entity is not None
@@ -2260,12 +2309,13 @@ def update_memory(
         # id must answer NOT FOUND even when no field was passed, otherwise
         # the validation message suggests the id was seen and is valid.
         active_table = None
+        active_sql = ("id = %s AND superseded_by IS NULL "
+                      "AND deleted_at IS NULL")
+        if not revive_expired:
+            active_sql += " AND (expires_at IS NULL OR expires_at > NOW())"
         for table in tables:
-            cur.execute(
-                f"SELECT 1 FROM {table} WHERE id = %s "
-                "AND superseded_by IS NULL AND deleted_at IS NULL",
-                (memory_id,),
-            )
+            cur.execute(f"SELECT 1 FROM {table} WHERE {active_sql}",
+                        (memory_id,))
             if cur.fetchone():
                 active_table = table
                 break
@@ -2411,7 +2461,9 @@ def update_batch(
 
     Each entry works like one `update_memory` call: `content` changes
     re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` and the
-    TTL (`expires_at`/`clear_expires_at`) are applied as given. `touch=true`
+    TTL (`expires_at`/`clear_expires_at`) are applied as given. An expired
+    row answers `conflict` unless the entry revives it with a future
+    `expires_at` or `clear_expires_at`. `touch=true`
     refreshes the decay age without changing the content and can be combined
     with the other fields. `restore=true`
     undoes a soft delete and is mutually exclusive with the other fields.
@@ -2680,12 +2732,20 @@ def update_batch(
                         continue
                     tables = _all_mem_tables(cur)
 
+                entry_fields = spec["fields"]
+                revive_expired = (
+                    "expires_at" in entry_fields
+                    and (entry_fields["expires_at"] is None
+                         or not _is_past(entry_fields["expires_at"])))
                 active_table = None
+                active_sql = ("id = %s AND superseded_by IS NULL "
+                              "AND deleted_at IS NULL")
+                if not revive_expired:
+                    active_sql += (" AND (expires_at IS NULL "
+                                   "OR expires_at > NOW())")
                 for table in tables:
-                    cur.execute(
-                        f"SELECT 1 FROM {table} WHERE id = %s "
-                        "AND superseded_by IS NULL AND deleted_at IS NULL",
-                        (memory_id,))
+                    cur.execute(f"SELECT 1 FROM {table} WHERE {active_sql}",
+                                (memory_id,))
                     if cur.fetchone():
                         active_table = table
                         break

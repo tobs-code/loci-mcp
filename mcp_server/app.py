@@ -146,13 +146,14 @@ TOOLS BY TASK
 - Search/browse/bootstrap: `recall`, `recall_batch`, `list_memories` (pass `memory_id` for a
   direct single-memory lookup), `get_entity`, `list_entities`, `init_context`
   (`project="*"` lists every scope with sizes in `project_stats`).
-- Graph: `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`.
+- Graph: `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
+  `list_relations`.
 - Maintenance/backup: `server_health`, `contradictions_report`,
   `export_memories`, `import_memories`, `verify_integrity`, `prune_memories`,
   `drop_project`.
 
-`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14 tools);
-the default `full` exposes all 24 (batch, backup and repair included).
+`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (15 tools);
+the default `full` exposes all 25 (batch, backup and repair included).
 
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.

@@ -367,9 +367,12 @@ the graph nodes of the covered scopes, not of the whole database.
 | `unrelate` | Delete a single directed relation; `keep_context` keeps the edge sentence; nodes left without an edge or a memory are removed (`orphan_nodes_removed`) |
 | `find_connections` | Graph traversal (outgoing/incoming/both), results carry `direction`; `limit`/`offset` page and the answer reports `total`/`has_more`/`next_offset` |
 | `find_paths` | Shortest paths between two existing entities (`project`-scoped); edges are traversed in both directions, so a path can run against an edge. Missing entities return `not_found`, no path returns a warning; `from_entity == to_entity` answers a 0-hop path and `max_hops > 10` is clamped with a warning |
+| `list_relations` | Browse edges without a start entity: `entity` (either endpoint), `relation_type`, `project` (omitted or `"*"` = every scope, `"global"` = shared only); sorted by weight then endpoints, with `total`/`has_more`/`next_offset` |
 
 - `relate` takes `from_entity`, `to_entity` (not `from`/`to`), `relation_type`
-  and `weight` (0..1). The weight scales the retrieval boost of `graph_boost`.
+  and `weight` (0..1). Omitting `weight` keeps the weight of an existing edge
+  (1.0 for a new one), so adding a context sentence does not reset it. The
+  weight scales the retrieval boost of `graph_boost`.
   Repeating the same edge with the same `context` reuses the context memory
   (`context_reused: true`, same `context_memory` id) instead of creating a new
   version; a changed sentence still replaces the old context.
@@ -381,15 +384,18 @@ the graph nodes of the covered scopes, not of the whole database.
   no memory row are deleted from the graph, so an empty node does not survive
   in `list_entities`.
 - `find_connections` takes `entity` (`entity_name` is kept as alias),
-  `direction`, `limit` and `offset`; `total` and `has_more` describe the full
+  `direction`, `limit` and `offset`; each result carries the edge's `context`
+  sentence when one was stored, `total` and `has_more` describe the full
   match set, and a missing entity names the scope it searched.
+- `list_relations` pages through edges directly; `project` omitted (or `"*"`)
+  covers every scope, `"global"` only the shared graph.
 
 ## Maintenance tools
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); an entity scan covers the entity's memories **plus untagged (entity-less) memories** as their neighbours, so a tagged/untagged conflict stays visible and cross-entity pairs are reported but never auto-resolved; `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older (newest is the creation time; a `touch` does not decide it); cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 25s) bounds the NLI leg: when it is exhausted the scan stops early, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); `nli_failures_count` and `nli_failure_summary` give the compact scale without reading every entry; other partial NLI failures are named there too |
-| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default follows `include_superseded`; `false` leaves soft-forgotten rows out), `include_expired`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph and keeps the other endpoints of those edges; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows; `include_expired=false` leaves expired rows out |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); an entity scan covers the entity's memories **plus untagged (entity-less) memories** as their neighbours, so a tagged/untagged conflict stays visible and cross-entity pairs are reported but never auto-resolved; `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older (newest is the creation time; a `touch` does not decide it); cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 40s) bounds the NLI leg: when it is exhausted the scan stops early, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); `nli_failures_count` and `nli_failure_summary` give the compact scale without reading every entry; other partial NLI failures are named there too |
+| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default follows `include_superseded`; `false` leaves soft-forgotten rows out), `include_expired`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph, keeps the other endpoints of those edges and includes their relation-context sentences; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows; `include_expired=false` leaves expired rows out |
 | `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; broken links and chains are listed in `results` (chains carry `chain_to`); `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content and re-scans after the repair, so the counts and `results` describe the state AFTER the fix (`fixed` carries what was cleared) |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`); IDs, TTL and timestamps are preserved; an id that already exists is always skipped; `dry_run` validates without writing and adds `would_create`; dangling supersede links are cleared with a warning, as are self-referencing or internal (`__forgotten__`) `superseded_by` values (`repaired_self_references`); `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; counts name `active_memories`/`already_forgotten` so a preview can be compared with `forget(entity="*")`; the shared scope cannot be dropped |
@@ -401,10 +407,11 @@ See [Backup & Restore](backup.md) for the export/import contract and
 
 ## Toolset profiles
 
-`MCP_TOOLSET=core` registers 14 tools: `remember`, `remember_batch`,
+`MCP_TOOLSET=core` registers 15 tools: `remember`, `remember_batch`,
 `update_memory`, `forget`, `recall`, `list_memories`, `get_entity`,
 `list_entities`, `list_projects`, `init_context`, `relate`, `unrelate`,
-`find_connections` and `find_paths`. The default `full` registers all 24, adding `update_batch`,
+`find_connections`, `find_paths` and `list_relations`. The default `full`
+registers all 25, adding `update_batch`,
 `relate_batch`, `contradictions_report`, `export_memories`, `import_memories`,
 `verify_integrity`, `prune_memories`, `drop_project` and `server_health`. An
 unknown value warns

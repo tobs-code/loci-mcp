@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +16,7 @@ from mcp_server.config import (
     RERANK_TRIGGER_MARGIN,
     RERANK_TRIGGER_SCORE,
     RRF_K,
+    SENTINEL_FORGOTTEN,
 )
 from mcp_server.db import get_conn
 from mcp_server.inference_client import rerank
@@ -45,6 +47,103 @@ def _row_is_active(row: dict) -> bool:
 
 
 BEST_DROPPED_PREVIEW_CHARS = 160
+
+# An outdated row stays visible with the history flags but must lose against
+# the current fact that replaced it. 0.5 is strong enough to flip a near-tie
+# without hiding an old fact that is the only match.
+HISTORY_RELEVANCE_WEIGHT = 0.5
+
+# An exact substring hit is stronger evidence than a stemmed full-text hit:
+# a file name, an id or a token must outrank a memory that merely shares a
+# word with it. The weight is an RRF contribution, not a probability.
+EXACT_MATCH_WEIGHT = 1.5
+
+# A single token that looks like an identifier (separators, digits or inner
+# capitals) is what FTS tokenizers and embeddings handle badly. Quoted input
+# is always treated as an exact needle.
+_IDENTIFIER_RE = re.compile(r"^\S{2,120}$")
+_IDENTIFIER_SEPARATORS = set("_-./:\\@#")
+
+
+def _exact_needle(text: str | None) -> str | None:
+    """The literal substring a query asks for, or None.
+
+    Only identifier-like queries and quoted phrases use the exact leg. A
+    natural-language question would match arbitrary substrings and turn the
+    leg into noise; those keep the vector/FTS fusion.
+    """
+    if not text:
+        return None
+    value = text.strip()
+    if len(value) >= 4 and value[0] == value[-1] == '"':
+        value = value[1:-1].strip()
+        return value or None
+    if not _IDENTIFIER_RE.match(value):
+        return None
+    if (any(c.isdigit() for c in value)
+            or any(c in _IDENTIFIER_SEPARATORS for c in value)
+            or any(c.isupper() for c in value[1:])):
+        return value
+    return None
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE/ILIKE wildcards so the needle is matched literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _hidden_exact_matches(cur, tables: list[str], needle: str,
+                          include_deleted: bool, include_superseded: bool,
+                          include_expired: bool) -> dict[str, Any] | None:
+    """Count exact matches that the visibility flags keep out of the results.
+
+    A hidden row that contains the exact identifier is the difference between
+    "this memory does not exist" and "it is expired/superseded/forgotten".
+    The count is reported with the flags that would reveal it, so the caller
+    does not have to guess.
+    """
+    pattern = f"%{_escape_like(needle)}%"
+    count = 0
+    flags: set[str] = set()
+    scopes: dict[str, int] = {}
+    for table in tables:
+        try:
+            cur.execute(
+                f"SELECT deleted_at, superseded_by, expires_at FROM {table} "
+                f"WHERE content ILIKE %s ESCAPE '\\' LIMIT 100",
+                (pattern,))
+            rows = cur.fetchall()
+        except Exception:  # a repair call must not break the search
+            logger.debug("hidden exact lookup failed for %s", table,
+                         exc_info=True)
+            continue
+        hidden_here = 0
+        for deleted_at, superseded_by, expires_at in rows:
+            row_flags: list[str] = []
+            expired = (expires_at is not None
+                       and expires_at <= datetime.now(timezone.utc))
+            if expired and not include_expired:
+                row_flags.append("include_expired")
+            if deleted_at is not None and not include_deleted:
+                row_flags.append("include_deleted")
+            # A row that is both deleted and requested as history is visible
+            # even when `superseded_by` is set (the visibility flags are
+            # orthogonal, deleted wins over superseded in the SQL predicate).
+            if (deleted_at is None and superseded_by is not None
+                    and not include_superseded):
+                row_flags.append("include_superseded")
+            if not row_flags:
+                continue
+            hidden_here += 1
+            flags.update(row_flags)
+        if hidden_here:
+            count += hidden_here
+            scopes[table] = hidden_here
+    if not count:
+        return None
+    return {"count": count,
+            "flags": sorted(flags),
+            "scopes": scopes}
 
 
 def _note_dropped_candidate(
@@ -138,6 +237,43 @@ def _skip_active_cross_scope_duplicate(
         return True
     seen_active[c_hash] = table
     return False
+
+
+def _is_expired_value(value: Any) -> bool:
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value <= datetime.now(timezone.utc)
+
+
+def _is_current_row(row: dict) -> bool:
+    """True for an active row (not superseded, forgotten or expired)."""
+    if row.get("deleted_at") is not None:
+        return False
+    superseded_by = row.get("superseded_by")
+    if superseded_by is not None and superseded_by != SENTINEL_FORGOTTEN:
+        return False
+    return not _is_expired_value(row.get("expires_at"))
+
+
+def _apply_history_penalty(row: dict) -> None:
+    """Rank history below current facts when it is included on purpose.
+
+    `include_superseded`/`include_deleted`/`include_expired` widen the result
+    set; they do not make an outdated row as good as the fact that replaced
+    it. Without the penalty the old wording often wins on vector similarity
+    alone and the agent reads the stale answer first.
+    """
+    relevance = row.get("_relevance_score")
+    if relevance is None or _is_current_row(row):
+        return
+    penalised = float(relevance) * HISTORY_RELEVANCE_WEIGHT
+    row["_relevance_score"] = round(penalised, 4)
+    row["_history_penalty"] = round(1.0 - HISTORY_RELEVANCE_WEIGHT, 4)
+    if "_final_score" in row:
+        row["_final_score"] = round(
+            float(row["_final_score"]) * HISTORY_RELEVANCE_WEIGHT, 4)
 
 
 def _dedup_rows_across_scopes(
@@ -270,16 +406,28 @@ def _parse_timestamp(value: str):
     return stamp
 
 
-def _softmax(values: list[float]) -> list[float]:
-    """Turn raw cross-encoder logits into a relative 0..1 score."""
+def _sigmoid_scores(values: list[float]) -> list[float]:
+    """Calibrate raw cross-encoder logits one by one.
+
+    A softmax over the reranked block depends on the block size: a strong
+    hit scored alone becomes ~1.0, the same hit in a block with one rival
+    suddenly ~0.5. The published `_relevance_score` then means different
+    things on page 1 and page 2. The sigmoid of a single logit is independent
+    of the candidate block, so the score stays comparable across queries and
+    pages (it is a per-pair confidence, not a share of the block).
+    """
     if not values:
         return []
-    top = max(values)
-    exps = [math.exp(value - top) for value in values]
-    total = sum(exps)
-    if not total:
-        return [0.0 for _ in values]
-    return [value / total for value in exps]
+    scores: list[float] = []
+    for value in values:
+        try:
+            logit = float(value)
+        except (TypeError, ValueError):
+            logit = 0.0
+        # Keep exp() finite for a broken provider that returns huge logits.
+        logit = max(-60.0, min(60.0, logit))
+        scores.append(1.0 / (1.0 + math.exp(-logit)))
+    return scores
 
 
 def _rerank_rows(
@@ -298,11 +446,11 @@ def _rerank_rows(
     (`>= RERANK_TRIGGER_MARGIN`) is trusted as is. That keeps the ~2s CPU
     cost out of the common path without hiding the hard case.
 
-    The raw logits are not probabilities and are not comparable across
-    requests, so `_rerank_score` is a softmax over the reranked block only.
-    `_similarity`, `_rrf_score` and `_rrf_norm` stay the first-stage values;
-    `_relevance_score` is replaced for the reranked rows and the first-stage
-    order is kept for the tail.
+    The raw logits are not probabilities, so `_rerank_score` is the sigmoid
+    of each logit: a per-pair confidence that does not change when another
+    candidate joins or leaves the block. `_similarity`, `_rrf_score` and
+    `_rrf_norm` stay the first-stage values; `_relevance_score` is replaced
+    for the reranked rows and the first-stage order is kept for the tail.
     """
     if not RERANK_ENABLED or not query_text or not rows:
         return rows
@@ -342,7 +490,7 @@ def _rerank_rows(
             stats["rerank_error"] = message
         return rows
 
-    probabilities = _softmax(logits)
+    probabilities = _sigmoid_scores(logits)
     for row, probability in zip(candidates, probabilities):
         row["_rerank_score"] = round(probability, 4)
         relevance = probability
@@ -412,6 +560,7 @@ def _search_memories_rrf(
 
     max_distance = None if min_similarity is None else 1.0 - min_similarity
     fts_query = _fts_query(query_text)
+    exact_needle = _exact_needle(query_text)
     # Query lexemes after stemming/stopword removal. They are used to measure
     # how much of the query a full-text hit actually covers: an OR query makes
     # a single common word look like a perfect match otherwise.
@@ -428,6 +577,8 @@ def _search_memories_rrf(
     vec_candidates: list[tuple[float, str, str]] = []
     # (rank, matched_lexemes, id, table)
     text_candidates: list[tuple[float, int, str, str]] = []
+    # (is_full_content_match, id, table)
+    exact_candidates: list[tuple[bool, str, str]] = []
     dropped_by_similarity = 0
     dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
@@ -492,6 +643,24 @@ def _search_memories_rrf(
                 for row_id, rank, matched in cur.fetchall()
             )
 
+        # 3. Exact substring search (identifier-like queries only). FTS
+        # tokenizes `ZEBRAFISH_TOKEN` or `app/config.py` in ways that can miss
+        # the literal token; ILIKE does not. The result is a candidate, not a
+        # proof: the ranking still combines it with the other legs.
+        if exact_needle:
+            pattern = f"%{_escape_like(exact_needle)}%"
+            sql = (
+                f"SELECT id, (lower(content) = lower(%s)) AS exact_content "
+                f"FROM {table} "
+                f"WHERE content ILIKE %s ESCAPE '\\' AND {where} "
+                f"ORDER BY exact_content DESC, length(content) ASC LIMIT 50"
+            )
+            cur.execute(sql, [exact_needle, pattern] + params)
+            exact_candidates.extend(
+                (bool(full), row_id, table)
+                for row_id, full in cur.fetchall()
+            )
+
     vec_candidates.sort(key=lambda c: c[0])
     text_candidates.sort(key=lambda c: -c[0])
 
@@ -502,6 +671,8 @@ def _search_memories_rrf(
     Key = tuple[str, str]
     vector_results: dict[Key, float] = {}
     text_results: dict[Key, float] = {}
+    exact_results: dict[Key, float] = {}
+    exact_modes: dict[Key, str] = {}
     similarities: dict[Key, float] = {}
     text_scores: dict[Key, float] = {}
     coverages: dict[Key, float] = {}
@@ -512,6 +683,10 @@ def _search_memories_rrf(
         similarities[key] = 1.0 - distance
     for rank, (_, _, row_id, table) in enumerate(text_candidates[:50], 1):
         text_results[(table, row_id)] = FTS_WEIGHT / (k + rank)
+    for rank, (full, row_id, table) in enumerate(exact_candidates[:50], 1):
+        key = (table, row_id)
+        exact_results[key] = EXACT_MATCH_WEIGHT / (k + rank)
+        exact_modes[key] = "content" if full else "substring"
 
     max_text_rank = max((r for r, _, _, _ in text_candidates[:50]), default=0.0)
     lexeme_count = max(1, len(fts_lexemes))
@@ -527,8 +702,10 @@ def _search_memories_rrf(
         coverages[key] = coverage
 
     fused_scores = {
-        key: vector_results.get(key, 0.0) + text_results.get(key, 0.0)
-        for key in set(vector_results) | set(text_results)
+        key: (vector_results.get(key, 0.0) + text_results.get(key, 0.0)
+              + exact_results.get(key, 0.0))
+        for key in (set(vector_results) | set(text_results)
+                    | set(exact_results))
     }
     # A hit that only the full-text leg found has no similarity to vouch for
     # it. If it covers only a sliver of the query it is noise, and if it is
@@ -537,11 +714,15 @@ def _search_memories_rrf(
     dropped_by_coverage = 0
     if fts_lexemes:
         weak = [key for key in fused_scores
-                if key not in similarities
+                if key not in similarities and key not in exact_results
                 and coverages.get(key, 1.0) < FTS_MIN_COVERAGE]
         for key in weak:
             del fused_scores[key]
         dropped_by_coverage = len(weak)
+    hidden_exact = (
+        _hidden_exact_matches(cur, tables, exact_needle, include_deleted,
+                              include_superseded, include_expired)
+        if exact_needle else None)
     if not fused_scores:
         if stats is not None:
             if best_dropped:
@@ -555,7 +736,10 @@ def _search_memories_rrf(
                           "dropped_by_cross_scope_duplicate":
                               dropped_by_cross_scope_duplicate,
                           "min_coverage": FTS_MIN_COVERAGE,
-                          "fulltext_only": 0})
+                          "fulltext_only": 0,
+                          "exact_matches": 0})
+            if hidden_exact:
+                stats["hidden_exact_match"] = hidden_exact
             if best_dropped:
                 stats["best_dropped_by_similarity"] = best_dropped
         return []
@@ -601,6 +785,14 @@ def _search_memories_rrf(
             # match instead of being flattened into the same RRF band.
             relevance = _relevance_score(similarities.get(key, 0.0),
                                          text_scores.get(key, 0.0))
+            if key in exact_results:
+                # The literal needle is the strongest evidence a lexical hit
+                # can carry: an exact content match must not lose against a
+                # vaguely similar vector hit, and a substring (an id inside a
+                # longer note) must stay competitive.
+                relevance = max(
+                    relevance, 0.95 if exact_modes[key] == "content" else 0.85)
+                d["_exact_match"] = exact_modes[key]
             # A project-scoped row wins over an identical global one: the
             # global scope is the fallback, not an equal peer. The boost is
             # compressed towards 1 instead of added and clamped, so strong
@@ -612,6 +804,7 @@ def _search_memories_rrf(
                 relevance = relevance + effective_boost
                 d["_scope_boost"] = effective_boost
             d["_relevance_score"] = round(relevance, 4)
+            _apply_history_penalty(d)
             if not include_embedding:
                 d.pop("embedding", None)
             if include_decay:
@@ -641,7 +834,11 @@ def _search_memories_rrf(
             "min_coverage": FTS_MIN_COVERAGE,
             "fulltext_only": sum(1 for key in fused_scores
                                  if key not in similarities),
+            "exact_matches": sum(1 for key in fused_scores
+                                 if key in exact_results),
         })
+        if hidden_exact:
+            stats["hidden_exact_match"] = hidden_exact
         if best_dropped:
             stats["best_dropped_by_similarity"] = best_dropped
 
@@ -837,6 +1034,7 @@ def _search_memories(
             rank = row.pop("_fts_rank", 0.0)
             row["_text_score"] = round(rank / max_rank, 4) if max_rank else 0.0
             row["_relevance_score"] = row["_text_score"]
+            _apply_history_penalty(row)
         rows.sort(key=lambda x: -x.get("_relevance_score", 0.0))
     else:
         rows.sort(key=lambda x: x.get("updated_at") or _now(), reverse=True)
@@ -844,6 +1042,9 @@ def _search_memories(
     if has_vec:
         for row in rows:
             row["_relevance_score"] = row.get("_similarity", 0.0)
+            _apply_history_penalty(row)
+        if not recent_first:
+            rows.sort(key=lambda x: -x.get("_relevance_score", 0.0))
     if stats is not None:
         if best_dropped:
             if "content_preview" not in best_dropped:

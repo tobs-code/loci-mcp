@@ -37,7 +37,7 @@ not accept (a forgotten or renamed parameter) is refused with
 `unknown argument(s) ...; accepted arguments are: ...` instead of being
 silently ignored.
 
-## MCP Tools (24 total)
+## MCP Tools (25 total)
 
 ### Write
 
@@ -69,29 +69,31 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `relate` | Create a directed edge: `from_entity`, `to_entity`, `relation_type` (letters/digits/`_`), `weight` (0..1), `context`, `project`. Entities are auto-created; `context` is stored as a relation memory, and repeating the same edge with the same context reuses that memory (`context_reused: true`). |
+| `relate` | Create a directed edge: `from_entity`, `to_entity`, `relation_type` (letters/digits/`_`), `weight` (0..1), `context`, `project`. Omitting `weight` keeps the weight of an existing edge (1.0 for a new one), so adding a context sentence never resets it. Entities are auto-created; `context` is stored as a relation memory, and repeating the same edge with the same context reuses that memory (`context_reused: true`). |
 | `relate_batch` | Many `edges: [{from_entity, to_entity, relation_type, weight?, context?, project?}]` in one transaction. MERGE-based and idempotent. All-or-nothing: one invalid edge aborts the call and the error names its index (`edge 1: ...`); an empty list is an error; self-loops are stored with a warning. |
 | `unrelate` | Delete one directed edge (`from_entity`, `to_entity`, `relation_type`, `project`). The edge's context memory is soft-forgotten unless `keep_context=true`. A graph node that the deletion leaves without any edge or memory is removed too (`orphan_nodes_removed`), so `list_entities` does not keep showing an empty node. |
-| `find_connections` | Traverse from `entity` (alias `entity_name`), `direction` (`outgoing`/`incoming`/`both`), `relation_type`, `project`, `limit`, `offset`. Each result carries `direction`; the answer reports `total`/`has_more`/`next_offset`. |
+| `find_connections` | Traverse from `entity` (alias `entity_name`), `direction` (`outgoing`/`incoming`/`both`), `relation_type`, `project`, `limit`, `offset`. Each result carries `direction` and the edge's `context` sentence (when one was stored); the answer reports `total`/`has_more`/`next_offset`. |
+| `list_relations` | Browse edges without a start entity: `entity` (either endpoint), `relation_type`, `project` (omitted or `"*"` = every scope, `"global"` = shared only), `limit`, `offset`. Sorted by weight, then endpoints. Reports `count`/`total`/`has_more`/`next_offset`. |
 | `find_paths` | Shortest paths between `from_entity` and `to_entity`, `project`, `max_hops` (max 10). Edges are traversed in both directions. Equal endpoints answer a 0-hop path; `max_hops` above 10 is clamped with a warning. |
 
 ### Maintenance
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (an entity scan covers that entity's memories **plus untagged neighbours** of the scope, so a tagged/untagged conflict stays visible; cross-entity pairs are reported, never auto-resolved; without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`, `budget_seconds` (NLI wall-clock budget, default 25s). Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only and uses the creation time (a `touch` does not decide the winner); cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. When the budget runs out the scan stops early, sets `budget_exhausted` and lists every unjudged pair in `nli_failures` (`reason: skipped: NLI time budget exhausted`); `nli_failures_count`/`nli_failure_summary` summarize them without reading every entry, and other NLI failures are named there too. |
-| `export_memories` | Backup in `data`. `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default keeps the historical behaviour: `include_superseded=true` carries forgotten rows; `false` leaves soft-forgotten rows out), `include_expired` (default `true`; `false` leaves expired rows out), `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`. JSON includes the graph; JSONL is flat and warns that `include_graph` was ignored. `entity` narrows the graph too and keeps the other endpoints of the exported edges so the graph stays complete; the other memory filters do not narrow the graph and warn. Warns about excluded history and included expired rows. |
-| `import_memories` | Restore `data` (object or JSON string). `project`, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`. Keeps ids and timestamps; re-import is idempotent. Skips are split into `skipped_reasons`. Broken metadata is reported per record and skipped. `dry_run` adds `would_create`; dangling supersede links left by a partial backup are cleared with a warning, and self-referencing or internal (`__forgotten__`) `superseded_by` values of imported records are cleared the same way (`repaired_self_references`). |
+| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (an entity scan covers that entity's memories **plus untagged neighbours** of the scope, so a tagged/untagged conflict stays visible; cross-entity pairs are reported, never auto-resolved; without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`, `budget_seconds` (NLI wall-clock budget, default 40s). Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only and uses the creation time (a `touch` does not decide the winner); cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. When the budget runs out the scan stops early, sets `budget_exhausted` and lists every unjudged pair in `nli_failures` (`reason: skipped: NLI time budget exhausted`); `nli_failures_count`/`nli_failure_summary` summarize them without reading every entry, and other NLI failures are named there too. |
+| `export_memories` | Backup in `data`. `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default keeps the historical behaviour: `include_superseded=true` carries forgotten rows; `false` leaves soft-forgotten rows out), `include_expired` (default `true`; `false` leaves expired rows out), `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`. JSON includes the graph; JSONL is flat and warns that `include_graph` was ignored. `entity` narrows the graph too, keeps the other endpoints of the exported edges so the graph stays complete, and includes the relation-context sentences of its edges; the other memory filters do not narrow the graph and warn. Warns about excluded history and included expired rows. |
+| `import_memories` | Restore `data` (object, JSON string, or a list/JSONL string of records). `project`, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`. Keeps ids and timestamps; re-import is idempotent. Skips are split into `skipped_reasons`. Broken metadata is reported per record and skipped. `dry_run` adds `would_create`; dangling supersede links left by a partial backup are cleared with a warning, and self-referencing or internal (`__forgotten__`) `superseded_by` values of imported records are cleared the same way (`repaired_self_references`). |
 | `verify_integrity` | Find rows hidden by a broken `superseded_by` (target missing or self), report supersede chains and expired active rows. Broken links and chain rows are listed in `results` (`problem` names the kind, chains also carry `chain_to`); `chains` counts them even when `limit` truncates the list; a chain alone adds a warning instead of "no integrity problems found". `project`, `fix` (clear broken links), `limit`. `fix=true` never deletes content or restores a valid supersede, and the counts and `results` then describe the state AFTER the repair (`fixed` carries what was cleared). |
 | `drop_project` | Remove a scope completely: memory table, registry entry, graph nodes, mirror rows. `project`, `dry_run`. `global` is refused. A graph-only scope is removed as well. Dangling supersede links of other scopes are cleared. Counts include `active_memories`/`already_forgotten` so a dry run can be compared with `forget(entity="*")`. |
 | `prune_memories` | Permanently delete inactive rows only (active memories are never touched). `project` (default: every scope), `older_than_days` (default 30), `include_expired`/`include_forgotten` (default true), `include_superseded` (default false: history is kept), `dry_run` (default true). Removes rows whose `expires_at`/`deleted_at` is older than the cutoff, and clears supersede links that would dangle afterwards. `counts` carries `memories` and per-scope `by_scope`; the message says "Would remove" or "Removed". |
 | `server_health` | Check Postgres, inference and NLI configuration. Reports `version`, `code_fingerprint` (detects a stale container), `started_at`, `toolset`. |
 
-`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14 tools:
+`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (15 tools:
 `remember`, `remember_batch`, `update_memory`, `forget`, `recall`,
 `list_memories`, `get_entity`, `list_entities`, `list_projects`,
-`init_context`, `relate`, `unrelate`, `find_connections`, `find_paths`). The
-default `full` exposes all 24, including the batch, backup and repair tools.
+  `init_context`, `relate`, `unrelate`, `find_connections`, `find_paths`,
+  `list_relations`). The
+default `full` exposes all 25, including the batch, backup and repair tools.
 
 Resource: `memory://stats` returns active/total memory counts, entity/relation
 counts and health.
@@ -171,6 +173,9 @@ counts and health.
   write cannot silently replace another subject's fact.
 - Replaced metadata is carried over by default (`metadata_mode="merge"`);
   explicitly passed keys win. `metadata_mode="replace"` drops the old keys.
+- `mem_type` is optional on `remember`/`remember_batch`. An explicit type wins;
+  otherwise a supersede carries the replaced memory's type and a fresh fact
+  defaults to `"fact"`.
 - A cross-scope supersede is named: `cross_scope_superseded` plus a warning.
   The invalidated global fact disappears from every scope.
 - Dedupe only covers the write target. If the exact content is already active
@@ -201,14 +206,21 @@ counts and health.
 
 - `recall` searches the project table (when set) and the global table. An
   active copy of the same content in another scope is deduped; history stays
-  visible with the matching flags.
+  visible with the matching flags. Identical active copies inside one scope
+  (possible with `dedupe="off"`) stay in the result; `list_memories` lists
+  them too.
+- An exact literal hit is a first-class retriever: an identifier-like token
+  (`ZEBRAFISH_TOKEN`, `app.py`, `v1.2.3`) or a quoted phrase is searched as a
+  case-insensitive substring and fused with a stronger RRF weight. Such rows
+  carry `_exact_match` (`"content"` or `"substring"`) and a relevance floor of
+  0.95/0.85, so an exact id outranks a vaguely similar vector hit.
 - Vector search is exact on scopes below 10,000 rows: no IVFFlat index is
   built there, so a nearby row is never missed by an unprobed list.
 - FTS is OR-based; the text score is multiplied by query coverage, and a
   full-text-only hit below `FTS_MIN_COVERAGE` (0.3) is dropped. `min_similarity`
   filters **vector** hits only; full-text hits survive a bad embedding score.
   `recall` reports `dropped_by_similarity`, `dropped_by_coverage`,
-  `dropped_by_decay`, `dropped_by_superseded` and
+  `dropped_by_decay`, `dropped_by_superseded`,
   `dropped_by_cross_scope_duplicate`; an empty result names every filter that
   removed something. The strongest rejected vector hit is reported
   as `best_dropped_by_similarity` (id, similarity, scope, `content_preview`),
@@ -233,8 +245,12 @@ counts and health.
     `_scope_boost` for project rows (max 0.05). `null` for graph-only hits.
     After reranking it is the rerank probability (plus scope boost) for the
     rescored block.
-  - `_rerank_score` (0..1): softmax of the cross-encoder logits over the
-    reranked block; only present when reranking ran.
+  - `_rerank_score` (0..1): per-candidate sigmoid of the cross-encoder logit,
+    so a score does not depend on how many candidates were reranked; only
+    present when reranking ran.
+  - `_history_penalty` (0.5) marks a superseded, forgotten or expired row that
+    was included on purpose. Its relevance is halved, so the current fact wins
+    a near-tie while history stays readable when it is the only match.
   - `_final_score` (0..1): relevance blended with decay (70/30) plus graph
     boost. Only present with `include_decay=true` or `graph_boost=true`.
   - `_distance` is raw cosine distance.
@@ -302,10 +318,11 @@ counts and health.
   - `contradictions_report` loads up to 200 active memories (entity-scoped or
     scope-wide; an entity scan covers that entity's memories **plus untagged
     neighbours** of the scope, so a tagged/untagged conflict stays visible),
-    fetches 8 neighbours per memory per searched scope table
+    fetches 6 neighbours per memory per searched scope table
     (`CONTRADICTION_NEIGHBORS`) and NLI-checks the deduplicated pairs in a
-    bounded pool (4 workers). The NLI leg has a wall-clock budget
-    (`budget_seconds`, default 25s or `CONTRADICTION_SCAN_BUDGET_SECONDS`); when it runs out the scan stops
+    bounded pool (6 workers). Neighbours are ordered by vector distance and
+    the most suspicious pairs are judged first. The NLI leg has a wall-clock budget
+    (`budget_seconds`, default 40s or `CONTRADICTION_SCAN_BUDGET_SECONDS`); when it runs out the scan stops
     early, sets `budget_exhausted` and names every unjudged pair in
     `nli_failures` (`reason: skipped: NLI time budget exhausted`) instead of
     letting the MCP call time out.
@@ -341,7 +358,8 @@ counts and health.
 - `export_memories` (JSON version `0.3`) keeps ids, `superseded_by`, TTL,
   `deleted_at`, timestamps, `access_count`, project, and for JSON the graph
   (entities and weighted relations with scope). JSONL is one record per line
-  with no graph.
+  with no graph. An `entity` export also carries that entity's
+  relation-context sentences.
 - Default export excludes superseded/forgotten history and warns how many rows
   it left out. Expired rows are included with `expires_at` and an explicit
   warning. Forgotten rows carry `deleted_at` and `superseded_by: null`; the

@@ -56,7 +56,7 @@ Graph tools use the global graph when `project` is omitted.
 `get_entity`, `list_entities`, `list_memories`, `recall`,
 `init_context`,
 `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
-`forget`, `contradictions_report`, `export_memories`,
+`list_relations`, `forget`, `contradictions_report`, `export_memories`,
 `import_memories`, `drop_project`.
 
 The read defaults differ per tool and are listed in

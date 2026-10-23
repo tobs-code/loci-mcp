@@ -65,7 +65,9 @@ both scopes, the project copy wins.
 | `_distance` | Raw cosine distance to the query. |
 | `_text_score` | Normalized rank of the full-text hit (1.0 = best). |
 | `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. After reranking this is the rerank probability (plus scope boost) for the rescored block. |
-| `_rerank_score` | Softmax of the cross-encoder logits over the reranked candidate block (0..1, relative to that block). Only present when reranking ran. |
+| `_rerank_score` | Per-candidate sigmoid of the cross-encoder logit (0..1), so a score does not depend on how many candidates were reranked. Only present when reranking ran. |
+| `_exact_match` | `"content"` or `"substring"` when the query or an identifier-like token hit literally; such rows get a relevance floor of 0.95/0.85. |
+| `_history_penalty` | `0.5` on a superseded, forgotten or expired row included on purpose: its relevance is halved, so the current fact wins a near-tie. |
 | `_scope_boost` | The compressed boost a project row gets on top of `_relevance_score`: `0.05 × (1 − relevance)`, at most 0.05 for a weak hit. |
 | `_rrf_score` / `_rrf_norm` | Raw RRF fusion value and its normalized form. |
 | `_decay_score` / `_decay_norm` | Raw decay value (uncapped) and the normalized 0..1 score. |
@@ -87,6 +89,14 @@ ranking is then `_relevance_score`, and the result is ordered by it.
 measured **0.288 noise floor**, and filters the **vector** retriever only. A
 full-text hit is kept even when the embedding model scores it badly — that is
 the case the full-text leg exists for.
+
+A third retriever handles literals: an identifier-like token (`ZEBRAFISH_TOKEN`,
+`app.py`, `v1.2.3`) or a quoted phrase is searched as a case-insensitive
+substring and fused with a stronger RRF weight. Exact content hits get a
+relevance floor of 0.95, substring hits 0.85, so an exact id outranks a vaguely
+similar vector match. `recall` reports `hidden_exact_match` when the literal
+exists only in a hidden row and names the flag (`include_deleted`,
+`include_expired` or `include_superseded`) that reveals it.
 
 The old **0.40** default came from assuming that unrelated facts score below
 0.30. The model card's own example scores unrelated documents at **0.50-0.61**,
@@ -120,10 +130,10 @@ winner or a clear margin is trusted as is; this keeps the ~2 s CPU cost out of
 the common path. `RERANK_ALWAYS=true` reranks every query,
 `RERANK_ENABLED=false` disables the stage.
 
-Reranked rows carry `_rerank_score` (a softmax over the submitted block, so it
-is relative, not a probability of relevance) and an updated
-`_relevance_score`; `_similarity`, `_rrf_score` and `_rrf_norm` stay the
-first-stage values. The reranked block is ordered by the cross-encoder, the
+Reranked rows carry `_rerank_score` (a per-candidate sigmoid of the
+cross-encoder logit, so the value does not shift with the block size) and an
+updated `_relevance_score`; `_similarity`, `_rrf_score` and `_rrf_norm` stay
+the first-stage values. The reranked block is ordered by the cross-encoder, the
 remaining first-stage hits follow in their previous order. `recall` reports
 `reranked` (the number of rescored rows); a reranker failure adds
 `rerank_error` and the warning `reranking skipped: ...`, and the first-stage

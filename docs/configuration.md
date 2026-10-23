@@ -10,7 +10,7 @@
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary; invalid names fall back to `english` |
-| `MCP_TOOLSET` | `full` | `full` (24 tools) or `core` (14 daily read/write/graph tools); an unknown value warns and falls back to `full` |
+| `MCP_TOOLSET` | `full` | `full` (25 tools) or `core` (15 daily read/write/graph tools); an unknown value warns and falls back to `full` |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu` or `cuda`; `cuda` still falls back if no device is visible |
 | `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | Build arg for the inference image; use `https://download.pytorch.org/whl/cpu` for a CPU-only image |
 | `RERANK_ENABLED` | `true` | Local cross-encoder reranking of ambiguous first-stage results |
@@ -29,9 +29,9 @@
 | `OPENAI_API_KEY` | – | Used when `LLM_PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | – | Used when `LLM_PROVIDER=anthropic` |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
-| `CONTRADICTION_SCAN_BUDGET_SECONDS` | `25` | Wall-clock budget for the NLI leg of `contradictions_report`; on exhaustion the scan stops early and names unjudged pairs in `nli_failures` |
-| `CONTRADICTION_NEIGHBORS` | `8` | Vector neighbours fetched per memory per searched scope table (1-20) |
-| `CONTRADICTION_NLI_WORKERS` | `4` | Bounded concurrency of the NLI calls (1-16) |
+| `CONTRADICTION_SCAN_BUDGET_SECONDS` | `40` | Wall-clock budget for the NLI leg of `contradictions_report`; on exhaustion the scan stops early and names unjudged pairs in `nli_failures` |
+| `CONTRADICTION_NEIGHBORS` | `6` | Vector neighbours fetched per memory per searched scope table (1-20); the closest pairs are judged first |
+| `CONTRADICTION_NLI_WORKERS` | `6` | Bounded concurrency of the NLI calls (1-16) |
 
 ## LLM providers
 

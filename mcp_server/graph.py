@@ -237,11 +237,15 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
         if not frm or not to:
             raise ValueError("each edge needs 'from_entity' and 'to_entity'")
         _safe_ident(rtype or "", "relation_type")
+        raw_weight = edge.get("weight")
         prepared.append({
             "from_entity": frm,
             "to_entity": to,
             "relation_type": rtype,
-            "weight": _validate_weight(edge.get("weight", 1.0)),
+            # None means "preserve what the edge already has"; validation is
+            # skipped until the existing weight has been read.
+            "weight": (None if raw_weight is None
+                       else _validate_weight(raw_weight)),
             "context": edge.get("context"),
         })
 
@@ -261,7 +265,6 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
     for e in prepared:
         from_json = json.dumps(e["from_entity"])
         to_json = json.dumps(e["to_entity"])
-        w_json = json.dumps(e["weight"])
         rtype = e["relation_type"]
 
         cur.execute(
@@ -269,7 +272,24 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
             f"MATCH (a:{label} {{name: {from_json}}})-[r:{rtype}]->(b:{label} {{name: {to_json}}}) "
             f"RETURN r.weight $$) AS (w agtype)"
         )
-        existed = cur.fetchone() is not None
+        existing_row = cur.fetchone()
+        existed = existing_row is not None
+        if e["weight"] is None:
+            # No weight passed: keep the stored strength (default 1.0 only
+            # for a brand-new edge). Otherwise an idempotent `relate` call -
+            # e.g. adding a context sentence later - silently reset a
+            # deliberately weak edge to 1.0.
+            weight = 1.0
+            if existing_row is not None:
+                try:
+                    weight = _validate_weight(
+                        float(_ag_str(existing_row[0])))
+                except (TypeError, ValueError):
+                    weight = 1.0
+        else:
+            weight = e["weight"]
+        e["weight"] = weight
+        w_json = json.dumps(weight)
 
         cur.execute(
             f"SELECT * FROM cypher('memory_graph', $$ "
@@ -284,18 +304,18 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
             "WHERE e1.name = %s AND e2.name = %s "
             "AND e1.project = %s AND e2.project = %s "
             "ON CONFLICT (source_id, target_id, relation_type) DO UPDATE SET weight = EXCLUDED.weight",
-            (rtype, e["weight"], e["from_entity"], e["to_entity"], scope, scope),
+            (rtype, weight, e["from_entity"], e["to_entity"], scope, scope),
         )
         # The context sentence of an edge carries the edge weight in its
         # metadata. A later weight change would leave the old value behind
         # and contradict the graph, so the two are kept in sync.
         _sync_context_weight(cur, project, e["from_entity"], e["to_entity"],
-                             rtype, e["weight"])
+                             rtype, weight)
         results.append({
             "from_entity": e["from_entity"],
             "to_entity": e["to_entity"],
             "relation_type": rtype,
-            "weight": e["weight"],
+            "weight": weight,
             "status": "updated" if existed else "created",
             "context_memory": None,
             "context_reused": False,
@@ -361,14 +381,18 @@ def relate(
         Field(description="Project scope of the graph. Without it the global "
                           "graph is used.")] = None,
     weight: Annotated[
-        float,
-        Field(description="Strength of the edge in 0.0-1.0 (default 1.0). It "
-                          "scales the retrieval boost of graph_boost.")] = 1.0,
+        float | None,
+        Field(description="Strength of the edge in 0.0-1.0. Omit it to keep "
+                          "an existing edge's weight (a new edge defaults to "
+                          "1.0); passing a value always re-weights the edge. "
+                          "It scales the retrieval boost of graph_boost.")] = None,
 ) -> dict[str, Any]:
     """Create a directed relation between two entities in the AGE graph.
 
     `weight` is the strength of the edge in 0.0-1.0; it scales the retrieval
-    boost that `graph_boost` gives to the connected memories.
+    boost that `graph_boost` gives to the connected memories. Repeating a
+    call without `weight` is idempotent and preserves the stored weight
+    instead of resetting a deliberate 0.2 edge to the default 1.0.
     """
     logger.info("relate %s ->[%s]-> %s weight=%s", from_entity, relation_type, to_entity, weight)
     try:
@@ -434,8 +458,9 @@ def relate_batch(
     """Create or update multiple directed relations in one transaction.
 
     Each edge needs: from_entity, to_entity, relation_type.
-    Optional: weight (default 1.0), context (stored as a memory), project
-    (overrides the tool-level project for that edge).
+    Optional: weight (omit to preserve an existing edge's weight; a new edge
+    defaults to 1.0), context (stored as a memory), project (overrides the
+    tool-level project for that edge).
     Entities are auto-created; existing edges are updated (MERGE), so the
     call is idempotent and both directions of a relation can coexist.
     """
@@ -457,7 +482,8 @@ def relate_batch(
                 raise ValueError(
                     "each edge needs 'from_entity' and 'to_entity'")
             _safe_ident(edge.get("relation_type") or "", "relation_type")
-            _validate_weight(edge.get("weight", 1.0))
+            if edge.get("weight") is not None:
+                _validate_weight(edge.get("weight"))
             _norm_project(edge.get("project", project))
         except (TypeError, ValueError) as e:
             return fail(STATUS_ERROR, f"edge {i}: {e}")
@@ -628,7 +654,8 @@ def find_connections(
     own direction. `project` selects that project's graph; without it the
     global graph is traversed. `offset` pages through the connections; the
     answer reports `total` and `has_more`, so a truncated list is never
-    mistaken for a complete neighbourhood.
+    mistaken for a complete neighbourhood. Each result carries the edge's
+    `context` sentence when one was stored with `relate`.
     """
     if entity and entity_name and entity.strip() != entity_name.strip():
         return fail(
@@ -719,6 +746,28 @@ def find_connections(
                 "from_entity": src,
                 "to_entity": tgt,
             })
+        # An edge optionally carries a sentence explaining *why* the two
+        # entities are connected. Traversal that returns only the label makes
+        # the agent guess; the sentence is already stored as a relation-context
+        # memory, so attach it to the edge it belongs to.
+        ctx_table = _mem_table(project) if project else "memories"
+        if _table_exists(cur, ctx_table):
+            for result in results:
+                ctx_entity = (f"{result['from_entity']}_"
+                              f"{result['relation']}_"
+                              f"{result['to_entity']}")
+                cur.execute(
+                    f"SELECT content FROM {ctx_table} "
+                    "WHERE entity = %s AND superseded_by IS NULL "
+                    "AND deleted_at IS NULL "
+                    "AND metadata->>'relation_context' = 'true' "
+                    "AND metadata->>'relation_type' = %s "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (ctx_entity, result["relation"]),
+                )
+                context_row = cur.fetchone()
+                if context_row:
+                    result["context"] = context_row[0]
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -731,6 +780,102 @@ def find_connections(
         warnings.append(
             f"no results on this page: offset={offset} is beyond the "
             f"{total} connection(s); lower the offset")
+    return ok(STATUS_OK, count=len(results), total=total, offset=offset,
+              has_more=has_more,
+              next_offset=(offset + limit) if has_more else None,
+              warnings=warnings, results=results)
+
+
+def list_relations(
+    entity: Annotated[
+        str | None,
+        Field(description="Only relations where this entity is the source or "
+                          "the target.")] = None,
+    relation_type: Annotated[
+        str | None,
+        Field(description="Only relations of this type.")] = None,
+    project: Annotated[
+        str | None,
+        Field(description="Graph scope. Without it (or with '*') every scope "
+                          "is listed; 'global' lists only the shared graph.")] = None,
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of relations (default 50).")] = 50,
+    offset: Annotated[
+        int,
+        Field(description="Skip this many relations (default 0).")] = 0,
+) -> dict[str, Any]:
+    """Browse stored graph edges without traversing from one entity.
+
+    `find_connections` answers "what is next to X"; this answers "which
+    relations exist here", optionally filtered by one endpoint or a relation
+    type. Sorted by weight (strongest first), then by source, target and type.
+    """
+    logger.info("list_relations entity=%s relation_type=%s project=%s",
+                entity, relation_type, project)
+    all_scopes = project is None or str(project).strip() == "*"
+    try:
+        project = None if all_scopes else _norm_project(project)
+        entity = _norm_entity(entity) if entity is not None else None
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    if relation_type:
+        try:
+            _safe_ident(relation_type, "relation_type")
+        except ValueError as e:
+            return fail(STATUS_ERROR, str(e))
+    if limit < 1:
+        return fail(STATUS_ERROR, "limit must be >= 1")
+    if offset < 0:
+        return fail(STATUS_ERROR, "offset must be >= 0")
+
+    conditions: list[str] = []
+    params: list[Any] = []
+    if not all_scopes:
+        conditions.append("e1.project = %s")
+        params.append(_scope_key(project))
+    if entity:
+        conditions.append("(e1.name = %s OR e2.name = %s)")
+        params.extend([entity, entity])
+    if relation_type:
+        conditions.append("r.relation_type = %s")
+        params.append(relation_type)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    from_sql = (f"FROM relations r JOIN entities e1 ON e1.id = r.source_id "
+                f"JOIN entities e2 ON e2.id = r.target_id {where}")
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT count(*) {from_sql}", params)
+        total = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            f"SELECT e1.name, e2.name, r.relation_type, r.weight, e1.project "
+            f"{from_sql} "
+            f"ORDER BY coalesce(r.weight, 1.0) DESC, e1.name, e2.name, "
+            f"r.relation_type OFFSET %s LIMIT %s",
+            params + [offset, limit],
+        )
+        results = [{
+            "from_entity": row[0],
+            "to_entity": row[1],
+            "relation_type": row[2],
+            "weight": float(row[3] or 1.0),
+            "project": "global" if row[4] == "global" else row[4],
+        } for row in cur.fetchall()]
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+
+    has_more = total > offset + limit
+    warnings: list[str] = []
+    if offset > 0 and total > 0 and not results:
+        warnings.append(
+            f"no results on this page: offset={offset} is beyond the "
+            f"{total} relation(s); lower the offset")
     return ok(STATUS_OK, count=len(results), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,

@@ -42,6 +42,8 @@ SCORE_FIELDS = (
     "_graph_source",
     "_graph_weight",
     "_graph_relation_context",
+    "_exact_match",
+    "_history_penalty",
 )
 
 SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS

@@ -74,8 +74,16 @@ def _export_memories_json(cur, project: str | None,
         # caller who wants only active facts can now say so.
         conditions.append("(expires_at IS NULL OR expires_at > NOW())")
     if entity:
-        conditions.append("entity = %s")
-        params.append(entity)
+        # The sentence of an edge is stored under the synthetic entity
+        # `<from>_<relation>_<to>`, not under either endpoint. An entity
+        # export that skipped it lost the "why" of the exported edges while
+        # the graph section still carried them. `metadata.from`/`to` name the
+        # real endpoints, so this matches the context without parsing the
+        # synthetic name.
+        conditions.append(
+            "(entity = %s OR (metadata->>'relation_context' = 'true' "
+            "AND (metadata->>'from' = %s OR metadata->>'to' = %s)))")
+        params.extend([entity, entity, entity])
     if mem_type:
         conditions.append("mem_type = %s")
         params.append(mem_type)
@@ -242,7 +250,9 @@ def export_memories(
         Field(description="Include entities and relations (JSON exports only).")] = True,
     entity: Annotated[
         str | None,
-        Field(description="Only export memories of this entity.")] = None,
+        Field(description="Only export memories of this entity. The "
+                          "relation-context sentences of its graph edges are "
+                          "included, so the exported graph keeps its 'why'.")] = None,
     mem_type: Annotated[
         str | None,
         Field(description="Only export memories of this type.")] = None,
@@ -264,6 +274,9 @@ def export_memories(
     `include_deleted` separates soft-forgotten rows from superseded history:
     pass false to export invalidated facts without deliberately forgotten
     ones, true to include both.
+    `entity` also exports the relation-context sentences of that entity's
+    graph edges (they live under a synthetic entity name), so an entity
+    backup keeps the edge explanations together with the incident edges.
 
     The payload is returned in "data" and can be passed to `import_memories`
     unchanged.
@@ -506,6 +519,11 @@ def import_memories(
                 "(one record per line), a list of records, or format='json'",
                 imported=0, skipped=0)
         if isinstance(data, dict):
+            parsed = data
+        elif format == "jsonl" and isinstance(data, list):
+            # A client that already parsed the lines may send the records as a
+            # list. That is the shape the error message promises; stringifying
+            # it used to fail with "invalid jsonl data".
             parsed = data
         elif format == "jsonl":
             lines = [line for line in str(data).strip().split("\n")

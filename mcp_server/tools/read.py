@@ -223,7 +223,8 @@ def recall(
                           "_rrf_norm, _relevance_score, _rerank_score, "
                           "_scope_boost, _decay_score, _decay_norm, "
                           "_final_score, _graph_boost, _graph_source, "
-                          "_graph_weight, _graph_relation_context.")] = None,
+                          "_graph_weight, _graph_relation_context, "
+                          "_exact_match.")] = None,
     detail: Annotated[
         Literal["full", "slim"],
         Field(description="'full' (default) returns every public column and "
@@ -601,7 +602,26 @@ def recall(
     if dropped_by_superseded:
         payload["dropped_by_superseded"] = dropped_by_superseded
     if stats.get("fulltext_only"):
-        payload["fulltext_only"] = stats["fulltext_only"]
+        fulltext_only = stats["fulltext_only"]
+        payload["fulltext_only"] = fulltext_only
+        if min_similarity is not None:
+            # `_similarity` is null for these rows, so the documented filter
+            # did not judge them. Saying so prevents the wrong conclusion
+            # ("the hit has similarity above min_similarity").
+            warnings.append(
+                f"{fulltext_only} result(s) matched only the full-text index: "
+                f"min_similarity={min_similarity} does not apply to them "
+                f"(_similarity is null)")
+    hidden_exact = stats.get("hidden_exact_match")
+    if hidden_exact:
+        payload["hidden_exact_match"] = dict(hidden_exact)
+        flags = hidden_exact.get("flags") or []
+        flag_hint = ("; pass " + ", ".join(f"{flag}=true" for flag in flags)
+                     if flags else "")
+        warnings.append(
+            f"{hidden_exact['count']} hidden memory/memories contain this "
+            f"exact text but are not active (expired, superseded or "
+            f"soft-forgotten){flag_hint} to see them")
     if stats.get("reranked"):
         payload["reranked"] = stats["reranked"]
     if stats.get("rerank_error"):
