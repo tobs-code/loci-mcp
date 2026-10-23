@@ -248,6 +248,7 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
             "weight": e["weight"],
             "status": "updated" if existed else "created",
             "context_memory": None,
+            "context_reused": False,
             "self_loop": e["from_entity"] == e["to_entity"],
         })
 
@@ -258,20 +259,33 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
         for (e, r), emb in zip(context_edges, embeddings):
             ctx_entity = f"{e['from_entity']}_{e['relation_type']}_{e['to_entity']}"
             cur.execute(
-                f"SELECT id FROM {ctx_table} WHERE entity = %s "
+                f"SELECT id, content FROM {ctx_table} WHERE entity = %s "
                 f"AND superseded_by IS NULL AND deleted_at IS NULL LIMIT 1",
                 (ctx_entity,),
             )
             row = cur.fetchone()
-            mem_id = _store_memory(
-                cur, e["context"], emb, "context", ctx_entity, 0.8,
-                {"relation_context": True, "relation_type": e["relation_type"],
-                 "from": e["from_entity"],
-                 "to": e["to_entity"], "weight": e["weight"]},
-                project, None,
-            )
-            if row:
-                _supersede(cur, project, mem_id, row[0])
+            if row and row[1] == e["context"]:
+                # Re-relating the same edge with the same sentence is a no-op
+                # for the context memory. Storing a new copy and superseding
+                # the old one changed the id on every call, so an idempotent
+                # `relate` still produced a new memory version each time.
+                mem_id = row[0]
+                cur.execute(
+                    f"UPDATE {ctx_table} SET updated_at = NOW() "
+                    f"WHERE id = %s", (mem_id,))
+                r["context_reused"] = True
+            else:
+                mem_id = _store_memory(
+                    cur, e["context"], emb, "context", ctx_entity, 0.8,
+                    {"relation_context": True,
+                     "relation_type": e["relation_type"],
+                     "from": e["from_entity"],
+                     "to": e["to_entity"], "weight": e["weight"]},
+                    project, None,
+                )
+                if row:
+                    _supersede(cur, project, mem_id, row[0])
+                r["context_reused"] = False
             r["context_memory"] = mem_id
 
     return results
@@ -351,6 +365,7 @@ def relate(
         "relation_type": edge["relation_type"],
         "weight": edge["weight"],
         "context_memory": edge["context_memory"],
+        "context_reused": edge.get("context_reused", False),
         "warnings": warnings,
     })
 

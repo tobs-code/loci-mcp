@@ -32,7 +32,8 @@ def _export_memories_json(cur, project: str | None,
                           entity: str | None = None,
                           mem_type: str | None = None,
                           updated_after: str | None = None,
-                          metadata_filter: dict | None = None) -> list[dict]:
+                          metadata_filter: dict | None = None,
+                          include_expired: bool = True) -> list[dict]:
     names = _project_names(cur)
     if project:
         tables = [(_mem_table(project), project)]
@@ -50,6 +51,11 @@ def _export_memories_json(cur, project: str | None,
     params: list[Any] = []
     if not include_superseded:
         conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+    if not include_expired:
+        # Symmetric with every read tool: an expired row is inactive. The
+        # default keeps it (a backup must not lose the TTL/history), but a
+        # caller who wants only active facts can now say so.
+        conditions.append("(expires_at IS NULL OR expires_at > NOW())")
     if entity:
         conditions.append("entity = %s")
         params.append(entity)
@@ -202,6 +208,11 @@ def export_memories(
     include_superseded: Annotated[
         bool,
         Field(description="Include superseded (invalidated) memories.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Include memories whose TTL has passed (default "
+                          "true: a backup keeps them with their expires_at). "
+                          "Pass false to export active rows only.")] = True,
     include_graph: Annotated[
         bool,
         Field(description="Include entities and relations (JSON exports only).")] = True,
@@ -251,7 +262,8 @@ def export_memories(
                                      only_global=only_global,
                                      entity=entity, mem_type=mem_type,
                                      updated_after=updated_after,
-                                     metadata_filter=metadata_filter)
+                                     metadata_filter=metadata_filter,
+                                     include_expired=include_expired)
         graph = (_export_graph(cur, project, only_global=only_global,
                                entity=entity)
                  if (include_graph and format != "jsonl") else None)
@@ -318,6 +330,10 @@ def export_memories(
             f"export includes {expired_count} expired memories: they are "
             f"backed up with their expires_at and stay inactive after an "
             f"import")
+    elif not include_expired:
+        warnings.append(
+            "include_expired=false: memories whose TTL has passed were left "
+            "out of the export")
     superseded_count, forgotten_count = excluded
     if superseded_count or forgotten_count:
         parts = []
@@ -338,14 +354,14 @@ def export_memories(
         data = "\n".join(json.dumps(r) for r in records)
         return ok(STATUS_OK, format=format, count=len(records), data=data,
                   data_format="jsonl", graph_included=False,
-                  warnings=warnings)
+                  include_expired=include_expired, warnings=warnings)
     payload = {"type": "memory_export", "version": "0.3",
                "records": records, "count": len(records)}
     if graph is not None:
         payload["graph"] = graph
     return ok(STATUS_OK, format=format, count=len(records), data=payload,
               data_format="json", graph_included=graph is not None,
-              warnings=warnings)
+              include_expired=include_expired, warnings=warnings)
 
 
 def _parse_dt(value) -> datetime | None:

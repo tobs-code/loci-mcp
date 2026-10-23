@@ -55,6 +55,16 @@ logger = logging.getLogger(__name__)
 
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
+# The token-cheap recall view: enough to judge a hit and call the next tool
+# (id/content/scope/entity/type/rank), without the metadata blob or history
+# bookkeeping. An explicit `fields` list always wins over `detail`.
+SLIM_RECALL_FIELDS = (
+    "id", "content", "mem_type", "entity", "project", "importance",
+    "updated_at", "superseded_by", "forgotten", "expired",
+    "_similarity", "_relevance_score", "_final_score",
+    "_graph_boost", "_graph_source", "_graph_relation_context",
+)
+
 
 def _escape_like(value: str) -> str:
     """Escape the wildcards of a LIKE/ILIKE pattern."""
@@ -208,7 +218,16 @@ def recall(
                           "_similarity, _distance, _text_score, _rrf_score, "
                           "_rrf_norm, _relevance_score, _scope_boost, "
                           "_decay_score, _decay_norm, _final_score, "
-                          "_graph_boost, _graph_source, _graph_weight.")] = None,
+                          "_graph_boost, _graph_source, _graph_weight, "
+                          "_graph_relation_context.")] = None,
+    detail: Annotated[
+        Literal["full", "slim"],
+        Field(description="'full' (default) returns every public column and "
+                          "score annotation. 'slim' returns only the fields a "
+                          "caller needs to judge and reuse a hit (id, content, "
+                          "entity, mem_type, project, importance, timestamps "
+                          "and the ranking scores), which saves tokens for "
+                          "large result sets. An explicit `fields` list wins.")] = "full",
     only_superseded: Annotated[
         bool,
         Field(description="Return only invalidated (superseded) memories.")] = False,
@@ -441,10 +460,13 @@ def recall(
 
     rows = []
     expired_count = 0
+    projection_fields = fields
+    if projection_fields is None and detail == "slim":
+        projection_fields = list(SLIM_RECALL_FIELDS)
     for r in results:
         if not isinstance(r, dict):
             continue
-        item = project_row(r, fields)
+        item = project_row(r, projection_fields)
         if r.get("deleted_at"):
             item["forgotten"] = True
             if item.get("superseded_by") == SENTINEL_FORGOTTEN:
@@ -547,6 +569,7 @@ def recall(
         # The scopes that were actually searched: an agent that finds
         # nothing has to know whether other scopes were covered.
         "scopes_searched": scopes_searched,
+        "detail": detail,
     }
     # The strongest rejected vector hit: a count alone hides the natural
     # language question that barely missed the threshold. With a non-empty
@@ -758,6 +781,7 @@ def list_memories(
         return result
     conn = get_conn()
     warnings: list[str] = []
+    scopes_searched: list[str] = []
     try:
         cur = conn.cursor()
         unknown = _unknown_project_warning(cur, project)
@@ -798,6 +822,7 @@ def list_memories(
         conditions.extend(extra_conditions)
         params.extend(extra_params)
         where = " AND ".join(conditions)
+        scopes_searched = _scopes_of_tables(cur, tables)
         # Two phases. First the light columns of every match: dedup and paging
         # must see the whole set, otherwise `total`, `has_more` and the page
         # disagree. Only then the full rows of this page are loaded, so a
@@ -831,6 +856,18 @@ def list_memories(
         conn.close()
     unique, hidden_duplicates = _dedup_rows_across_scopes(
         index_rows, include_duplicates)
+    # Scope transparency: with a project the browse also covers global rows.
+    # A flat `total` made that mix invisible, so name the scopes and split the
+    # counts. `total_by_scope` counts every matching row; `listed_by_scope`
+    # counts what remains after the cross-scope duplicate suppression.
+    total_by_scope: dict[str, int] = {}
+    for row in index_rows:
+        scope_name = row.get("_project") or "global"
+        total_by_scope[scope_name] = total_by_scope.get(scope_name, 0) + 1
+    listed_by_scope: dict[str, int] = {}
+    for row in unique:
+        scope_name = row.get("_project") or "global"
+        listed_by_scope[scope_name] = listed_by_scope.get(scope_name, 0) + 1
     if hidden_duplicates:
         warnings.append(
             f"{hidden_duplicates} active memory/memories were hidden because "
@@ -909,6 +946,9 @@ def list_memories(
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
               duplicates_hidden=hidden_duplicates,
+              scopes_searched=scopes_searched,
+              total_by_scope=total_by_scope,
+              listed_by_scope=listed_by_scope,
               warnings=warnings, results=results)
 
 
@@ -1197,12 +1237,28 @@ def get_entity(name: Annotated[
     warnings: list[str] = []
     total = 0
     relation_context_count = 0
+    scopes_searched: list[str] = []
+    memories_by_scope: dict[str, int] = {}
+    scope_presence: dict[str, str] = {}
     try:
         cur = conn.cursor()
         tables = _retrieval_tables(cur, project) if project else None
         if project and not include_global:
             tables = [table for table in tables if table != "memories"]
         used_tables = tables or ["memories"]
+        scopes_searched = _scopes_of_tables(cur, used_tables)
+        # An entity name can exist in several scopes. The caller asked for one
+        # lookup, so the answer has to say where else the name occurs instead
+        # of silently merging a global memory-only entity with this project's
+        # graph node.
+        for table, scope_name in zip(used_tables, scopes_searched):
+            cur.execute(f"SELECT 1 FROM {table} WHERE entity = %s LIMIT 1",
+                        (target,))
+            if cur.fetchone():
+                scope_presence[scope_name] = "memory"
+        cur.execute("SELECT project FROM entities WHERE name = %s", (target,))
+        for (entity_project,) in cur.fetchall():
+            scope_presence[entity_project or "global"] = "graph"
         memories = _search_memories(cur, None, None, None, target,
                                     limit + offset + 1, project,
                                     include_superseded=include_superseded,
@@ -1275,6 +1331,18 @@ def get_entity(name: Annotated[
         }
     if entity_data is None and not memories:
         return fail(STATUS_NOT_FOUND, f"entity not found: {target}", entity=target)
+    if len(scope_presence) > 1:
+        entity_data["scopes_with_entity"] = scope_presence
+        detail_scope = entity_data.get("project") or "global"
+        warnings.append(
+            f"entity {target!r} exists in several scopes "
+            f"({', '.join(sorted(scope_presence))}); `details` describes the "
+            f"{detail_scope!r} occurrence and the memories come from "
+            f"{', '.join(scopes_searched)}. Pass project=<name> for one scope")
+    for memory in memories:
+        scope_name = memory.get("_project") or "global"
+        memories_by_scope[scope_name] = (
+            memories_by_scope.get(scope_name, 0) + 1)
     # The rows come from several tables: newest update first makes the
     # detail view deterministic page-over-page.
     memories.sort(key=lambda m: m.get("updated_at") or "", reverse=True)
@@ -1308,6 +1376,8 @@ def get_entity(name: Annotated[
               count=len(window), offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
+              scopes_searched=scopes_searched,
+              memories_by_scope=memories_by_scope,
               warnings=warnings)
 
 

@@ -200,8 +200,15 @@ def _find_near_duplicate(cur, content: str, project: str | None,
     is allowed (the caller may want both versions) - this function only
     reports the match so the response can warn instead of forking silently.
 
-    Returns {"id", "similarity"} or None. Exact content hashes never land
-    here: `_deduplicate` already reports them before this check runs.
+    The match carries its `entity` and `content` so the caller can decide
+    whether the two facts really describe the same subject. A high vector
+    similarity between two different entities (staging vs. production, two
+    services) is not a duplicate and must never trigger an automatic
+    supersede.
+
+    Returns {"id", "similarity", "entity", "content"} or None. Exact content
+    hashes never land here: `_deduplicate` already reports them before this
+    check runs.
     """
     if embedding_vec is None:
         return None
@@ -212,7 +219,8 @@ def _find_near_duplicate(cur, content: str, project: str | None,
     if exclude_id:
         params.append(exclude_id)
     cur.execute(
-        f"SELECT id, embedding <=> %s::vector AS dist FROM {table} "
+        f"SELECT id, embedding <=> %s::vector AS dist, entity, content "
+        f"FROM {table} "
         f"WHERE content_hash <> %s "
         f"AND {ACTIVE_ROW_SQL} "
         f"AND embedding IS NOT NULL{exclude_sql} "
@@ -224,7 +232,8 @@ def _find_near_duplicate(cur, content: str, project: str | None,
         return None
     similarity = round(1.0 - float(row[1]), 4)
     if similarity >= NEAR_DUPLICATE_THRESHOLD:
-        return {"id": row[0], "similarity": similarity}
+        return {"id": row[0], "similarity": similarity,
+                "entity": row[2], "content": row[3]}
     return None
 
 
@@ -374,7 +383,7 @@ def _find_last_for_entity(cur, entity: str, project: str | None,
 
 def _find_last_in_scope(cur, project: str | None,
                         embedding: list[float] | None = None
-                        ) -> tuple[str, str, float | None] | None:
+                        ) -> tuple[str, str, float | None, str | None] | None:
     """The active memory of the scope that best matches the new fact.
 
     Fallback for `supersede_last` when no entity is set: the same
@@ -382,12 +391,17 @@ def _find_last_in_scope(cur, project: str | None,
     instead of one entity's memories. Needs an embedding (similarity is the
     topic check); without one the caller must refuse the mode instead of
     guessing "the newest is about the same topic".
+
+    Returns (id, content, similarity, entity). The entity is needed because a
+    scope-wide match that belongs to a tagged entity must not be replaced by
+    an untagged write: similarity alone cannot prove that both describe the
+    same subject.
     """
     if embedding is None:
         return None
     table = _mem_table(project)
     cur.execute(
-        f"SELECT id, content, embedding <=> %s::vector AS dist "
+        f"SELECT id, content, embedding <=> %s::vector AS dist, entity "
         f"FROM {table} "
         f"WHERE {ACTIVE_ROW_SQL} "
         f"ORDER BY dist ASC, updated_at DESC LIMIT 1",
@@ -396,7 +410,7 @@ def _find_last_in_scope(cur, project: str | None,
     row = cur.fetchone()
     if not row:
         return None
-    return row[0], row[1], round(1.0 - float(row[2]), 4)
+    return row[0], row[1], round(1.0 - float(row[2]), 4), row[3]
 
 
 def _check_contradictions(cur, content: str, entity: str | None,

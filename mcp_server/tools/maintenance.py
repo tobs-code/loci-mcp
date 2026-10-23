@@ -672,7 +672,16 @@ def contradictions_report(entity: Annotated[
         # Which pairs were NOT judged, per fact. A stale inference container
         # that does not send `failed_indices` leaves this empty; the
         # aggregated warning still names the incomplete scan then.
+        # The per-neighbour list is intentionally complete (an agent may need
+        # to retry exactly those ids), but the compact summary lets a caller
+        # see the scale without reading every entry.
         result["nli_failures"] = nli_failures
+        result["nli_failures_count"] = len(nli_failures)
+        summary: dict[str, int] = {}
+        for failure in nli_failures:
+            reason = str(failure.get("reason") or "unknown")
+            summary[reason] = summary.get(reason, 0) + 1
+        result["nli_failure_summary"] = summary
     return ok(STATUS_OK, **result)
 
 

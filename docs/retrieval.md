@@ -127,7 +127,15 @@ confident matches.
 `recall` reports `scopes_searched`: the scopes the query actually covered.
 Without a `project` only the shared scope is searched, so an agent that finds
 nothing there is told which other scopes exist and that `project="*"` covers
-them.
+them. `get_entity` reports the same plus `memories_by_scope`;
+`list_memories` adds `scopes_searched`, `total_by_scope` (before cross-scope
+dedup) and `listed_by_scope` (after it), so a mixed global + project browse is
+never mistaken for one flat scope.
+
+`recall(detail="slim")` trims the rows to the fields a session usually needs
+(id, content, entity, type, project, importance, timestamps and scores) while
+the default `detail="full"` keeps metadata and history bookkeeping. An explicit
+`fields` list still wins over `detail`.
 
 Measured with the current embedding model:
 

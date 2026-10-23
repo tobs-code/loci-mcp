@@ -43,6 +43,7 @@ from mcp_server.scopes import (
     _scope_key,
     _scope_label,
     _scope_of_table,
+    _scopes_of_tables,
     _table_exists,
 )
 from mcp_server.scoring import _content_hash
@@ -96,7 +97,7 @@ class BatchFact(BaseModel):
     entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                          description="Entity this memory belongs to; links it in the graph.")
     importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
-                            description="Importance in 0.0-1.0 (default 1.0); scales decay weighting.")
+                            description="Importance in 0.0-1.0 (default 0.5); scales decay weighting.")
     metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]},
                           description="Free-form JSON object stored with the memory.")
     scope: Any = Field(default=None, json_schema_extra={
@@ -155,9 +156,42 @@ def _sanitize_batch_fact(value: Any) -> Any:
 BatchFactInput = Annotated[BatchFact, BeforeValidator(_sanitize_batch_fact)]
 
 
-def _near_duplicate_warning(near_dup: dict) -> str:
+def _same_subject_entity(near_dup: dict, entity: str | None) -> bool:
+    """Whether the near-duplicate match and the new fact share an entity.
+
+    Entity tagging is the only reliable subject signal available before an
+    NLI call: two memories about staging and production are often nearly
+    identical in wording but describe different systems. An untagged write
+    and an untagged match count as the same subject (the historical
+    behaviour); one tagged and one untagged does not.
+    """
+    return _norm_str(near_dup.get("entity")) == _norm_str(entity)
+
+
+def _near_duplicate_warning(near_dup: dict, entity: str | None = None) -> str:
     """Warning for a write that dedupe did not match but that still reads
-    like a reworded copy of an active memory (remember + remember_batch)."""
+    like a reworded copy of an active memory (remember + remember_batch).
+
+    `entity` is the entity of the new write. When it differs from the matched
+    memory's entity, the warning must NOT suggest `supersede`: following that
+    advice would replace a fact about a different subject merely because the
+    sentences look alike.
+    """
+    if not _same_subject_entity(near_dup, entity):
+        old_entity = near_dup.get("entity")
+        new_entity = entity if entity is not None else "untagged"
+        preview = (near_dup.get("content") or "").strip()
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        return (
+            f"near-duplicate across entities: active memory {near_dup['id']} "
+            f"(entity {old_entity!r}) matches this content with similarity "
+            f"{near_dup['similarity']}, but this write belongs to entity "
+            f"{new_entity!r} - stored as a separate fact. If both describe the "
+            f"same subject, tag them with the same entity; only pass "
+            f"supersede={near_dup['id']} if you are sure the other fact must "
+            f"be replaced. Matched content: {preview!r}"
+        )
     return (
         f"near-duplicate: active memory {near_dup['id']} matches this content "
         f"with similarity {near_dup['similarity']} - the write looks like a "
@@ -406,8 +440,11 @@ def remember(
                           "and enables graph_boost / find_connections.")] = None,
     importance: Annotated[
         float,
-        Field(description="Importance in 0.0-1.0 (default 1.0). Scales the decay "
-                          "weight, so low-importance memories fade faster.")] = 1.0,
+        Field(description="Importance in 0.0-1.0 (default 0.5). Scales the "
+                          "decay weight, so low-importance memories fade "
+                          "faster. A default of 1.0 made decay nearly "
+                          "ineffective; raise it for facts that must stay "
+                          "prominent.")] = 0.5,
     metadata: Annotated[
         Any,
         Field(json_schema_extra={"type": ["object", "null"]},
@@ -713,7 +750,9 @@ def remember(
         # writes nothing at all - the caller explicitly asked not to fork a
         # reworded copy and expects a duplicate answer instead.
         auto_near: dict | None = None
-        if near_dup and near_policy == "reject" \
+        same_subject = (near_dup is not None
+                        and _same_subject_entity(near_dup, entity))
+        if near_dup and same_subject and near_policy == "reject" \
                 and near_dup["id"] not in superseded:
             conn.rollback()
             return ok(
@@ -728,7 +767,7 @@ def remember(
                     f"{near_dup['similarity']}; nothing was stored (pass "
                     f"on_near_duplicate='supersede' to replace it or 'warn' "
                     f"to store it anyway)"])
-        if near_dup and near_policy == "supersede" \
+        if near_dup and same_subject and near_policy == "supersede" \
                 and near_dup["id"] not in superseded:
             auto_near = near_dup
             superseded.append(near_dup["id"])
@@ -836,7 +875,7 @@ def remember(
                 f"{near_dup['similarity']}) is superseded by this write "
                 f"already; no separate action is needed")
         elif near_dup:
-            warnings.append(_near_duplicate_warning(near_dup))
+            warnings.append(_near_duplicate_warning(near_dup, entity))
         if cross_scope_superseded:
             warnings.append(_cross_scope_warning(cross_scope_superseded))
         if cross_duplicates:
@@ -1057,6 +1096,7 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
                 f"scope; nothing was replaced"
             )
     if supersede_last:
+        found_entity: str | None = None
         if entity:
             found = _find_last_for_entity(cur, entity, store_project, embedding)
         else:
@@ -1065,6 +1105,7 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
             # not replace an unrelated memory either.
             found = _find_last_in_scope(cur, store_project, embedding)
             if found:
+                found_entity = found[3] if len(found) > 3 else None
                 warnings.append(
                     "supersede_last without an entity: resolved the "
                     "best-matching memory across the scope instead of one "
@@ -1079,11 +1120,24 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
                 f"supersede_last skipped: no memory of entity {entity!r} "
                 f"is active; nothing was replaced")
         if found:
-            target_id, old_content, similarity = found
+            # The scope-wide lookup returns an entity; the entity-scoped one
+            # necessarily matched the requested entity.
+            target_id, old_content, similarity = found[:3]
             topic_floor = (SUPERSEDE_SIMILARITY_MIN if entity
                            else max(SUPERSEDE_SIMILARITY_MIN,
                                     NEAR_DUPLICATE_THRESHOLD))
-            if similarity is not None and similarity < topic_floor:
+            if not entity and found_entity is not None:
+                # An untagged write must not replace a fact that belongs to a
+                # tagged entity just because the vectors are close. The caller
+                # has to name the entity (or the id) to make that choice.
+                warnings.append(
+                    f"supersede_last skipped: the best scope-wide match "
+                    f"{target_id} belongs to entity {found_entity!r}, but the "
+                    f"new fact has no entity; pass entity={found_entity!r} or "
+                    f"supersede={target_id} to replace it explicitly. The new "
+                    f"fact was stored as an additional memory"
+                )
+            elif similarity is not None and similarity < topic_floor:
                 pool = repr(entity) if entity else "the scope"
                 warnings.append(
                     f"supersede_last skipped: no memory of "
@@ -1254,7 +1308,7 @@ def remember_batch(
             prepared.append((None, f"invalid mem_type {mem_type!r}"))
             continue
         try:
-            importance = float(fact.get("importance", 1.0))
+            importance = float(fact.get("importance", 0.5))
         except (TypeError, ValueError):
             prepared.append((None, "importance must be a number between 0.0 and 1.0"))
             continue
@@ -1453,8 +1507,14 @@ def remember_batch(
                 )
                 # Per-fact near-duplicate policy (same semantics as in
                 # `remember`): reject stores nothing, supersede replaces.
+                # A high similarity across different entities is not a
+                # duplicate; the policy must not delete the other subject.
                 fact_near_policy = spec["on_near_duplicate"]
-                if near_dup and fact_near_policy == "reject" \
+                same_fact_subject = (near_dup is not None
+                                     and _same_subject_entity(
+                                         near_dup, spec["entity"]))
+                if near_dup and same_fact_subject \
+                        and fact_near_policy == "reject" \
                         and near_dup["id"] not in superseded:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     results.append({
@@ -1473,7 +1533,8 @@ def remember_batch(
                             f"was stored"],
                     })
                     continue
-                if near_dup and fact_near_policy == "supersede" \
+                if near_dup and same_fact_subject \
+                        and fact_near_policy == "supersede" \
                         and near_dup["id"] not in superseded:
                     superseded.append(near_dup["id"])
 
@@ -1541,7 +1602,10 @@ def remember_batch(
                      # Where the fact really landed: a batch can mix scopes,
                      # so the caller has to be able to see it per fact.
                      "scope": spec["scope"],
-                     "project": (store_project or "global")}
+                     "project": (store_project or "global"),
+                     # Stable shape: a caller can read entry["warnings"]
+                     # without a key check, also when there is nothing to say.
+                     "warnings": []}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
             if scope_warning:
@@ -1553,7 +1617,8 @@ def remember_batch(
                     "metadata carried over from the replaced memories (these "
                     "values come from the old fact; verify they still apply): "
                     + ", ".join(sorted(set(carried))))
-            if near_dup and spec["on_near_duplicate"] == "supersede":
+            if near_dup and same_fact_subject \
+                    and spec["on_near_duplicate"] == "supersede":
                 entry.setdefault("warnings", []).append(
                     f"auto-supersede: replaced near-duplicate "
                     f"{near_dup['id']} (similarity {near_dup['similarity']}) "
@@ -1563,7 +1628,7 @@ def remember_batch(
                 pass
             elif near_dup:
                 entry.setdefault("warnings", []).append(
-                    _near_duplicate_warning(near_dup))
+                    _near_duplicate_warning(near_dup, spec["entity"]))
             if cross_scope_superseded:
                 entry["cross_scope_superseded"] = cross_scope_superseded
                 entry.setdefault("warnings", []).append(
@@ -1903,6 +1968,14 @@ def update_memory(
                         "touch=true or restore=true",
                         id=memory_id)
         scope = _scope_of_table(cur, active_table)
+        # `entity=None` means "keep the current entity", not "untagged": the
+        # near-duplicate warning needs the entity the updated row will have.
+        near_entity = entity
+        if near_entity is None:
+            cur.execute(f"SELECT entity FROM {active_table} WHERE id = %s",
+                        (memory_id,))
+            row = cur.fetchone()
+            near_entity = row[0] if row else None
         near_dup = None
         if content is not None and dedupe != "off":
             # An edit must not fork a fact either: `remember` already refuses
@@ -1941,7 +2014,8 @@ def update_memory(
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
         conn.close()
-    warnings = ([_near_duplicate_warning(near_dup)] if near_dup else [])
+    warnings = ([_near_duplicate_warning(near_dup, near_entity)]
+                if near_dup else [])
     ttl_warning = _ttl_past_warning(expires_at) if expires_at is not None else None
     if ttl_warning:
         warnings.append(ttl_warning)
@@ -2244,6 +2318,13 @@ def update_batch(
                                     "error": error})
                     continue
                 scope = _scope_of_table(cur, active_table)
+                near_entity = spec["fields"].get("entity")
+                if near_entity is None:
+                    cur.execute(
+                        f"SELECT entity FROM {active_table} WHERE id = %s",
+                        (memory_id,))
+                    row = cur.fetchone()
+                    near_entity = row[0] if row else None
                 near_dup = None
                 if ("content" in spec["fields"]
                         and spec.get("dedupe") != "off"):
@@ -2293,7 +2374,8 @@ def update_batch(
                                      "status": STATUS_UPDATED,
                                      "project": scope}
             if near_dup:
-                entry["warnings"] = [_near_duplicate_warning(near_dup)]
+                entry["warnings"] = [
+                    _near_duplicate_warning(near_dup, near_entity)]
             if spec.get("ttl_warning"):
                 entry.setdefault("warnings", []).append(spec["ttl_warning"])
             results.append(entry)
@@ -2396,6 +2478,7 @@ def forget(
     conn = get_conn()
     counts = {"memories": 0, "entities": 0, "relations": 0}
     scopes: list[str] = []
+    affected_scopes: list[str] = []
     bulk_results: list[dict] = []
     try:
         cur = conn.cursor()
@@ -2617,6 +2700,7 @@ def forget(
             # project must not wipe the global facts of the same entity.
             tables = (_all_mem_tables(cur) if not project
                       else [_mem_table(project)])
+            affected_scopes = _scopes_of_tables(cur, list(dict.fromkeys(tables)))
             for tbl in dict.fromkeys(tables):
                 if not _table_exists(cur, tbl):
                     continue
@@ -2707,10 +2791,18 @@ def forget(
         extra["scopes"] = scopes
     if memory_ids:
         extra["bulk_results"] = bulk_results
+    warnings: list[str] = []
+    if entity_name and not project:
+        extra["scopes_affected"] = affected_scopes
+        if len(affected_scopes) > 1:
+            warnings.append(
+                f"forget(entity=...) without project=true touched multiple "
+                f"scopes ({', '.join(affected_scopes)}); pass project=<name> "
+                f"to restrict the removal to one scope")
     if dry_run:
         return ok(STATUS_OK, id=memory_id, entity=entity_name, counts=counts,
-                  dry_run=True, **extra,
+                  dry_run=True, **extra, warnings=warnings,
                   message=f"Would remove {target} (nothing was changed)")
     return ok(status, id=memory_id, entity=entity_name, counts=counts,
-              dry_run=False, **extra,
+              dry_run=False, **extra, warnings=warnings,
               message=f"{'Soft-forgotten' if soft else 'Deleted'} {target}")
