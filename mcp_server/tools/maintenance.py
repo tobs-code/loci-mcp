@@ -2,7 +2,8 @@ import json
 import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -123,6 +124,51 @@ def _shares_subject(a: str, b: str) -> bool:
     return bool(_subject_tokens(a) & _subject_tokens(b))
 
 
+# A scope-wide scan performs one NLI call per candidate fact; without a
+# deadline a slow or rate-limited provider makes the tool outlive the MCP
+# transport timeout and the caller sees neither the pairs judged so far nor a
+# machine-readable failure list. The budget keeps the call inside the
+# transport window and turns the cut-off into `nli_failures` + a warning.
+DEFAULT_SCAN_BUDGET_SECONDS = 25.0
+DEFAULT_NEIGHBORS_PER_FACT = 8
+DEFAULT_NLI_WORKERS = 4
+
+
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(value, high))
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(value, high))
+
+
+def _scan_budget_seconds(budget_seconds: float | None) -> float:
+    """The wall-clock budget for the NLI leg of a contradiction scan."""
+    if budget_seconds is not None:
+        return max(0.5, min(float(budget_seconds), 300.0))
+    return _env_float(
+        "CONTRADICTION_SCAN_BUDGET_SECONDS",
+        DEFAULT_SCAN_BUDGET_SECONDS, 1.0, 300.0,
+    )
+
+
+def _neighbors_per_fact() -> int:
+    return _env_int("CONTRADICTION_NEIGHBORS",
+                    DEFAULT_NEIGHBORS_PER_FACT, 1, 20)
+
+
+def _nli_workers() -> int:
+    return _env_int("CONTRADICTION_NLI_WORKERS", DEFAULT_NLI_WORKERS, 1, 16)
+
+
 def contradictions_report(entity: Annotated[
         str | None,
         Field(description="Entity to check. Without it every active memory in "
@@ -136,6 +182,15 @@ def contradictions_report(entity: Annotated[
         int,
         Field(description="Maximum number of candidate pairs to report "
                           "(default 20).")] = 20,
+    budget_seconds: Annotated[
+        float | None,
+        Field(description="Wall-clock budget for the NLI leg (default: "
+                          "CONTRADICTION_SCAN_BUDGET_SECONDS or 25s). When "
+                          "it runs out, the scan stops early and the pairs "
+                          "that were NOT judged are listed in `nli_failures` "
+                          "with `skipped: NLI time budget exhausted` instead "
+                          "of the call timing out.",
+              ge=0.5, le=300.0)] = None,
     resolve: Annotated[
         Literal["none", "newest"],
         Field(description="'none' (default) only reports. 'newest' keeps the "
@@ -174,7 +229,12 @@ def contradictions_report(entity: Annotated[
     contradiction among the checked pairs.
     When the NLI provider fails for some pairs, `nli_failures` names exactly
     which fact/neighbour ids were NOT judged (with the reason), so a partial
-    scan is never mistaken for a clean one.
+    scan is never mistaken for a clean one. The NLI leg has a wall-clock
+    budget (`budget_seconds`, default 25s): when it is exhausted the scan
+    stops early, returns the pairs judged so far, sets `budget_exhausted`
+    and records the unchecked pairs in `nli_failures` with reason
+    `skipped: NLI time budget exhausted`. Narrow the scan with `entity`,
+    lower `limit` or raise the budget to check more.
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
     try:
@@ -210,7 +270,7 @@ def contradictions_report(entity: Annotated[
             ])
 
         tables = _retrieval_tables(cur, project)
-        neighbors_per_fact = 20
+        neighbors_per_fact = _neighbors_per_fact()
         # fact id -> list of (neighbour id, neighbour content)
         checked: set[tuple[str, str]] = set()
         fact_ids = {f["id"] for f in facts}
@@ -275,8 +335,15 @@ def contradictions_report(entity: Annotated[
     nli_failures: list[dict] = []
     nli_failed: str | None = None
     checked_pairs = 0
+    skipped_fact_ids: set[str] = set()
     try:
         candidate_list = list(candidates.values())
+        budget = _scan_budget_seconds(budget_seconds)
+        deadline = time.monotonic() + budget
+        # Cap one HTTP request below the whole budget: a single slow provider
+        # reply must not consume it all, so the pool can still judge other
+        # facts before the deadline.
+        request_cap = max(1.0, min(15.0, budget))
 
         def _score_fact(item: tuple[dict, list[tuple[str, str]]]):
             fact, neighbours = item
@@ -288,34 +355,86 @@ def contradictions_report(entity: Annotated[
                 fact["content"], [n[1] for n in neighbours],
                 query_entity=fact.get("entity"),
                 document_entities=[n[2] for n in neighbours],
+                timeout=request_cap,
+                deadline=deadline,
             )
 
-        # NLI is a network round trip per fact. A scope-wide scan of a few
-        # dozen memories ran into the client timeout when the calls were
-        # strictly sequential, so a small bounded pool overlaps them. The
-        # results are still consumed in candidate order, which keeps the
-        # report deterministic.
+        # NLI is a network round trip per fact. A small bounded pool overlaps
+        # the calls, but only within `budget`: the results are consumed in
+        # candidate order and the scan stops as soon as the deadline passes.
         scores_by_fact: dict[str, tuple[list[float], str | None, list[int]]] = {}
         nli_errors: list[tuple[str, str]] = []
         nli_error_facts: dict[str, list[str]] = {}
         partials: list[str] = []
         if candidate_list:
-            workers = min(8, len(candidate_list))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(_score_fact, item)
-                           for item in candidate_list]
-                for item, future in zip(candidate_list, futures):
-                    try:
-                        scores_by_fact[item[0]["id"]] = future.result()
-                    except Exception as e:  # noqa: BLE001 - reported below
-                        nli_errors.append((item[0]["id"], str(e)))
-                        nli_error_facts[item[0]["id"]] = [
-                            neighbour[0] for neighbour in item[1]]
+            workers = min(_nli_workers(), len(candidate_list))
+            in_flight: dict[Any, tuple[dict, list[tuple[str, str]]]] = {}
+            next_index = 0
+
+            def _submit_until_full(pool: ThreadPoolExecutor) -> None:
+                nonlocal next_index
+                while (len(in_flight) < workers
+                       and next_index < len(candidate_list)
+                       and time.monotonic() < deadline):
+                    item = candidate_list[next_index]
+                    next_index += 1
+                    in_flight[pool.submit(_score_fact, item)] = item
+
+            pool = ThreadPoolExecutor(max_workers=workers)
+            try:
+                _submit_until_full(pool)
+                while in_flight:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    done, _ = wait(
+                        list(in_flight), timeout=remaining,
+                        return_when=FIRST_COMPLETED)
+                    if not done:
+                        break
+                    for future in done:
+                        item = in_flight.pop(future)
+                        try:
+                            scores_by_fact[item[0]["id"]] = future.result()
+                        except TimeoutError:
+                            skipped_fact_ids.add(item[0]["id"])
+                        except Exception as e:  # noqa: BLE001 - reported below
+                            nli_errors.append((item[0]["id"], str(e)))
+                            nli_error_facts[item[0]["id"]] = [
+                                n[0] for n in item[1]]
+                    _submit_until_full(pool)
+
+                # Deadline reached: do not wait for the requests still in
+                # flight (one may hold the socket for up to `request_cap`).
+                # They are abandoned and recorded instead of silently
+                # disappearing; the response returns inside the budget.
+                for future, item in list(in_flight.items()):
+                    future.cancel()
+                    skipped_fact_ids.add(item[0]["id"])
+                in_flight.clear()
+                for item in candidate_list[next_index:]:
+                    skipped_fact_ids.add(item[0]["id"])
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+            if skipped_fact_ids:
+                logger.warning(
+                    "contradictions_report stopped after %.1fs: %d of %d "
+                    "candidate group(s) were not judged",
+                    budget, len(skipped_fact_ids), len(candidate_list))
+
         # One targeted second pass. The provider occasionally fails a single
         # document inside an otherwise successful batch (truncated JSON,
         # transient 5xx); retrying only those documents recovers most of them
-        # instead of reporting a permanently "partial" scan.
+        # instead of reporting a permanently "partial" scan. It stays inside
+        # the same deadline.
         for fact, neighbours in candidate_list:
+            if fact["id"] in skipped_fact_ids:
+                continue
+            if time.monotonic() >= deadline:
+                if fact["id"] not in scores_by_fact:
+                    skipped_fact_ids.add(fact["id"])
+                continue
             scored = scores_by_fact.get(fact["id"])
             if scored is None:
                 indices = list(range(len(neighbours)))
@@ -328,7 +447,13 @@ def contradictions_report(entity: Annotated[
                     fact["content"], [neighbours[i][1] for i in indices],
                     query_entity=fact.get("entity"),
                     document_entities=[neighbours[i][2] for i in indices],
+                    timeout=request_cap,
+                    deadline=deadline,
                 )
+            except TimeoutError:
+                if fact["id"] not in scores_by_fact:
+                    skipped_fact_ids.add(fact["id"])
+                continue
             except Exception as e:  # noqa: BLE001 - first-pass error wins
                 logger.warning("contradictions_report NLI retry failed: %s", e)
                 continue
@@ -344,7 +469,8 @@ def contradictions_report(entity: Annotated[
             scores_by_fact[fact["id"]] = (merged, retry_partial, still_failed)
         # A fact that the retry healed is not a failure anymore.
         nli_errors = [(fact_id, error) for fact_id, error in nli_errors
-                      if fact_id not in scores_by_fact]
+                      if fact_id not in scores_by_fact
+                      and fact_id not in skipped_fact_ids]
         if nli_errors:
             nli_failed = f"NLI unavailable: {nli_errors[0][1]}"
             warnings.append(
@@ -357,13 +483,35 @@ def contradictions_report(entity: Annotated[
                     "fact_id": fact_id,
                     "neighbor_ids": nli_error_facts.get(fact_id, []),
                     "reason": error})
+        if skipped_fact_ids:
+            warnings.append(
+                f"scan incomplete: the NLI time budget of {budget:.1f}s was "
+                f"exhausted before {len(skipped_fact_ids)} of "
+                f"{len(candidate_list)} candidate fact group(s) could be "
+                f"judged; the unchecked pairs are listed in `nli_failures` "
+                f"(reason 'skipped: NLI time budget exhausted'). Narrow the "
+                f"scan with entity=..., lower limit or raise budget_seconds "
+                f"to check more")
+
+        for f, neighbours in candidate_list:
+            scored = scores_by_fact.get(f["id"])
+            if scored is None:
+                # This fact's NLI call failed or was skipped: its pairs were
+                # not judged. Reported independently of `limit`, so a
+                # truncated contradiction list never hides an unchecked pair.
+                if f["id"] in skipped_fact_ids:
+                    nli_failures.append({
+                        "fact_id": f["id"],
+                        "neighbor_ids": [n[0] for n in neighbours],
+                        "reason": "skipped: NLI time budget exhausted"})
+                continue
+            checked_pairs += len(neighbours) - len(scored[2])
 
         for f, neighbours in candidate_list:
             if len(contradictions) >= limit:
                 break
             scored = scores_by_fact.get(f["id"])
             if scored is None:
-                # This fact's NLI call failed; its pairs were not judged.
                 continue
             scores, partial, failed_indices = scored
             if partial:
@@ -378,7 +526,6 @@ def contradictions_report(entity: Annotated[
                     "neighbor_ids": [neighbours[i][0] for i in failed_indices
                                      if 0 <= i < len(neighbours)],
                     "reason": _partial_reason(partial) or "NLI unavailable"})
-            checked_pairs += len(neighbours)
             for (nid, ncontent, nentity), score in zip(neighbours, scores):
                 if len(contradictions) >= limit:
                     break
@@ -515,6 +662,8 @@ def contradictions_report(entity: Annotated[
     result: dict[str, Any] = {"count": len(contradictions),
                               "results": contradictions,
                               "resolved": resolved,
+                              "checked_pairs": checked_pairs,
+                              "budget_exhausted": bool(skipped_fact_ids),
                               "warnings": warnings}
     if resolve == "newest" and dry_run:
         result["would_resolve"] = would_resolve

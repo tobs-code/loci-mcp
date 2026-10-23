@@ -40,6 +40,9 @@ def nli_detailed(query: str,
                  documents: list[str],
                  query_entity: str | None = None,
                  document_entities: list[str | None] | None = None,
+                 *,
+                 timeout: float = 60.0,
+                 deadline: float | None = None,
                  ) -> tuple[list[float], str | None, list[int]]:
     """Return (scores, partial_error, failed_indices).
 
@@ -52,6 +55,11 @@ def nli_detailed(query: str,
 
     The optional entity labels tell the NLI model which subject each fact
     belongs to (older inference containers ignore them silently).
+
+    `timeout` bounds each HTTP request; `deadline` (a `time.monotonic()`
+    value) bounds the whole call, including retries. A caller that scans many
+    memories uses it to stay inside its own request budget instead of being
+    cut off by the transport timeout.
     """
     if not documents:
         return [], None, []
@@ -70,10 +78,16 @@ def nli_detailed(query: str,
             # immediate resend would most likely hit the very same transient
             # state again.
             time.sleep(0.5 * attempt)
+        request_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("NLI time budget exhausted")
+            request_timeout = max(0.5, min(timeout, remaining))
         resp = _get_session().post(
             f"{INFERENCE_URL}/nli",
             json=body,
-            timeout=60,
+            timeout=request_timeout,
         )
         resp.raise_for_status()
         try:

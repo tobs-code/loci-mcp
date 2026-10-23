@@ -229,6 +229,31 @@ def test_classify_falls_back_to_json_object(monkeypatch):
     assert formats[1] == {"type": "json_object"}
 
 
+def test_classify_retries_groq_json_validate_failed(monkeypatch):
+    # Groq's strict structured output intermittently rejects the model's own
+    # empty generation as 400 json_validate_failed. That is transient, so the
+    # SAME format is retried instead of falling back immediately.
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json.get("response_format"))
+        if len(calls) == 1:
+            return FakeResponse(
+                status_code=400,
+                text='{"error":{"code":"json_validate_failed",'
+                     '"failed_generation":""}}')
+        return FakeResponse(payload=_chat_payload(score=0.88))
+
+    monkeypatch.setattr("inference.llm.requests.post", fake_post)
+    monkeypatch.setattr("inference.llm.time.sleep", lambda s: None)
+    config = load_config({"LLM_PROVIDER": "openai", "LLM_API_KEY": "sk-test"})
+
+    assert classify(config, "A", "B") == 0.88
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0]["type"] == "json_schema"
+
+
 def test_classify_supports_anthropic_responses(monkeypatch):
     def fake_post(url, headers=None, json=None, timeout=None):
         return FakeResponse(payload={

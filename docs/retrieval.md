@@ -206,15 +206,23 @@ and warns about the broader comparison, so it is never silent.
    superseded pairs are done and not re-checked). Without an entity the scan
    is scope-wide: all active memories compete, so pairs across different
    entities are reported too.
-2. **Vector self-join**: for each memory, the 20 nearest neighbours are fetched
-   via `ORDER BY embedding <=>`.
+2. **Vector self-join**: for each memory, the 8 nearest neighbours per
+   searched scope table (project + global) are fetched via
+   `ORDER BY embedding <=>` (`CONTRADICTION_NEIGHBORS`, 1-20).
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
-   memory, not one call per pair. The calls run in a bounded pool (8 workers)
-   and are reported in candidate order; a scope-wide scan used to hit the
-   client timeout when every call ran sequentially.
-4. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
+   memory, not one call per pair. The calls run in a bounded pool (4 workers,
+   `CONTRADICTION_NLI_WORKERS`) and are reported in candidate order.
+4. The NLI leg has a wall-clock budget (`budget_seconds`, default 25s or
+   `CONTRADICTION_SCAN_BUDGET_SECONDS`). When it runs out the scan stops early,
+   returns the pairs judged so far, sets `budget_exhausted: true` and lists
+   every unchecked pair in `nli_failures` with
+   `reason: "skipped: NLI time budget exhausted"`. The transport call no
+   longer dies with a timeout, so a partial scan is visible and machine
+   readable. Narrow the scan (`entity`, lower `limit`) or raise the budget to
+   check more.
+5. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
    the entity of both facts and a `cross_entity` flag.
-5. `resolve="newest"` (opt-in) keeps the most recently updated memory of
+6. `resolve="newest"` (opt-in) keeps the most recently updated memory of
    each pair of the **same entity** active and supersedes the older one; the
    pair reports `resolution` with the `superseded` and `kept` ids. Both
    untagged facts count as the same subject. **Cross-entity pairs are never
@@ -229,8 +237,9 @@ and warns about the broader comparison, so it is never silent.
 The quality of the detection depends on the embedding model
 (`jina-embeddings-v5`), which provides good similarity values for semantically
 similar texts. Distracting prefixes such as `Batch-X: ` in the content destroy
-the similarity and should be avoided. If necessary, increase
-`neighbors_per_fact` in `contradictions_report`.
+the similarity and should be avoided. If necessary, raise
+`CONTRADICTION_NEIGHBORS` (or pass a larger `budget_seconds`, so more of the
+candidate groups are actually judged).
 
 The NLI prompt first asks the model to decide whether both facts describe
 the **same subject** at all; a differing attribute (environment, host, port,

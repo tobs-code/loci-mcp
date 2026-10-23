@@ -75,7 +75,7 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`. Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only; cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. Partial NLI failures are named in `nli_failures`. |
+| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`, `budget_seconds` (NLI wall-clock budget, default 25s). Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only; cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. When the budget runs out the scan stops early, sets `budget_exhausted` and lists every unjudged pair in `nli_failures` (`reason: skipped: NLI time budget exhausted`); other NLI failures are named there too. |
 | `export_memories` | Backup in `data`. `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`. JSON includes the graph; JSONL is flat and warns that `include_graph` was ignored. `entity` narrows the graph too; the other memory filters do not and warn. Warns about excluded history and included expired rows. |
 | `import_memories` | Restore `data` (object or JSON string). `project`, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`. Keeps ids and timestamps; re-import is idempotent. Skips are split into `skipped_reasons`. Broken metadata is reported per record and skipped. `dry_run` adds `would_create`; dangling supersede links left by a partial backup are cleared with a warning. |
 | `verify_integrity` | Find rows hidden by a broken `superseded_by` (target missing or self), report supersede chains and expired active rows. `project`, `fix` (clear broken links), `limit`. `fix=true` never deletes content or restores a valid supersede. |
@@ -248,8 +248,13 @@ counts and health.
     compete and the answer sets `contradictions.cross_entity = true` plus a
     warning.
   - `contradictions_report` loads up to 200 active memories (entity-scoped or
-    scope-wide), fetches 20 neighbours per memory and NLI-checks the
-    deduplicated pairs. Calls run in a small worker pool.
+    scope-wide), fetches 8 neighbours per memory per searched scope table
+    (`CONTRADICTION_NEIGHBORS`) and NLI-checks the deduplicated pairs in a
+    bounded pool (4 workers). The NLI leg has a wall-clock budget
+    (`budget_seconds`, default 25s or `CONTRADICTION_SCAN_BUDGET_SECONDS`); when it runs out the scan stops
+    early, sets `budget_exhausted` and names every unjudged pair in
+    `nli_failures` (`reason: skipped: NLI time budget exhausted`) instead of
+    letting the MCP call time out.
 - Candidates are not restricted to `mem_type="fact"`.
 - A score of 0.7 or higher is a contradiction. Auto-supersede marks the old
   memory with `superseded_by = new_id`; with `resolve="newest"` the older
@@ -262,10 +267,10 @@ counts and health.
   two pattern instances the same subject.
 - NLI outages are surfaced: `/nli` sets `error` when no score is a real
   judgment; the client raises. Unparseable JSON is retried once (logged); the
-  inference side also retries with backoff when the whole `classify` call hits
-  a transient failure (429/5xx, timeout or connection error - 3 attempts, then
-  the provider-level `json_schema`/`json_object`/plain fallback). A partial
-  failure sets `partial_error`/`failed`; `contradictions_report`
+  inference side also retries with backoff (3 attempts) on 429/5xx, timeout,
+  connection error and Groq's transient `400 json_validate_failed`/`tool_use_failed`,
+  then falls back through provider-level `json_schema`/`json_object`/plain. A
+  partial failure sets `partial_error`/`failed`; `contradictions_report`
   reports an incomplete scan and names `nli_failures`. Write tools keep the
   fact and warn (`contradiction check skipped: NLI unavailable: ...`) in
   `warnings` and `contradictions.skipped`. Zero scores are always trustworthy.

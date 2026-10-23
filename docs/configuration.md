@@ -19,6 +19,9 @@
 | `OPENAI_API_KEY` | – | Used when `LLM_PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | – | Used when `LLM_PROVIDER=anthropic` |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
+| `CONTRADICTION_SCAN_BUDGET_SECONDS` | `25` | Wall-clock budget for the NLI leg of `contradictions_report`; on exhaustion the scan stops early and names unjudged pairs in `nli_failures` |
+| `CONTRADICTION_NEIGHBORS` | `8` | Vector neighbours fetched per memory per searched scope table (1-20) |
+| `CONTRADICTION_NLI_WORKERS` | `4` | Bounded concurrency of the NLI calls (1-16) |
 
 ## LLM providers
 

@@ -389,7 +389,21 @@ def classify(config: LLMConfig, query: str, document: str,
                 resp = requests.post(url, headers=headers, json=body, timeout=60)
                 if resp.status_code >= 400:
                     last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    if resp.status_code in RETRYABLE_HTTP_STATUS:
+                    # Groq's strict structured output intermittently rejects
+                    # the model's own (often empty) generation as
+                    # `json_validate_failed`. That is a transient generation
+                    # failure, not a bad request: retry the same format. A
+                    # real 400 (bad model, bad parameter) is still not
+                    # retried and falls through to the next format.
+                    transient_generation = (
+                        resp.status_code == 400
+                        and any(marker in resp.text
+                                for marker in ("json_validate_failed",
+                                               "tool_use_failed",
+                                               "failed_generation"))
+                    )
+                    if (resp.status_code in RETRYABLE_HTTP_STATUS
+                            or transient_generation):
                         continue
                     break
                 parsed = parse_nli_json(extract_text(config, resp.json()))
