@@ -111,8 +111,8 @@ TOOLS BY TASK
 - Maintenance/backup: `server_health`, `contradictions_report`,
   `export_memories`, `import_memories`, `verify_integrity`, `drop_project`.
 
-`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (13 tools);
-the default `full` exposes all 21 (batch, backup and repair included).
+`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14 tools);
+the default `full` exposes all 22 (batch, backup and repair included).
 
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.

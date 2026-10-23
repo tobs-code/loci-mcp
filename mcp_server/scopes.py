@@ -385,6 +385,18 @@ def _project_has_memories(cur, project: str | None) -> bool:
     return _table_exists(cur, f"mem_{_project_suffix(project)}")
 
 
+def _project_exists(cur, project: str | None) -> bool:
+    """True when the scope already exists (the global scope always does).
+
+    Write tools call this before `_ensure_project_table` so they can tell the
+    caller that the project was created by *this* write instead of silently
+    inventing a scope from a typo.
+    """
+    if project is None:
+        return True
+    return _table_exists(cur, f"mem_{_project_suffix(project)}")
+
+
 def _unknown_project_warning(cur, project: str | None) -> str | None:
     """A warning for a project scope that holds no memories of its own.
 

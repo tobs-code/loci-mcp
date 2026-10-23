@@ -30,6 +30,11 @@ NLI_INSTRUCTION = (
     "referring to its own item) name no shared concrete object and stay "
     "neutral even when only one word differs. Answer contradiction only "
     "when both facts clearly refer to the very same item or object. "
+    "Both facts must state the SAME attribute of that item for a value "
+    "difference to be a contradiction: 'API version is 2.3.1' vs 'API "
+    "version is 3.0.0' contradicts (same attribute, different value), but "
+    "'API version is 2.3.1' vs 'deployment runs through GitHub Actions' "
+    "does not (different attributes/aspects, both can be true). "
     "Respond in JSON with keys 'label' (one of: contradiction, entailment, "
     "neutral) and 'score' (0.0-1.0)."
 )
@@ -255,6 +260,24 @@ def _loose_nli_object(text: str) -> dict | None:
     return {"label": label, "score": score}
 
 
+_BARE_LABELS = {"contradiction", "neutral", "entailment"}
+
+
+def _bare_label_object(text: str) -> dict | None:
+    """A reply that is only the label word, e.g. `contradiction` or `"neutral"`.
+
+    Some providers ignore the JSON instruction on retries and answer with the
+    bare class name. Only an exact (quoted or unquoted) label is accepted; a
+    sentence that merely contains the word is not, because "not a
+    contradiction" would otherwise turn into a contradiction.
+    """
+    cleaned = text.strip().strip("`'\"").strip().lower()
+    if cleaned in _BARE_LABELS:
+        return {"label": cleaned,
+                "score": 0.9 if cleaned == "contradiction" else 0.0}
+    return None
+
+
 def parse_nli_json(raw: str | None) -> dict | None:
     if not raw:
         return None
@@ -275,7 +298,7 @@ def parse_nli_json(raw: str | None) -> dict | None:
                 parsed = None
     if isinstance(parsed, dict):
         return parsed
-    return _loose_nli_object(text)
+    return _loose_nli_object(text) or _bare_label_object(text)
 
 
 def nli_score(payload: dict | None) -> float:

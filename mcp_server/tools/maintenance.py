@@ -91,6 +91,38 @@ def _entities_differ(a: str | None, b: str | None) -> bool:
     return a.strip().lower() != b.strip().lower()
 
 
+# Words that carry no subject: they occur in almost every fact, so a shared
+# "the"/"ist"/"with" must not look like evidence that two facts talk about the
+# same thing.
+_SUBJECT_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "into", "are", "was",
+    "were", "has", "have", "had", "not", "but", "its", "his", "her", "their",
+    "der", "die", "das", "und", "oder", "ist", "sind", "war", "waren", "ein",
+    "eine", "einer", "eines", "mit", "von", "für", "fuer", "auf", "aus", "bei",
+    "nicht", "kein", "keine", "über", "ueber", "unter", "wird", "werden",
+    "wurde", "wurden", "sich", "auch", "noch", "nur", "als", "wie", "dass",
+    "nach", "vor", "zum", "zur", "im", "in", "an", "am", "es", "sie", "er",
+}
+
+
+def _subject_tokens(text: str) -> set[str]:
+    """Lower-cased content words of a fact (stopwords removed)."""
+    tokens = re.findall(r"[0-9A-Za-zÄÖÜäöüß][0-9A-Za-zÄÖÜäöüß_.-]*", text or "")
+    return {t.lower() for t in tokens
+            if t.lower() not in _SUBJECT_STOPWORDS and len(t) > 1}
+
+
+def _shares_subject(a: str, b: str) -> bool:
+    """True when two facts share at least one content word.
+
+    A recency-based auto-resolve is only defensible for facts that clearly
+    talk about the same thing. Two unrelated statements can still be scored
+    as a contradiction by a noisy NLI model; requiring a shared content word
+    keeps that mistake from silently invalidating a correct memory.
+    """
+    return bool(_subject_tokens(a) & _subject_tokens(b))
+
+
 def contradictions_report(entity: Annotated[
         str | None,
         Field(description="Entity to check. Without it every active memory in "
@@ -112,7 +144,22 @@ def contradictions_report(entity: Annotated[
                           "cross-entity pairs are reported (cross_entity: "
                           "true) but never auto-resolved, because recency "
                           "says nothing about which fact is correct when the "
-                          "entities differ.")] = "none",
+                          "entities differ. Pairs without a shared content "
+                          "word and pairs below `resolve_min_confidence` are "
+                          "also left untouched.")] = "none",
+    dry_run: Annotated[
+        bool,
+        Field(description="With resolve='newest': report what would be "
+                          "superseded (`would_resolve`, pair `resolution` "
+                          "with dry_run=true) without changing anything. "
+                          "Ignored for resolve='none'.")] = False,
+    resolve_min_confidence: Annotated[
+        float,
+        Field(description="Minimum NLI confidence for an auto-resolve "
+                          "(default 0.80). Higher than the reporting "
+                          "threshold on purpose: a questionable pair may be "
+                          "reported but must not invalidate a memory.",
+              ge=0.0, le=1.0)] = 0.8,
 ) -> dict[str, Any]:
     """Find potentially conflicting facts stored for the same entity.
 
@@ -264,6 +311,40 @@ def contradictions_report(entity: Annotated[
                         nli_errors.append((item[0]["id"], str(e)))
                         nli_error_facts[item[0]["id"]] = [
                             neighbour[0] for neighbour in item[1]]
+        # One targeted second pass. The provider occasionally fails a single
+        # document inside an otherwise successful batch (truncated JSON,
+        # transient 5xx); retrying only those documents recovers most of them
+        # instead of reporting a permanently "partial" scan.
+        for fact, neighbours in candidate_list:
+            scored = scores_by_fact.get(fact["id"])
+            if scored is None:
+                indices = list(range(len(neighbours)))
+            else:
+                _scores, _partial, indices = scored
+            if not indices:
+                continue
+            try:
+                retry_scores, retry_partial, retry_failed = nli_detailed(
+                    fact["content"], [neighbours[i][1] for i in indices],
+                    query_entity=fact.get("entity"),
+                    document_entities=[neighbours[i][2] for i in indices],
+                )
+            except Exception as e:  # noqa: BLE001 - first-pass error wins
+                logger.warning("contradictions_report NLI retry failed: %s", e)
+                continue
+            if scored is None:
+                merged = [0.0] * len(neighbours)
+            else:
+                merged = list(scored[0])
+            for position, index in enumerate(indices):
+                merged[index] = retry_scores[position]
+            still_failed = [indices[position]
+                            for position in retry_failed
+                            if 0 <= position < len(indices)]
+            scores_by_fact[fact["id"]] = (merged, retry_partial, still_failed)
+        # A fact that the retry healed is not a failure anymore.
+        nli_errors = [(fact_id, error) for fact_id, error in nli_errors
+                      if fact_id not in scores_by_fact]
         if nli_errors:
             nli_failed = f"NLI unavailable: {nli_errors[0][1]}"
             warnings.append(
@@ -342,15 +423,44 @@ def contradictions_report(entity: Annotated[
                 f"{scope_desc} were checked with NLI")
 
     resolved = 0
+    would_resolve = 0
     if resolve == "newest" and contradictions:
-        resolvable = [p for p in contradictions if not p.get("cross_entity")]
-        skipped_cross = len(contradictions) - len(resolvable)
+        resolvable: list[dict] = []
+        skipped_cross = 0
+        skipped_subject = 0
+        skipped_weak = 0
+        for pair in contradictions:
+            if pair.get("cross_entity"):
+                skipped_cross += 1
+                continue
+            if pair.get("confidence", 0.0) < resolve_min_confidence:
+                skipped_weak += 1
+                continue
+            if not _shares_subject(pair["a"]["content"],
+                                   pair["b"]["content"]):
+                # A noisy NLI hit between unrelated statements must never
+                # invalidate a good memory (a version fact was once
+                # superseded as a "contradiction" of a deploy note).
+                skipped_subject += 1
+                continue
+            resolvable.append(pair)
         if skipped_cross:
             warnings.append(
                 f"resolve skipped for {skipped_cross} cross-entity pair(s): "
                 f"the two facts belong to different entities, so recency does "
                 f"not decide which one survives - inspect them manually or "
                 f"re-run with an entity filter")
+        if skipped_subject:
+            warnings.append(
+                f"resolve skipped for {skipped_subject} pair(s) without a "
+                f"shared content word: the NLI score alone is not enough "
+                f"evidence that both facts describe the same thing; inspect "
+                f"them manually")
+        if skipped_weak:
+            warnings.append(
+                f"resolve skipped for {skipped_weak} pair(s) below "
+                f"resolve_min_confidence={resolve_min_confidence}: they are "
+                f"reported but not acted on")
         if resolvable:
             conn = get_conn()
             try:
@@ -373,6 +483,15 @@ def contradictions_report(entity: Annotated[
                     b_ts = timestamps.get(b_id)
                     keep_a = a_ts is not None and (b_ts is None or a_ts >= b_ts)
                     older, newer = (b_id, a_id) if keep_a else (a_id, b_id)
+                    if dry_run:
+                        # Report the decision without writing it: the caller
+                        # sees exactly what a real run would invalidate.
+                        would_resolve += 1
+                        pair["resolution"] = {
+                            "superseded": older, "kept": newer,
+                            "dry_run": True,
+                        }
+                        continue
                     changed = 0
                     for table in tables:
                         cur.execute(
@@ -397,6 +516,9 @@ def contradictions_report(entity: Annotated[
                               "results": contradictions,
                               "resolved": resolved,
                               "warnings": warnings}
+    if resolve == "newest" and dry_run:
+        result["would_resolve"] = would_resolve
+        result["dry_run"] = True
     if nli_failures:
         # Which pairs were NOT judged, per fact. A stale inference container
         # that does not send `failed_indices` leaves this empty; the

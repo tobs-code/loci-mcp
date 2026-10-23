@@ -167,10 +167,11 @@ mutually exclusive.
 | Tool | Description |
 |------|-------------|
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total` and `relation_context_count` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden |
-| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, `projects`/`project_stats` for every scope, graph entity count, health; `detail="slim"\|"full"`, `include_global`, `include_empty_projects`; `project="*"` lists every scope |
+| `list_projects` | Discover every scope; `include_empty` (default true), `include_counts` (default true); each row carries `project`, `scope`, `has_table`, `has_graph` and memory/entity/relation counts |
+| `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, `projects`/`project_stats` for every scope, graph entity count, health; `detail="slim"\|"full"`, `include_global`, `include_empty_projects`; `project="*"` lists every scope; without a project it warns about the other scopes |
 
 ### `recall`
 
@@ -324,7 +325,7 @@ the graph nodes of the covered scopes, not of the whole database.
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older, cross-entity pairs stay active (warning); a partially failed NLI names the unjudged pairs in `nli_failures` (`fact_id`, `neighbor_ids`, `reason`) |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older; cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; a partially failed NLI names the unjudged pairs in `nli_failures` (`fact_id`, `neighbor_ids`, `reason`) |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows |
 | `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`); IDs, TTL and timestamps are preserved; an id that already exists is always skipped; `dry_run` validates without writing and adds `would_create`; dangling supersede links are cleared with a warning; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
@@ -336,10 +337,10 @@ See [Backup & Restore](backup.md) for the export/import contract and
 
 ## Toolset profiles
 
-`MCP_TOOLSET=core` registers 13 tools: `remember`, `remember_batch`,
+`MCP_TOOLSET=core` registers 14 tools: `remember`, `remember_batch`,
 `update_memory`, `forget`, `recall`, `list_memories`, `get_entity`,
-`list_entities`, `init_context`, `relate`, `unrelate`, `find_connections` and
-`find_paths`. The default `full` registers all 21, adding `update_batch`,
+`list_entities`, `list_projects`, `init_context`, `relate`, `unrelate`,
+`find_connections` and `find_paths`. The default `full` registers all 22, adding `update_batch`,
 `relate_batch`, `contradictions_report`, `export_memories`, `import_memories`,
 `verify_integrity`, `drop_project` and `server_health`. An unknown value warns
 and falls back to `full`; `server_health` reports the active `toolset`.

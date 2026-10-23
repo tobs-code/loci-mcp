@@ -465,6 +465,7 @@ def recall(
     # path (a decay-filtered hit was reported as "below min_similarity").
     filtered_out = stats.get("dropped_by_similarity", 0)
     dropped_by_coverage = stats.get("dropped_by_coverage", 0)
+    dropped_by_cross_scope = stats.get("dropped_by_cross_scope_duplicate", 0)
     candidates = stats.get("candidates", 0)
     best_dropped = stats.get("best_dropped_by_similarity")
     if not rows and offset > 0 and candidates:
@@ -494,6 +495,10 @@ def recall(
             reasons.append(
                 f"{dropped_by_superseded} hit(s) were not superseded "
                 f"(only_superseded=true)")
+        if dropped_by_cross_scope:
+            reasons.append(
+                f"{dropped_by_cross_scope} active hit(s) were identical copies "
+                f"in another scope and were deduplicated")
         if metadata_filter:
             reasons.append(
                 f"metadata_filter={metadata_filter!r} may have excluded the "
@@ -559,6 +564,15 @@ def recall(
         payload["dropped_by_superseded"] = dropped_by_superseded
     if stats.get("fulltext_only"):
         payload["fulltext_only"] = stats["fulltext_only"]
+    if dropped_by_cross_scope:
+        # Silent dedup made a cross-scope copy look like a missing memory:
+        # report the count so the caller can retry inside the other scope.
+        payload["dropped_by_cross_scope_duplicate"] = dropped_by_cross_scope
+        if rows:
+            warnings.append(
+                f"{dropped_by_cross_scope} active hit(s) were hidden as "
+                f"identical copies in another scope; search that scope "
+                f"directly to see it")
     return ok(STATUS_OK, count=len(rows), results=rows, warnings=warnings,
               **payload)
 
@@ -642,6 +656,12 @@ def list_memories(
                           "They are stored under the synthetic entity "
                           "'<from>_<relation>_<to>' and repeat what the edge "
                           "already says.")] = True,
+    include_duplicates: Annotated[
+        bool,
+        Field(description="False (default) lists one active copy of identical "
+                          "content even when it exists in several scopes. "
+                          "True lists every copy, so a browse across scopes "
+                          "shows each scope's row.")] = False,
 ) -> dict[str, Any]:
     """Browse stored memories without a search query.
 
@@ -665,6 +685,9 @@ def list_memories(
     `include_relation_context=False` hides the relation-context sentences of
     the graph edges. A project that does not exist is reported in `warnings`:
     the browse then only covered the global scope.
+    Identical content that exists in several scopes is listed once; the answer
+    says in `warnings` how many copies were hidden. Pass
+    `include_duplicates=True` to see every copy.
     """
     logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
                 entity, mem_type, limit, offset, project)
@@ -806,7 +829,13 @@ def list_memories(
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
-    unique = _dedup_rows_across_scopes(index_rows)
+    unique, hidden_duplicates = _dedup_rows_across_scopes(
+        index_rows, include_duplicates)
+    if hidden_duplicates:
+        warnings.append(
+            f"{hidden_duplicates} active memory/memories were hidden because "
+            f"identical content exists in another scope; only one copy is "
+            f"listed. Pass include_duplicates=true to list every copy")
     unique.sort(key=lambda r: (r.get("_order") is not None,
                                 r.get("_order"),
                                 str(r.get("id") or "")), reverse=True)
@@ -879,6 +908,7 @@ def list_memories(
     return ok(STATUS_OK, count=len(results), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
+              duplicates_hidden=hidden_duplicates,
               warnings=warnings, results=results)
 
 
@@ -1532,7 +1562,9 @@ def init_context(project: Annotated[
     without active memories.
     `graph_entities_count` counts the graph nodes of the covered scopes.
     """
+    raw_project = project
     all_projects = project == "*"
+    explicit_scope = bool(raw_project and str(raw_project).strip())
     try:
         project = None if all_projects else _norm_project(project)
     except ValueError as e:
@@ -1568,6 +1600,17 @@ def init_context(project: Annotated[
         # one. Without it the caller cannot see that global memories were
         # part of the answer.
         projects = list(scope_names)
+        if not all_projects and not explicit_scope:
+            # The default bootstrap only shows the shared scope. A session
+            # start that reports "0 memories" while a dozen project facts
+            # exist must not look like an empty database.
+            other_scopes = [s for s in _scopes_of_tables(cur, _all_mem_tables(cur))
+                            if s not in scope_names]
+            if other_scopes:
+                warnings.append(
+                    f"only the global scope was summarized; other scopes "
+                    f"exist ({', '.join(other_scopes)}) - pass project='*' to "
+                    f"bootstrap all of them")
         project_stats: list[dict[str, Any]] = []
         for table, scope in zip(tables, scope_names):
             cur.execute(

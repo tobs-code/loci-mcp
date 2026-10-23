@@ -19,7 +19,9 @@ from mcp_server.storage import clear_dangling_supersede
 from mcp_server.scopes import (
     _mem_table,
     _norm_project,
+    _project_names,
     _project_suffix,
+    _project_tables,
     _scope_label,
     _scope_key,
     _table_exists,
@@ -134,3 +136,106 @@ def drop_project(
                        f"({counts['memories']} memories, "
                        f"{counts['entities']} entities, "
                        f"{counts['relations']} relations)"))
+
+def list_projects(
+    include_empty: Annotated[
+        bool,
+        Field(description="True (default) lists every known scope, including "
+                          "ones without memories. False lists only scopes with "
+                          "active memories or graph data.")] = True,
+    include_counts: Annotated[
+        bool,
+        Field(description="True (default) reports per-scope memory, entity and "
+                          "relation counts.")] = True,
+) -> dict[str, Any]:
+    """List every project scope (and the shared global one).
+
+    A project exists as soon as a write created its table (or `relate` created
+    graph nodes for it). The shared scope is reported as `global`. This is the
+    discovery tool for `recall`, `list_memories` and `init_context`: a caller
+    that does not know the project names would otherwise have to guess them
+    with `init_context(project='*')`.
+
+    `project` on every row is the value to pass to the other tools (`global`
+    for the shared scope). `has_table=False` marks a graph-only scope.
+    """
+    logger.info("list_projects include_empty=%s", include_empty)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        names = _project_names(cur)
+        table_scopes = {
+            table: (names.get(table[len("mem_"):], table[len("mem_"):]))
+            for table in _project_tables(cur)
+        }
+        cur.execute("SELECT DISTINCT project FROM entities")
+        graph_scopes = {row[0] for row in cur.fetchall() if row[0]}
+        # Relations have no project column of their own: their scope is the
+        # scope of the entities they connect.
+        cur.execute(
+            "SELECT DISTINCT e.project FROM relations r "
+            "JOIN entities e ON e.id = r.source_id")
+        graph_scopes |= {row[0] for row in cur.fetchall() if row[0]}
+
+        scopes = ["global"] + sorted(
+            set(table_scopes.values()) | {s for s in graph_scopes
+                                           if s != "global"},
+            key=str.casefold)
+        rows: list[dict[str, Any]] = []
+        for scope in scopes:
+            table = ("memories" if scope == "global"
+                     else _mem_table(scope))
+            has_table = scope == "global" or table in table_scopes
+            counts = {"memories": 0, "total_memories": 0,
+                      "superseded_memories": 0, "forgotten_memories": 0,
+                      "entities": 0, "relations": 0}
+            if has_table:
+                if include_counts:
+                    cur.execute(
+                        f"SELECT COUNT(*), "
+                        f"COUNT(*) FILTER (WHERE superseded_by IS NULL "
+                        f"AND deleted_at IS NULL), "
+                        f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
+                        f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
+                        f"FROM {table}")
+                    total, active, superseded, forgotten = cur.fetchone()
+                    counts.update({
+                        "memories": active, "total_memories": total,
+                        "superseded_memories": superseded,
+                        "forgotten_memories": forgotten,
+                    })
+                else:
+                    # `include_empty=False` still needs to know whether the
+                    # scope holds an active memory, so this one count runs
+                    # even when the full report is off.
+                    cur.execute(
+                        f"SELECT COUNT(*) FILTER (WHERE superseded_by IS NULL "
+                        f"AND deleted_at IS NULL) FROM {table}")
+                    counts["memories"] = cur.fetchone()[0]
+                if include_counts:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM entities WHERE project = %s",
+                        (scope,))
+                    counts["entities"] = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT COUNT(*) FROM relations WHERE source_id IN "
+                        "(SELECT id FROM entities WHERE project = %s) OR "
+                        "target_id IN (SELECT id FROM entities WHERE project = %s)",
+                        (scope, scope))
+                    counts["relations"] = cur.fetchone()[0]
+            has_graph = scope in graph_scopes
+            if include_empty or counts["memories"] > 0 or has_graph:
+                rows.append({
+                    "project": scope,
+                    "scope": "global" if scope == "global" else "project",
+                    "has_table": has_table,
+                    "has_graph": has_graph,
+                    **counts,
+                })
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+    return ok(STATUS_OK, count=len(rows), results=rows, projects=rows)

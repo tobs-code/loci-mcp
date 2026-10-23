@@ -34,7 +34,7 @@ from mcp_server.tools.read import (
     list_memories,
     recall,
 )
-from mcp_server.tools.scopes import drop_project
+from mcp_server.tools.scopes import drop_project, list_projects
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ _CORE_TOOL_NAMES = frozenset({
     "list_memories",
     "get_entity",
     "list_entities",
+    "list_projects",
     "init_context",
     "relate",
     "unrelate",
@@ -64,6 +65,7 @@ _ALL_TOOLS = (
     list_memories,
     get_entity,
     list_entities,
+    list_projects,
     init_context,
     relate,
     relate_batch,
@@ -78,8 +80,8 @@ _ALL_TOOLS = (
     drop_project,
 )
 
-# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (13
-# tools); `full` (default) exposes all 21. Maintenance and batch tools are
+# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14
+# tools); `full` (default) exposes all 22. Maintenance and batch tools are
 # full-only, which keeps the per-turn schema small for interactive agents.
 _toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
 if _toolset == "core":

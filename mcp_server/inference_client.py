@@ -62,13 +62,14 @@ def nli_detailed(query: str,
         body["document_entities"] = document_entities
     last_error: str | None = None
     # A provider occasionally returns unparseable JSON. That is a transient
-    # model/format hiccup, not an outage: retry once instead of reporting the
-    # whole contradiction scan as incomplete.
-    for attempt in range(2):
+    # model/format hiccup, not an outage: retry twice instead of reporting
+    # the whole contradiction scan as incomplete on the first hiccup.
+    for attempt in range(3):
         if attempt:
-            # A short pause before the retry: the same immediate resend
-            # would most likely hit the very same transient state again.
-            time.sleep(0.5)
+            # A short pause with linear backoff before the retry: the same
+            # immediate resend would most likely hit the very same transient
+            # state again.
+            time.sleep(0.5 * attempt)
         resp = _get_session().post(
             f"{INFERENCE_URL}/nli",
             json=body,
@@ -79,8 +80,8 @@ def nli_detailed(query: str,
             payload = resp.json()
         except ValueError as e:
             last_error = f"response was not valid NLI JSON: {e}"
-            if attempt == 0:
-                logger.warning("NLI response invalid, retrying once: %s",
+            if attempt < 2:
+                logger.warning("NLI response invalid, retrying: %s",
                                last_error)
                 continue
             raise RuntimeError(last_error) from e
@@ -101,9 +102,8 @@ def nli_detailed(query: str,
                      "document")
         last_error = str(error)
         retryable = "json" in last_error.lower() or "parse" in last_error.lower()
-        if attempt == 0 and retryable:
-            logger.warning("NLI response invalid, retrying once: %s",
-                           last_error)
+        if attempt < 2 and retryable:
+            logger.warning("NLI response invalid, retrying: %s", last_error)
             continue
         # The scores are zeros from a failed run, not a real judgment:
         # callers must surface this instead of trusting 0.0 as "neutral".

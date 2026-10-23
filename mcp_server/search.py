@@ -61,8 +61,34 @@ def _note_dropped_candidate(
     dropped.update({
         "id": row_id,
         "similarity": round(similarity, 4),
+        # The raw table is kept for the preview lookup; `scope` is replaced by
+        # the readable project name in `_decorate_best_dropped`.
         "scope": "global" if table == "memories" else table[4:] or "global",
+        "_table": table,
     })
+
+
+def _decorate_best_dropped(cur, dropped: dict[str, Any] | None,
+                           result_ids: set[str] | None = None) -> None:
+    """Report the project name and drop a candidate that is already visible.
+
+    The internal table suffix (`test_project_05f71b6a`) means nothing to a
+    caller; the registry name (`test-project`) does. A hit that ended up in
+    the result set is not "dropped" and must not be advertised as a rejected
+    match, otherwise the hint contradicts the response.
+    """
+    if not dropped:
+        return
+    if result_ids and dropped.get("id") in result_ids:
+        dropped.clear()
+        return
+    names = _project_names(cur)
+    table = dropped.pop("_table", None)
+    if table and table != "memories":
+        suffix = table[len("mem_"):]
+        dropped["scope"] = names.get(suffix, dropped.get("scope") or suffix)
+    else:
+        dropped["scope"] = "global"
 
 
 
@@ -79,6 +105,9 @@ def _fill_dropped_preview(cur, table: str, row_id: str,
 
 
 def _table_of_dropped(dropped: dict[str, Any]) -> str:
+    table = dropped.get("_table")
+    if table:
+        return table
     scope = dropped.get("scope") or "global"
     return "memories" if scope == "global" else f"mem_{scope}"
 
@@ -104,7 +133,10 @@ def _skip_active_cross_scope_duplicate(
     return False
 
 
-def _dedup_rows_across_scopes(rows: list[dict]) -> list[dict]:
+def _dedup_rows_across_scopes(
+    rows: list[dict],
+    include_duplicates: bool = False,
+) -> tuple[list[dict], int]:
     """Drop active cross-scope copies of the same content.
 
     Same rule as `_skip_active_cross_scope_duplicate`, but for a complete row
@@ -112,7 +144,13 @@ def _dedup_rows_across_scopes(rows: list[dict]) -> list[dict]:
     (`dedupe="off"` deliberately allows them). An active project table wins
     over the global one; when several project tables hold the same content the
     first one wins, so a row set must be ordered project tables first.
+
+    Returns `(kept, hidden_count)`. The count matters: a browse that silently
+    lists one of two identical rows looks complete while a whole scope is
+    missing from it.
     """
+    if include_duplicates:
+        return list(rows), 0
     groups: dict[str, list[dict]] = {}
     kept: list[dict] = []
     for row in rows:
@@ -121,6 +159,7 @@ def _dedup_rows_across_scopes(rows: list[dict]) -> list[dict]:
             kept.append(row)
             continue
         groups.setdefault(c_hash, []).append(row)
+    hidden = 0
     for group in groups.values():
         def scope(row: dict) -> str:
             table = row.get("_table")
@@ -129,8 +168,12 @@ def _dedup_rows_across_scopes(rows: list[dict]) -> list[dict]:
             return row.get("_project") or "global"
         project_rows = [r for r in group if scope(r) != "global"]
         winner = scope(project_rows[0]) if project_rows else scope(group[0])
-        kept.extend(r for r in group if scope(r) == winner)
-    return kept
+        for row in group:
+            if scope(row) == winner:
+                kept.append(row)
+            else:
+                hidden += 1
+    return kept, hidden
 
 
 def _fts_lexemes(cur, query_text: str | None) -> list[str]:
@@ -277,6 +320,7 @@ def _search_memories_rrf(
     # (rank, matched_lexemes, id, table)
     text_candidates: list[tuple[float, int, str, str]] = []
     dropped_by_similarity = 0
+    dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
 
     for table in tables:
@@ -395,9 +439,12 @@ def _search_memories_rrf(
                 _fill_dropped_preview(
                     cur, _table_of_dropped(best_dropped),
                     best_dropped["id"], best_dropped)
+                _decorate_best_dropped(cur, best_dropped)
             stats.update({"candidates": 0,
                           "dropped_by_similarity": dropped_by_similarity,
                           "dropped_by_coverage": dropped_by_coverage,
+                          "dropped_by_cross_scope_duplicate":
+                              dropped_by_cross_scope_duplicate,
                           "min_coverage": FTS_MIN_COVERAGE,
                           "fulltext_only": 0})
             if best_dropped:
@@ -432,6 +479,7 @@ def _search_memories_rrf(
             if _skip_active_cross_scope_duplicate(
                 d, table, seen_active_hashes
             ):
+                dropped_by_cross_scope_duplicate += 1
                 continue
             d["_rrf_score"] = fused_scores.get(key, 0.0)
             d["_rrf_norm"] = d["_rrf_score"] / max_rrf
@@ -473,10 +521,14 @@ def _search_memories_rrf(
             _fill_dropped_preview(
                 cur, _table_of_dropped(best_dropped),
                 best_dropped["id"], best_dropped)
+            _decorate_best_dropped(cur, best_dropped,
+                                   {r.get("id") for r in rows})
         stats.update({
             "candidates": len(fused_scores),
             "dropped_by_similarity": dropped_by_similarity,
             "dropped_by_coverage": dropped_by_coverage,
+            "dropped_by_cross_scope_duplicate":
+                dropped_by_cross_scope_duplicate,
             "min_coverage": FTS_MIN_COVERAGE,
             "fulltext_only": sum(1 for key in fused_scores
                                  if key not in similarities),
@@ -559,6 +611,7 @@ def _search_memories(
     seen_active_hashes: dict[str, str] = {}
     dropped_by_similarity = 0
     dropped_by_coverage = 0
+    dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
 
     project_names = _project_names(cur)
@@ -628,20 +681,8 @@ def _search_memories(
                 d["_distance"] = float(d.pop("distance"))
                 if max_distance is not None and d["_distance"] > max_distance:
                     dropped_by_similarity += 1
-                    if best_dropped is not None:
-                        sim = 1.0 - d["_distance"]
-                        if ("similarity" not in best_dropped
-                                or sim > best_dropped["similarity"]):
-                            best_dropped.clear()
-                            best_dropped.update({
-                                "id": d["id"],
-                                "similarity": round(sim, 4),
-                                "scope": ("global" if table == "memories"
-                                          else table[4:] or "global"),
-                                "content_preview":
-                                    str(d.get("content") or "")
-                                    [:BEST_DROPPED_PREVIEW_CHARS],
-                            })
+                    _note_dropped_candidate(
+                        best_dropped, d["id"], table, 1.0 - d["_distance"])
                     continue
                 d["_similarity"] = round(1.0 - d["_distance"], 4)
             else:
@@ -662,6 +703,7 @@ def _search_memories(
             if _skip_active_cross_scope_duplicate(
                 d, table, seen_active_hashes
             ):
+                dropped_by_cross_scope_duplicate += 1
                 continue
             if not include_embedding:
                 d.pop("embedding", None)
@@ -693,11 +735,20 @@ def _search_memories(
             row["_relevance_score"] = row.get("_similarity", 0.0)
     if stats is not None:
         if best_dropped:
+            if "content_preview" not in best_dropped:
+                _fill_dropped_preview(
+                    cur, _table_of_dropped(best_dropped),
+                    best_dropped["id"], best_dropped)
+            _decorate_best_dropped(cur, best_dropped,
+                                   {r.get("id") for r in rows})
+        if best_dropped:
             stats["best_dropped_by_similarity"] = best_dropped
         stats.update({
             "candidates": len(rows),
             "dropped_by_similarity": dropped_by_similarity,
             "dropped_by_coverage": dropped_by_coverage,
+            "dropped_by_cross_scope_duplicate":
+                dropped_by_cross_scope_duplicate,
             "min_coverage": FTS_MIN_COVERAGE,
             "fulltext_only": 0,
         })
@@ -746,6 +797,12 @@ def _search_memories_graph_boost(
     tables = None
     name_json = json.dumps(entity)
     graph_entities: list[tuple[str, float]] = []
+    # Relation-context sentences are stored under the synthetic entity
+    # `<from>_<relation>_<to>`; they describe the very edge that was just
+    # traversed, so a graph expansion that ignores them loses the "why" of
+    # the connection. Both directions are tried because the match is
+    # undirected.
+    relation_entities: list[tuple[str, float]] = []
     graph_results: list[dict] = []
 
     # Dedicated connection: a failing Cypher call must not abort
@@ -774,19 +831,30 @@ def _search_memories_graph_boost(
         # 1. Find connected entities via Apache AGE (any edge direction/type)
         cur.execute("SET search_path TO ag_catalog, public")
         seen_nodes: set[str] = set()
+        seen_relation_context: set[str] = set()
         for label in labels:
             cur.execute(
                 f"SELECT * FROM cypher('memory_graph', $$ "
                 f"MATCH (a:{label} {{name: {name_json}}})-[r]-(b) "
-                f"RETURN b.name, coalesce(r.weight, 1.0) LIMIT 10 $$) AS "
-                f"(name agtype, weight agtype)"
+                f"RETURN b.name, coalesce(r.weight, 1.0), type(r), a.name "
+                f"LIMIT 10 $$) AS "
+                f"(name agtype, weight agtype, rtype agtype, source agtype)"
             )
-            for name, weight in cur.fetchall():
+            for name, weight, rtype, source in cur.fetchall():
                 node = _ag_str(name)
+                weight_value = float(str(weight))
+                relation = _ag_str(rtype)
+                source_name = _ag_str(source)
+                if relation:
+                    for ctx_name in (f"{source_name}_{relation}_{node}",
+                                     f"{node}_{relation}_{source_name}"):
+                        if ctx_name not in seen_relation_context:
+                            seen_relation_context.add(ctx_name)
+                            relation_entities.append((ctx_name, weight_value))
                 if node in seen_nodes:
                     continue
                 seen_nodes.add(node)
-                graph_entities.append((node, float(str(weight))))
+                graph_entities.append((node, weight_value))
 
         # 2. Fetch memories of connected entities
         extra_conditions, extra_params = _extra_conditions(updated_after,
@@ -797,7 +865,9 @@ def _search_memories_graph_boost(
         extra_sql = "" if not extra_conditions else " AND " + " AND ".join(extra_conditions)
         existing_ids = {r["id"] for r in existing_results}
         project_names = _project_names(cur)
-        for entity_name, weight in graph_entities:
+
+        def _collect(entity_name: str, weight: float,
+                     relation_context: bool = False) -> None:
             for table in tables:
                 cur.execute(
                     f"SELECT * FROM {table} "
@@ -820,6 +890,8 @@ def _search_memories_graph_boost(
                                      else project_names.get(table[4:], table[4:]))
                     d["_graph_weight"] = weight
                     d["_graph_source"] = entity_name
+                    if relation_context:
+                        d["_graph_relation_context"] = True
                     # Graph candidates are not retrieved by relevance: they have
                     # no similarity and no RRF contribution. Mark them as such
                     # instead of leaving the score fields undefined.
@@ -839,6 +911,11 @@ def _search_memories_graph_boost(
                         )
                     existing_ids.add(d["id"])
                     graph_results.append(d)
+
+        for entity_name, weight in graph_entities:
+            _collect(entity_name, weight)
+        for ctx_name, weight in relation_entities:
+            _collect(ctx_name, weight, relation_context=True)
 
         if not graph_entities:
             # Distinguish an isolated node (no neighbours) from a name that

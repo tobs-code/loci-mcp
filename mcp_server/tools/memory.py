@@ -38,6 +38,7 @@ from mcp_server.scopes import (
     _memory_scopes,
     _norm_entity,
     _norm_project,
+    _project_exists,
     _safe_ident,
     _scope_key,
     _scope_label,
@@ -514,8 +515,15 @@ def remember(
     conn = get_conn()
     try:
         cur = conn.cursor()
+        created_scope = bool(store_project) and not _project_exists(
+            cur, store_project)
         if store_project:
             _ensure_project_table(cur, store_project)
+        scope_warning = (
+            f"created a new project scope {store_project!r}; it did not exist "
+            f"before this write (check the name if this was a typo, otherwise "
+            f"the scope now appears in init_context(project='*'))"
+            if created_scope else None)
 
         existing = _deduplicate(cur, content, store_project, emb, fuzzy_threshold,
                                 dedupe=dedupe)
@@ -526,6 +534,8 @@ def remember(
             if mode == "exact" and dedupe == "semantic":
                 detail += "; the content hash short-circuits the semantic check"
             warnings = [f"memory already exists; nothing stored ({detail})"]
+            if scope_warning:
+                warnings.append(scope_warning)
             superseded_now: list[str] = []
             cross_now: list[str] = []
             # A duplicate must not swallow a supersede instruction: the fact is
@@ -702,6 +712,8 @@ def remember(
         warnings: list[str] = []
         warnings.extend(guard_warnings)
         warnings.extend(link_warnings)
+        if scope_warning:
+            warnings.append(scope_warning)
         if ttl_warning:
             warnings.append(ttl_warning)
         if superseded_match:
@@ -722,13 +734,13 @@ def remember(
                 f"{near_dup['id']} (similarity {near_dup['similarity']}) "
                 f"instead of storing a reworded copy")
         elif near_dup and near_dup["id"] in superseded:
-            # The explicit supersede path already replaced this memory:
-            # telling the agent to also pass supersede=<id> would be stale
-            # advice, so the near-duplicate is reported as handled.
+            # Some other part of this write (explicit supersede or the
+            # contradiction check) already replaced it: the near-duplicate is
+            # handled, so no "pass supersede=<id>" advice is needed.
             warnings.append(
                 f"near-duplicate {near_dup['id']} (similarity "
-                f"{near_dup['similarity']}) was replaced by the supersede "
-                f"target of this write")
+                f"{near_dup['similarity']}) is superseded by this write "
+                f"already; no separate action is needed")
         elif near_dup:
             warnings.append(_near_duplicate_warning(near_dup))
         if cross_scope_superseded:
@@ -741,11 +753,11 @@ def remember(
         elif contradiction_skip:
             warnings.append(f"contradiction check skipped: {contradiction_skip}")
         if check_contradictions and not entity and not nli_unavailable \
-                and not contradiction_skip and not contradictions:
-            # Independent of the block above: even a clean scan must say that
-            # it compared the fact against nearest memories across all
-            # entities when no entity was set. Hiding it behind `elif` made
-            # the broader comparison silent.
+                and not contradiction_skip:
+            # Independent of the outcome: even a scan that found something
+            # compared the fact against nearest memories across all entities
+            # when no entity was set. Hiding it behind `elif` made the
+            # broader comparison silent exactly when it had consequences.
             warnings.append(
                 "no entity set: the contradiction check compared the fact "
                 "against the nearest memories across all entities")
@@ -1239,7 +1251,13 @@ def remember_batch(
             savepoint = f"fact_{i}"
             cur.execute(f"SAVEPOINT {savepoint}")
             try:
+                scope_warning = None
                 if store_project and store_project not in ensured:
+                    if not _project_exists(cur, store_project):
+                        scope_warning = (
+                            f"created a new project scope {store_project!r}; "
+                            f"it did not exist before this write (check the "
+                            f"name if this was a typo)")
                     _ensure_project_table(cur, store_project)
                     ensured.add(store_project)
 
@@ -1259,6 +1277,8 @@ def remember_batch(
                             "scope": spec["scope"],
                             "project": (store_project or "global"),
                         }
+                        if scope_warning:
+                            entry["warnings"] = [scope_warning]
                         if (spec.get("supersede") or spec.get("supersede_content")
                                 or spec.get("supersede_last")):
                             try:
@@ -1410,6 +1430,8 @@ def remember_batch(
                      "project": (store_project or "global")}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
+            if scope_warning:
+                entry.setdefault("warnings", []).append(scope_warning)
             if spec.get("ttl_warning"):
                 entry.setdefault("warnings", []).append(spec["ttl_warning"])
             if carried:

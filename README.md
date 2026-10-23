@@ -70,6 +70,7 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 | `list_memories` | Browse memories without a query (filter, sort, page); `memory_id` fetches one, including hidden rows |
 | `get_entity` | Everything known about one entity |
 | `list_entities` | Browse the entities of a scope |
+| `list_projects` | Discover every scope (project name, tables, graph, counts) |
 | `init_context` | Session bootstrap: recent memories plus `project_stats` for every scope |
 
 **Graph**
@@ -85,14 +86,14 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 
 | Tool | What it does |
 |------|--------------|
-| `contradictions_report` | Find conflicting memories, per entity or scope-wide |
+| `contradictions_report` | Find conflicting memories, per entity or scope-wide; `resolve="newest"`, `resolve_min_confidence`, `dry_run` |
 | `export_memories` / `import_memories` | Backup and restore, including the graph |
 | `verify_integrity` | Find and repair dangling supersede links |
 | `drop_project` | Remove a project scope completely |
 | `server_health` | Check Postgres and the inference API |
 
-`MCP_TOOLSET=core` exposes only the 13 daily read/write/graph tools; the
-default `full` exposes all 21.
+`MCP_TOOLSET=core` exposes only the 14 daily read/write/graph tools; the
+default `full` exposes all 22.
 
 There is also one resource, `memory://stats`, with the memory, entity and
 relation counts plus the health of the services.

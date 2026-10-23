@@ -40,6 +40,7 @@ SCORE_FIELDS = (
     "_graph_boost",
     "_graph_source",
     "_graph_weight",
+    "_graph_relation_context",
 )
 
 SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS

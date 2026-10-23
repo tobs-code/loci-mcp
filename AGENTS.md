@@ -34,13 +34,13 @@ Failed calls never raise. Invalid arguments (missing, wrong type, invalid
 TTL/project) return the same envelope with `ok: false` and an `error` naming
 the argument.
 
-## MCP Tools (21 total)
+## MCP Tools (22 total)
 
 ### Write
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `remember` | Store one memory with embedding. `project`, `scope` (`project`/`global`), `entity`, `mem_type`, `importance`, `metadata`, `expires_at`; `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold`; `supersede` (id), `supersede_content` (exact text), `supersede_last`; `on_near_duplicate` (`warn`/`supersede`/`reject`), alias `auto_supersede_near_duplicate`; `metadata_mode` (`merge`/`replace`); `check_contradictions`; `links` (`[{to_entity, relation_type, weight?, context?, from_entity?}]` — creates graph edges in the same step, `from_entity` defaults to `entity`). Reports the `scope`/`project` it wrote to and `links` (`status: created/updated/duplicate` per edge). Malformed links are an argument error before the write; edge failures roll back to a savepoint and warn (`links failed: ...`) while the fact stays stored. |
+| `remember` | Store one memory with embedding. `project`, `scope` (`project`/`global`), `entity`, `mem_type`, `importance`, `metadata`, `expires_at`; `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold`; `supersede` (id), `supersede_content` (exact text), `supersede_last`; `on_near_duplicate` (`warn`/`supersede`/`reject`), alias `auto_supersede_near_duplicate`; `metadata_mode` (`merge`/`replace`); `check_contradictions`; `links` (`[{to_entity, relation_type, weight?, context?, from_entity?}]` — creates graph edges in the same step, `from_entity` defaults to `entity`). Reports the `scope`/`project` it wrote to and `links` (`status: created/updated/duplicate` per edge). A write that had to create a previously unknown project scope warns (`created a new project scope ...`), so a typo in `project` is visible instead of silently starting a new scope. Malformed links are an argument error before the write; edge failures roll back to a savepoint and warn (`links failed: ...`) while the fact stays stored. |
 | `remember_batch` | Store many facts with per-entry savepoints. Top-level `project`, `scope`, `dedupe`, `fuzzy_threshold`, `skip_duplicates`, `on_near_duplicate`, `check_contradictions`; per fact `content`, `project`, `scope`, `entity`, `mem_type`, `importance`, `metadata`, `supersede`, `supersede_content`, `supersede_last`, `dedupe`, `fuzzy_threshold`, `on_near_duplicate`, `expires_at`. Invalid facts are reported individually; the rest are stored. `count` is the number of entries, `succeeded`/`failed` split the outcomes. A supersede carries metadata over like `remember`. |
 | `update_memory` | Change `content` (re-embeds), `importance`, `metadata`, `entity`, `mem_type`, TTL (`expires_at`/`clear_expires_at`); `project`, `dedupe`, `fuzzy_threshold`. `touch=true` only bumps `updated_at` (decay refresh; combinable with `importance`). `restore=true` undoes a soft delete, clears `deleted_at` and the sentinel, never a real `superseded_by`, and is mutually exclusive with other fields. A content change that would duplicate an active memory answers `duplicate` and applies nothing. Unknown ids answer `not_found` before the "nothing to update" check. |
 | `update_batch` | Many `updates` with per-entry savepoints (`memory_id` plus the same fields as `update_memory`, including `project` and `restore`). Invalid, unknown, ambiguous or duplicate entries are reported individually (`partial`); the rest are applied. `count` is the number of entries, `succeeded`/`failed` split the outcomes. |
@@ -54,11 +54,12 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `recall` | Hybrid vector + FTS search with RRF. `query`, `project`, `include_global`, `limit`, `offset`, `hybrid`; `min_similarity`, `min_decay_score`, `include_decay`; `include_superseded`, `only_superseded`, `include_deleted`, `include_expired`; `graph_boost`, `graph_entity`, `entity`; `updated_after`, `metadata_filter`; `include_relation_context`; `fields`. Logs `access_count`. Reports `candidates`, `dropped_by_*`, `scopes_searched`, `has_more`/`next_offset`. Hidden rows carry `forgotten`/`expired` markers. |
-| `list_memories` | Browse without a query, newest first. `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by` (`updated_at`/`created_at`/`access_count`/`importance`), `contains` (case-insensitive literal), `memory_id`; `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`. `total`/`has_more`/`next_offset` describe the deduped row set. With `memory_id` it is the direct lookup: the answer carries the single `memory` (plus a one-item `results`), a hidden row answers `ok: false` and names the flag that reveals it, an id in several scopes is refused with `scopes`, `"*"` searches every scope, and browse filters are reported as ignored. |
+| `recall` | Hybrid vector + FTS search with RRF. `query`, `project`, `include_global`, `limit`, `offset`, `hybrid`; `min_similarity`, `min_decay_score`, `include_decay`; `include_superseded`, `only_superseded`, `include_deleted`, `include_expired`; `graph_boost`, `graph_entity`, `entity`; `updated_after`, `metadata_filter`; `include_relation_context`; `fields`. Logs `access_count`. Reports `candidates`, `dropped_by_*` (including `dropped_by_cross_scope_duplicate`), `scopes_searched`, `has_more`/`next_offset`. Hidden rows carry `forgotten`/`expired` markers. |
+| `list_memories` | Browse without a query, newest first. `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by` (`updated_at`/`created_at`/`access_count`/`importance`), `contains` (case-insensitive literal), `memory_id`; `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates`. `total`/`has_more`/`next_offset` describe the deduped row set; identical content in another scope is hidden by default and counted in `duplicates_hidden` with a warning (`include_duplicates=true` shows every copy). With `memory_id` it is the direct lookup: the answer carries the single `memory` (plus a one-item `results`), a hidden row answers `ok: false` and names the flag that reveals it, an id in several scopes is refused with `scopes`, `"*"` searches every scope, and browse filters are reported as ignored. |
 | `get_entity` | Entity details, linked memories and graph connections. `entity` (alias `name`), `project`, `include_global`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`. Reports `total`, `relation_context_count`, `has_more`; `project="*"` is rejected. |
 | `list_entities` | Browse entities. `entity_type` (`graph`, `memory-only`, or a raw AGE label), `project`, `include_global`, `limit`, `offset`. Synthetic relation-context entities are hidden. `count` is the page size, `total` the full match count. Sorted by name. |
-| `init_context` | Bootstrap: most recently changed memories + counts + health. `project` (`"*"` = all scopes), `include_global`, `detail` (`slim`/`full`), `limit` (default 10), `include_empty_projects`. Reports `projects`, `project_stats` (per-scope memories/total/superseded/forgotten/entities/relations), `active_memories`, `total_memories`, `graph_entities_count`. |
+| `list_projects` | Discover every scope without guessing names. `include_empty` (default `true`), `include_counts` (default `true`). Each row reports `project` (the value to pass to every other tool), `scope` (`global`/`project`), `has_table`, `has_graph` and, with counts, memories/total/superseded/forgotten/entities/relations. `include_empty=false` keeps scopes with active memories or graph data; a graph-only scope has `has_table=false`. |
+| `init_context` | Bootstrap: most recently changed memories + counts + health. `project` (`"*"` = all scopes), `include_global`, `detail` (`slim`/`full`), `limit` (default 10), `include_empty_projects`. Reports `projects`, `project_stats` (per-scope memories/total/superseded/forgotten/entities/relations), `active_memories`, `total_memories`, `graph_entities_count`. Without an explicit project it summarizes only the global scope and warns which other scopes exist (pass `project="*"` or use `list_projects`). |
 
 ### Graph (Apache AGE)
 
@@ -74,18 +75,18 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `limit`. Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only; cross-entity pairs stay active with a warning. Partial NLI failures are named in `nli_failures`. |
+| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`. Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only; cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. Partial NLI failures are named in `nli_failures`. |
 | `export_memories` | Backup in `data`. `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`. JSON includes the graph; JSONL is flat and warns that `include_graph` was ignored. `entity` narrows the graph too; the other memory filters do not and warn. Warns about excluded history and included expired rows. |
 | `import_memories` | Restore `data` (object or JSON string). `project`, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`. Keeps ids and timestamps; re-import is idempotent. Skips are split into `skipped_reasons`. Broken metadata is reported per record and skipped. `dry_run` adds `would_create`; dangling supersede links left by a partial backup are cleared with a warning. |
 | `verify_integrity` | Find rows hidden by a broken `superseded_by` (target missing or self), report supersede chains and expired active rows. `project`, `fix` (clear broken links), `limit`. `fix=true` never deletes content or restores a valid supersede. |
 | `drop_project` | Remove a scope completely: memory table, registry entry, graph nodes, mirror rows. `project`, `dry_run`. `global` is refused. A graph-only scope is removed as well. Dangling supersede links of other scopes are cleared. |
 | `server_health` | Check Postgres, inference and NLI configuration. Reports `version`, `code_fingerprint` (detects a stale container), `started_at`, `toolset`. |
 
-`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (13 tools:
+`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14 tools:
 `remember`, `remember_batch`, `update_memory`, `forget`, `recall`,
-`list_memories`, `get_entity`, `list_entities`, `init_context`, `relate`,
-`unrelate`, `find_connections`, `find_paths`). The default `full` exposes all
-21, including the batch, backup and repair tools.
+`list_memories`, `get_entity`, `list_entities`, `list_projects`,
+`init_context`, `relate`, `unrelate`, `find_connections`, `find_paths`). The
+default `full` exposes all 22, including the batch, backup and repair tools.
 
 Resource: `memory://stats` returns active/total memory counts, entity/relation
 counts and health.
@@ -173,8 +174,9 @@ counts and health.
   full-text-only hit below `FTS_MIN_COVERAGE` (0.3) is dropped. `min_similarity`
   filters **vector** hits only; full-text hits survive a bad embedding score.
   `recall` reports `dropped_by_similarity`, `dropped_by_coverage`,
-  `dropped_by_decay` and `dropped_by_superseded`; an empty result names every
-  filter that removed something. The strongest rejected vector hit is reported
+  `dropped_by_decay`, `dropped_by_superseded` and
+  `dropped_by_cross_scope_duplicate`; an empty result names every filter that
+  removed something. The strongest rejected vector hit is reported
   as `best_dropped_by_similarity` (id, similarity, scope, `content_preview`),
   so a barely-missed fact is visible instead of hidden behind a count; the
   empty-result warning names it and suggests `min_similarity=null`.
@@ -189,11 +191,13 @@ counts and health.
     boost. Only present with `include_decay=true` or `graph_boost=true`.
   - `_distance` is raw cosine distance.
   - Graph hits carry `_graph_boost` (0.3 × weight), `_graph_source` and
-    `_graph_weight`.
+    `_graph_weight`; a traversed edge's relation-context sentence carries
+    `_graph_relation_context: true`.
 - `graph_boost=true` traverses one hop, loads up to 5 memories per connected
-  entity and adds the boost. `graph_entity` is the expansion point and leaves
-  the query unfiltered; `entity` alone also restricts the search to that
-  entity. If only graph hits return, a warning says so.
+  entity (including the edge's context sentence) and adds the boost.
+  `graph_entity` is the expansion point and leaves the query unfiltered;
+  `entity` alone also restricts the search to that entity. If only graph hits
+  return, a warning says so.
 - `hybrid=false` uses one retriever (vector if available, otherwise FTS).
   `hybrid=true` is the default and recommended.
 - `updated_after` (ISO date) and `metadata_filter` (scalar values compare
