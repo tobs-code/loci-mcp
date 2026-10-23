@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 
@@ -13,6 +12,10 @@ from mcp_server.graph import (
     relate,
     relate_batch,
     unrelate,
+)
+from mcp_server.graph_store import (
+    delete_duplicate_edge,
+    duplicate_edge_groups,
 )
 from mcp_server.scopes import _migrate_fts_indexes
 from mcp_server.tools.maintenance import (
@@ -160,25 +163,12 @@ def main() -> None:
     try:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SET search_path TO ag_catalog, public")
-        cur.execute("""
-            SELECT * FROM cypher('memory_graph', $$
-                MATCH (a)-[r1]->(b)
-                WITH a, b, type(r1) AS t, collect(r1) AS rels
-                WHERE size(rels) > 1
-                RETURN a.name, b.name, t, size(rels)
-            $$) AS (src agtype, tgt agtype, rel_type agtype, cnt agtype)
-        """)
-        dup_rows = cur.fetchall()
+        dup_rows = duplicate_edge_groups(cur)
         for src, tgt, rel_type, cnt in dup_rows:
             for _ in range(int(str(cnt)) - 1):
-                cur.execute(
-                    f"SELECT * FROM cypher('memory_graph', $$ "
-                    f"MATCH (a {{name: {json.dumps(str(src).strip('\"'))}}})"
-                    f"-[r:{str(rel_type).strip('\"')}]->"
-                    f"(b {{name: {json.dumps(str(tgt).strip('\"'))}}}) "
-                    f"DELETE r RETURN 1 LIMIT 1 $$) AS (x agtype)"
-                )
+                delete_duplicate_edge(
+                    cur, str(src).strip('"'), str(tgt).strip('"'),
+                    str(rel_type).strip('"'))
         conn.commit()
         conn.close()
         if dup_rows:

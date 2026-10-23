@@ -18,6 +18,7 @@ Covers:
 """
 
 import mcp_server.tools.memory as memory
+from mcp_server.duplicates import topic_tokens
 from mcp_server.server import (
     contradictions_report,
     drop_project,
@@ -36,7 +37,7 @@ from mcp_server.server import (
 
 
 def _tokens(*texts):
-    return [memory._topic_tokens(text, "Refund worker") for text in texts]
+    return [topic_tokens(text, "Refund worker") for text in texts]
 
 
 def test_topic_guard_accepts_an_attribute_update_with_extra_detail():

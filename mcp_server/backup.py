@@ -1,15 +1,16 @@
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
 from mcp_server.config import SENTINEL_FORGOTTEN
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.graph import _ensure_graph_entity, _relate_edges
 from mcp_server.inference_client import embed
+from mcp_server.lifecycle import is_expired, parse_expires_at
 from mcp_server.scopes import (
     _ensure_project_table,
     _is_global_scope,
@@ -294,9 +295,9 @@ def export_memories(
         return fail(STATUS_ERROR,
                     f"unsupported format {format!r}; use 'json' or 'jsonl'",
                     count=0, data=None)
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         rows = _export_memories_json(cur, project, include_superseded,
                                      include_embeddings,
                                      only_global=only_global,
@@ -311,12 +312,12 @@ def export_memories(
         excluded = ((0, 0)
                     if (include_superseded and include_deleted is not False)
                     else _export_excluded_counts(cur, project, only_global))
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     records = []
     for r in rows:
@@ -365,11 +366,7 @@ def export_memories(
             "not apply to the graph: entities and relations were exported in "
             "full for the selected scope; pass include_graph=false for a "
             "memory-only backup")
-    now = datetime.now(timezone.utc)
-    expired_count = sum(
-        1 for r in rows
-        if isinstance(r.get("expires_at"), datetime)
-        and r["expires_at"] <= now)
+    expired_count = sum(1 for r in rows if is_expired(r.get("expires_at")))
     if expired_count:
         warnings.append(
             f"export includes {expired_count} expired memories: they are "
@@ -429,7 +426,7 @@ def _parse_dt(value) -> datetime | None:
     if isinstance(value, datetime):
         return value
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parse_expires_at(value)
     except ValueError:
         return None
 
@@ -569,7 +566,7 @@ def import_memories(
                     f"'records' must be a list of objects, got {type(records).__name__}",
                     imported=0, skipped=0)
 
-    conn = get_conn()
+    db = MemoryStore()
     imported = 0
     skipped = 0
     # Why a record was skipped matters to the caller: an idempotent re-import
@@ -585,7 +582,7 @@ def import_memories(
     graph_relations = 0
     graph_relations_created = 0
     try:
-        cur = conn.cursor()
+        cur = db.cur
         for rec in records:
             if not isinstance(rec, dict):
                 errors.append("record is not an object")
@@ -736,19 +733,19 @@ def import_memories(
 
         repaired_links = 0
         if dry_run:
-            conn.rollback()
+            db.rollback()
         else:
             # A record can carry a `superseded_by` id that was not part of the
             # import (or whose replacement was hard-deleted). Without repair
             # that row would stay invisible forever.
             repaired_links = clear_dangling_supersede(cur)
-            conn.commit()
+            db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e), imported=imported, skipped=skipped,
                     invalid=len(errors))
     finally:
-        conn.close()
+        db.close()
 
     result = {"imported": imported, "skipped": skipped,
               "invalid": len(errors)}

@@ -13,8 +13,10 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
+from mcp_server.graph_store import delete_scope_graph
+from mcp_server.lifecycle import counts as lifecycle_counts
 from mcp_server.storage import clear_dangling_supersede
 from mcp_server.scopes import (
     _mem_table,
@@ -22,11 +24,9 @@ from mcp_server.scopes import (
     _project_names,
     _project_suffix,
     _project_tables,
-    _scope_label,
     _scope_key,
     _table_exists,
 )
-from mcp_server.scopes import superseded_marker_sql as _superseded_marker
 
 logger = logging.getLogger(__name__)
 
@@ -75,25 +75,20 @@ def drop_project(
         return fail(STATUS_ERROR, "project is required")
     table = _mem_table(name)
     suffix = _project_suffix(name)
-    label = _scope_label(name)
     scope = _scope_key(name)
-    conn = get_conn()
+    db = MemoryStore()
     counts = {"memories": 0, "entities": 0, "relations": 0}
     try:
-        cur = conn.cursor()
+        cur = db.cur
         has_table = _table_exists(cur, table)
         if has_table:
-            cur.execute(
-                f"SELECT COUNT(*), "
-                f"COUNT(*) FILTER (WHERE deleted_at IS NULL), "
-                f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) FROM {table}")
-            total_rows, active_rows, forgotten_rows = cur.fetchone()
-            counts["memories"] = total_rows
+            table_counts = lifecycle_counts(cur, table)
+            counts["memories"] = table_counts["total"]
             # `forget(entity='*')` can only hide the active rows while the
             # project drop removes the table. Naming both numbers makes the
             # two previews comparable instead of looking contradictory.
-            counts["active_memories"] = active_rows
-            counts["already_forgotten"] = forgotten_rows
+            counts["active_memories"] = table_counts["active"]
+            counts["already_forgotten"] = table_counts["forgotten"]
         cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s", (scope,))
         counts["entities"] = cur.fetchone()[0]
         cur.execute(
@@ -108,25 +103,14 @@ def drop_project(
                         f"unknown project {name!r}: it has neither a memory "
                         f"table nor graph nodes")
         if dry_run:
-            conn.rollback()
+            db.rollback()
             return ok(STATUS_OK, project=name, counts=counts, dry_run=True,
                       message=(f"Would drop project {name} "
                                f"({counts['memories']} memories, "
                                f"{counts['entities']} entities, "
                                f"{counts['relations']} relations)"))
         # The graph first: the AGE label and the mirror rows belong together.
-        cur.execute("SET search_path TO ag_catalog, public")
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (n:{label}) DETACH DELETE n $$) AS (r agtype)",
-        )
-        cur.execute(
-            "DELETE FROM relations WHERE source_id IN "
-            "(SELECT id FROM entities WHERE project = %s) OR target_id IN "
-            "(SELECT id FROM entities WHERE project = %s)",
-            (scope, scope),
-        )
-        cur.execute("DELETE FROM entities WHERE project = %s", (scope,))
+        delete_scope_graph(cur, project)
         # Back to the public schema before the DDL.
         cur.execute("SET search_path TO public")
         cur.execute(f"DROP TABLE IF EXISTS {table}")
@@ -135,12 +119,12 @@ def drop_project(
         # id that no longer exists: clear that link so the old fact becomes
         # readable history instead of staying invisible forever.
         clear_dangling_supersede(cur)
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     return ok(STATUS_OK, project=name, counts=counts, dry_run=False,
               message=(f"Dropped project {name} "
                        f"({counts['memories']} memories, "
@@ -173,9 +157,9 @@ def list_projects(
     for the shared scope). `has_table=False` marks a graph-only scope.
     """
     logger.info("list_projects include_empty=%s", include_empty)
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         names = _project_names(cur)
         table_scopes = {
             table: (names.get(table[len("mem_"):], table[len("mem_"):]))
@@ -204,35 +188,15 @@ def list_projects(
                       "entities": 0, "relations": 0}
             active_count = 0
             if has_table:
+                table_counts = lifecycle_counts(cur, table)
+                active_count = table_counts["active"]
                 if include_counts:
-                    # `superseded` counts only real supersede markers: the
-                    # `__forgotten__` sentinel also lives in `superseded_by`
-                    # and must not inflate the superseded count (it would
-                    # then contradict `recall`/`list_memories`, which exclude
-                    # the sentinel from superseded history).
-                    cur.execute(
-                        f"SELECT COUNT(*), "
-                        f"COUNT(*) FILTER (WHERE superseded_by IS NULL "
-                        f"AND deleted_at IS NULL), "
-                        f"COUNT(*) FILTER (WHERE {_superseded_marker()}), "
-                        f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
-                        f"FROM {table}")
-                    total, active, superseded, forgotten = cur.fetchone()
-                    active_count = active
                     counts.update({
-                        "memories": active, "total_memories": total,
-                        "superseded_memories": superseded,
-                        "forgotten_memories": forgotten,
+                        "memories": table_counts["active"],
+                        "total_memories": table_counts["total"],
+                        "superseded_memories": table_counts["superseded"],
+                        "forgotten_memories": table_counts["forgotten"],
                     })
-                else:
-                    # Even without the full report, `include_empty=False` needs
-                    # to know whether the scope holds an active memory. Only
-                    # this one count runs; the count keys are omitted below so
-                    # a row never mixes a real value with zero placeholders.
-                    cur.execute(
-                        f"SELECT COUNT(*) FILTER (WHERE superseded_by IS NULL "
-                        f"AND deleted_at IS NULL) FROM {table}")
-                    active_count = cur.fetchone()[0]
                 if include_counts:
                     cur.execute(
                         "SELECT COUNT(*) FROM entities WHERE project = %s",
@@ -255,10 +219,10 @@ def list_projects(
                 if include_counts:
                     row.update(counts)
                 rows.append(row)
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     return ok(STATUS_OK, count=len(rows), results=rows, projects=rows)

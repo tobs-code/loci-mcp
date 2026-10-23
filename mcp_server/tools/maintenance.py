@@ -9,7 +9,8 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from mcp_server.config import RERANK_ENABLED, RERANK_MODEL, SENTINEL_FORGOTTEN
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
+from mcp_server.duplicates import shared_content_word as _shares_subject
 from mcp_server.envelope import (
     STATUS_ERROR,
     STATUS_NOT_FOUND,
@@ -18,6 +19,7 @@ from mcp_server.envelope import (
     ok,
 )
 from mcp_server.inference_client import health_details, nli_detailed
+from mcp_server.lifecycle import ACTIVE_ROW_SQL, counts as lifecycle_counts
 from mcp_server.scopes import (
     _all_mem_tables,
     _mem_table,
@@ -27,10 +29,9 @@ from mcp_server.scopes import (
     _retrieval_tables,
     _scope_of_table,
     _table_exists,
-    superseded_marker_sql,
 )
-from mcp_server.search import _search_memories
-from mcp_server.storage import ACTIVE_ROW_SQL, clear_dangling_supersede
+from mcp_server.search import SearchRequest, _search_memories
+from mcp_server.storage import clear_dangling_supersede
 from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -100,38 +101,6 @@ def _entities_differ(a: str | None, b: str | None) -> bool:
     if a is None or b is None:
         return a is not b
     return a.strip().lower() != b.strip().lower()
-
-
-# Words that carry no subject: they occur in almost every fact, so a shared
-# "the"/"ist"/"with" must not look like evidence that two facts talk about the
-# same thing.
-_SUBJECT_STOPWORDS = {
-    "the", "and", "for", "with", "that", "this", "from", "into", "are", "was",
-    "were", "has", "have", "had", "not", "but", "its", "his", "her", "their",
-    "der", "die", "das", "und", "oder", "ist", "sind", "war", "waren", "ein",
-    "eine", "einer", "eines", "mit", "von", "für", "fuer", "auf", "aus", "bei",
-    "nicht", "kein", "keine", "über", "ueber", "unter", "wird", "werden",
-    "wurde", "wurden", "sich", "auch", "noch", "nur", "als", "wie", "dass",
-    "nach", "vor", "zum", "zur", "im", "in", "an", "am", "es", "sie", "er",
-}
-
-
-def _subject_tokens(text: str) -> set[str]:
-    """Lower-cased content words of a fact (stopwords removed)."""
-    tokens = re.findall(r"[0-9A-Za-zÄÖÜäöüß][0-9A-Za-zÄÖÜäöüß_.-]*", text or "")
-    return {t.lower() for t in tokens
-            if t.lower() not in _SUBJECT_STOPWORDS and len(t) > 1}
-
-
-def _shares_subject(a: str, b: str) -> bool:
-    """True when two facts share at least one content word.
-
-    A recency-based auto-resolve is only defensible for facts that clearly
-    talk about the same thing. Two unrelated statements can still be scored
-    as a contradiction by a noisy NLI model; requiring a shared content word
-    keeps that mistake from silently invalidating a correct memory.
-    """
-    return bool(_subject_tokens(a) & _subject_tokens(b))
 
 
 # A scope-wide scan performs one NLI call per candidate fact; without a
@@ -270,22 +239,29 @@ def contradictions_report(entity: Annotated[
         return ok(STATUS_OK, count=0, results=[], warnings=[
             "contradiction check skipped: NLI provider is not configured"
         ], nli_configured=False)
-    conn = get_conn()
+    db = MemoryStore()
     candidates: dict[str, tuple[dict, list[tuple[str, str]]]] = {}
     try:
-        cur = conn.cursor()
+        cur = db.cur
         # Only active memories are seeds: already superseded pairs are resolved
         # and must not be reported again. Every type is a candidate - a
         # decision that contradicts a pattern is a conflict too.
-        facts = _search_memories(cur, None, None, None, entity, 200, project,
-                                  include_embedding=True, include_superseded=False)
+        facts = _search_memories(cur, SearchRequest(
+            query_embedding=None,
+            query_text=None,
+            entity=entity,
+            limit=200,
+            project=project,
+            include_embedding=True,
+            include_superseded=False,
+        ))
         if entity is None and len(facts) < 2:
             # Only a scope-wide scan can bail early: with an entity a single
             # seed still competes against untagged neighbours of the scope,
             # and a tagged/untagged conflict must stay visible.
-            conn.commit()
+            db.commit()
             return ok(STATUS_OK, count=0, results=[], warnings=[
-                f"nothing to compare: the scope has "
+                "nothing to compare: the scope has "
                 f"{len(facts)} active memory/memories - a contradiction needs "
                 f"at least two"
             ])
@@ -299,10 +275,10 @@ def contradictions_report(entity: Annotated[
             for table in tables:
                 cur.execute(
                     f"SELECT COUNT(*) FROM {table} "
-                    f"WHERE embedding IS NOT NULL AND " + ACTIVE_ROW_SQL)
+                    "WHERE embedding IS NOT NULL AND " + ACTIVE_ROW_SQL)
                 scope_active += cur.fetchone()[0]
             if scope_active < 2:
-                conn.commit()
+                db.commit()
                 return ok(STATUS_OK, count=0, results=[], warnings=[
                     f"nothing to compare: the scope has "
                     f"{scope_active} active memory/memories - a contradiction "
@@ -342,13 +318,13 @@ def contradictions_report(entity: Annotated[
                     filter_sql = "AND content <> %s"
                     filter_params = [f["content"]]
                 cur.execute(
-                    f"SELECT id, content, entity, "
+                    "SELECT id, content, entity, "
                     f"(embedding <=> %s::vector) AS distance FROM {table} "
                     f"WHERE id != %s {entity_sql} "
                     f"{filter_sql} "
-                    f"AND embedding IS NOT NULL "
-                    f"AND " + ACTIVE_ROW_SQL + " "
-                    f"ORDER BY distance ASC LIMIT %s",
+                    "AND embedding IS NOT NULL "
+                    "AND " + ACTIVE_ROW_SQL + " "
+                    "ORDER BY distance ASC LIMIT %s",
                     [f["embedding"], f["id"]] + entity_params + filter_params
                     + [neighbors_per_fact],
                 )
@@ -369,13 +345,13 @@ def contradictions_report(entity: Annotated[
                 found.sort(key=lambda item: item[3])
                 candidates[f["id"]] = (f, found)
 
-        conn.commit()
+        db.commit()
     except Exception:
         logger.exception("contradictions_report scan failed")
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, "query failed")
     finally:
-        conn.close()
+        db.close()
 
     contradictions: list[dict] = []
     warnings: list[str] = []
@@ -662,9 +638,9 @@ def contradictions_report(entity: Annotated[
                 f"resolve_min_confidence={resolve_min_confidence}: they are "
                 f"reported but not acted on")
         if resolvable:
-            conn = get_conn()
+            db = MemoryStore()
             try:
-                cur = conn.cursor()
+                cur = db.cur
                 tables = _retrieval_tables(cur, project)
                 # Decide every pair before the first write. The UPDATE bumps
                 # `updated_at` of the superseded row, so re-reading timestamps
@@ -678,7 +654,7 @@ def contradictions_report(entity: Annotated[
                         for table in tables:
                             cur.execute(
                                 f"SELECT created_at, updated_at FROM {table} "
-                                f"WHERE id = %s",
+                                "WHERE id = %s",
                                 (mem_id,),
                             )
                             row = cur.fetchone()
@@ -724,7 +700,7 @@ def contradictions_report(entity: Annotated[
                     for table in tables:
                         cur.execute(
                             f"UPDATE {table} SET superseded_by = %s, "
-                            f"updated_at = NOW() WHERE id = %s "
+                            "updated_at = NOW() WHERE id = %s "
                             f"AND superseded_by IS NULL AND deleted_at IS NULL",
                             (newer, older),
                         )
@@ -739,13 +715,13 @@ def contradictions_report(entity: Annotated[
                             "skipped": "already superseded by an earlier "
                                        "pair in this run",
                         }
-                conn.commit()
+                db.commit()
             except Exception as e:
-                conn.rollback()
+                db.rollback()
                 logger.exception("contradictions_report resolve failed")
                 warnings.append(f"resolve failed: {e}")
             finally:
-                conn.close()
+                db.close()
 
     result: dict[str, Any] = {"count": len(contradictions),
                               "results": contradictions,
@@ -814,9 +790,9 @@ def verify_integrity(
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     only_global = str(project or "").strip().lower() == "global"
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         all_tables = _all_mem_tables(cur)
         if only_global:
             tables = ["memories"]
@@ -854,7 +830,7 @@ def verify_integrity(
                 cur.execute(
                     f"SELECT id, superseded_by, entity, content FROM {table} "
                     f"WHERE superseded_by IS NOT NULL "
-                    f"AND superseded_by <> %s", (SENTINEL_FORGOTTEN,))
+                    "AND superseded_by <> %s", (SENTINEL_FORGOTTEN,))
                 for mid, sup, entity, content in cur.fetchall():
                     total += 1
                     links[mid] = sup
@@ -918,7 +894,7 @@ def verify_integrity(
                     f"UPDATE {table} SET superseded_by = NULL WHERE id = %s",
                     (mid,))
                 fixed += 1
-            conn.commit()
+            db.commit()
             # Re-scan after the fix: the response keys
             # (`dangling_superseded_by`, `self_references`, `superseded_links`)
             # and `results` describe the state AFTER the repair, so a caller
@@ -928,12 +904,12 @@ def verify_integrity(
             details, dangling, self_refs, links, link_rows, total = _scan()
             chains = _chain_details(links, link_rows, details)
         else:
-            conn.commit()
+            db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     warnings: list[str] = []
     if fixed:
@@ -1044,16 +1020,16 @@ def prune_memories(
         params.extend([SENTINEL_FORGOTTEN, older_than_days])
     where = " OR ".join(conditions)
 
-    conn = get_conn()
+    db = MemoryStore()
     counts: dict[str, int] = {}
     total = 0
     warnings: list[str] = []
     try:
-        cur = conn.cursor()
+        cur = db.cur
         if project:
             tables = [_mem_table(project)]
             if not _table_exists(cur, tables[0]):
-                conn.rollback()
+                db.rollback()
                 return fail(STATUS_NOT_FOUND,
                             f"unknown project {project!r}: no memory table")
         else:
@@ -1074,15 +1050,15 @@ def prune_memories(
                 counts[scope] = counts.get(scope, 0) + removed
                 total += removed
         if dry_run:
-            conn.rollback()
+            db.rollback()
         else:
             clear_dangling_supersede(cur, tables)
-            conn.commit()
+            db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     scopes = list(counts)
     if len(scopes) > 1:
@@ -1109,12 +1085,12 @@ def server_health() -> dict[str, Any]:
     logger.info("server_health")
     pg_ok = False
     try:
-        conn = get_conn()
-        cur = conn.cursor()
+        db = MemoryStore()
+        cur = db.cur
         cur.execute("SELECT 1")
         pg_ok = True
-        conn.commit()
-        conn.close()
+        db.commit()
+        db.close()
     except Exception:
         pass
     inference_details = health_details()
@@ -1145,9 +1121,9 @@ def server_health() -> dict[str, Any]:
 
 def stats_resource() -> str:
     """Memory server stats: counts, health."""
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         tables = _all_mem_tables(cur)
         names = _project_names(cur)
         total = 0
@@ -1155,36 +1131,23 @@ def stats_resource() -> str:
         superseded = 0
         forgotten = 0
         for table in tables:
-            cur.execute(
-                f"SELECT COUNT(*), "
-                f"COUNT(*) FILTER (WHERE superseded_by IS NULL AND deleted_at IS NULL), "
-                # Superseded is orthogonal to the soft delete: count the
-                # history marker itself, not only rows that were never
-                # forgotten (see init_context counting for the same reason).
-                # The `__forgotten__` sentinel also lives in `superseded_by`
-                # and must not inflate the superseded count.
-                f"COUNT(*) FILTER (WHERE {superseded_marker_sql()}), "
-                f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
-                f"FROM {table}"
-            )
-            table_total, table_active, table_superseded, table_forgotten = \
-                cur.fetchone()
-            total += table_total
-            active += table_active
-            superseded += table_superseded
-            forgotten += table_forgotten
+            table_counts = lifecycle_counts(cur, table)
+            total += table_counts["total"]
+            active += table_counts["active"]
+            superseded += table_counts["superseded"]
+            forgotten += table_counts["forgotten"]
         cur.execute("""
             SELECT
                 (SELECT COUNT(*) FROM entities),
                 (SELECT COUNT(*) FROM relations)
         """)
         row = cur.fetchone()
-        conn.commit()
+        db.commit()
         entities, relations = row if row else (0, 0)
     except Exception:
         return json.dumps({"error": "unavailable"})
     finally:
-        conn.close()
+        db.close()
 
     return json.dumps({
         "version": VERSION,

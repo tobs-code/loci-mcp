@@ -4,49 +4,13 @@ from typing import Any
 
 from mcp_server.config import (
     DEFAULT_DUPLICATE_THRESHOLD,
-    NEAR_DUPLICATE_THRESHOLD,
     SENTINEL_FORGOTTEN,
 )
+from mcp_server.duplicates import find_duplicate, find_near_duplicate
 from mcp_server.inference_client import nli
+from mcp_server.lifecycle import ACTIVE_ROW_SQL
 from mcp_server.scopes import _mem_table, _retrieval_tables
 from mcp_server.scoring import _gen_id, _now, _content_hash
-
-# The read/dedupe definition of "this memory is usable". An expired row
-# (expires_at in the past) is neither a duplicate candidate nor a retrieval
-# hit anymore - it stays in the tables until it is pruned or exported.
-ACTIVE_ROW_SQL = (
-    "superseded_by IS NULL AND deleted_at IS NULL "
-    "AND (expires_at IS NULL OR expires_at > NOW())"
-)
-
-
-def visibility_condition(include_deleted: bool = False,
-                         include_superseded: bool = False,
-                         include_expired: bool = False) -> str:
-    """SQL filter for the orthogonal visibility flags.
-
-    Active rows are always visible; `include_superseded` adds history,
-    `include_deleted` adds forgotten rows, and `include_expired` adds rows
-    whose TTL has passed. Without `include_expired`, an expired row stays
-    hidden even when `include_deleted` or `include_superseded` is set: a TTL
-    does not turn a row into history or make it a forgotten one.
-    """
-    if include_deleted and include_superseded:
-        base = "TRUE"
-    elif include_deleted:
-        base = "(deleted_at IS NOT NULL OR superseded_by IS NULL)"
-    elif include_superseded:
-        base = "deleted_at IS NULL"
-    elif not include_expired:
-        # No history flag: the active-row predicate already carries the TTL.
-        return ACTIVE_ROW_SQL
-    else:
-        base = "superseded_by IS NULL AND deleted_at IS NULL"
-    if include_expired:
-        return base
-    # The TTL is orthogonal to history: an expired row stays hidden even when
-    # forgotten or superseded rows are requested.
-    return f"({base}) AND (expires_at IS NULL OR expires_at > NOW())"
 
 
 def clear_dangling_supersede(cur, tables: list[str] | None = None) -> int:
@@ -147,99 +111,15 @@ def _deduplicate(cur, content: str, project: str | None,
                  fuzzy_threshold: float | None = None,
                  dedupe: str = "exact",
                  exclude_id: str | None = None) -> tuple[str, str, float | None] | None:
-    """Return the id of an existing memory that says the same thing.
-
-    `dedupe` selects the mode: "exact" (content hash), "semantic" (hash plus
-    vector similarity) or "off" (no check at all).
-
-    Returns a tuple (memory id, mode, similarity). The mode tells the caller
-    *why* the memory was seen as a duplicate, and the similarity is the
-    measured cosine distance of a semantic match (None for an exact one).
-    """
-    if dedupe == "off":
-        return None
-
-    c_hash = _content_hash(content)
-    table = _mem_table(project)
-    exclude_sql = " AND id <> %s" if exclude_id else ""
-    exclude_params = [exclude_id] if exclude_id else []
-    cur.execute(
-        f"SELECT id FROM {table} WHERE content_hash = %s "
-        f"AND {ACTIVE_ROW_SQL}{exclude_sql} LIMIT 1",
-        [c_hash] + exclude_params,
-    )
-    row = cur.fetchone()
-    if row:
-        return row[0], "exact", None
-
-    if embedding_vec is not None and dedupe == "semantic":
-        threshold = fuzzy_threshold if fuzzy_threshold is not None else DEFAULT_DUPLICATE_THRESHOLD
-        max_dist = 1.0 - threshold
-        cur.execute(
-            f"SELECT id, embedding <=> %s::vector AS dist "
-            f"FROM {table} WHERE {ACTIVE_ROW_SQL} AND embedding IS NOT NULL"
-            f"{exclude_sql} "
-            f"ORDER BY dist ASC LIMIT 1",
-            [embedding_vec] + exclude_params,
-        )
-        row = cur.fetchone()
-        if row and float(row[1]) <= max_dist:
-            return row[0], "semantic", round(1.0 - float(row[1]), 4)
-
-    return None
+    return find_duplicate(cur, content, project, embedding_vec,
+                          fuzzy_threshold, dedupe, exclude_id)
 
 
 def _find_near_duplicate(cur, content: str, project: str | None,
                          embedding_vec: list[float] | None = None,
                          exclude_id: str | None = None) -> dict | None:
-    """The active memory that is closest to `content` above the near-dup floor.
-
-    Runs only when `_deduplicate` found no match: the dedupe thresholds say
-    "different fact", but a similarity of at least `NEAR_DUPLICATE_THRESHOLD`
-    still reads like a reworded copy of an existing memory. Storing it anyway
-    is allowed (the caller may want both versions) - this function only
-    reports the match so the response can warn instead of forking silently.
-
-    The match carries its `entity` and `content` so the caller can decide
-    whether the two facts really describe the same subject. A high vector
-    similarity between two different entities (staging vs. production, two
-    services) is not a duplicate and must never trigger an automatic
-    supersede.
-
-    Returns {"id", "similarity", "entity", "content"} or None. Exact content
-    hashes never land here: `_deduplicate` already reports them before this
-    check runs.
-    """
-    if embedding_vec is None:
-        return None
-    c_hash = _content_hash(content)
-    table = _mem_table(project)
-    exclude_sql = " AND id <> %s" if exclude_id else ""
-    params: list[Any] = [embedding_vec, c_hash]
-    if exclude_id:
-        params.append(exclude_id)
-    cur.execute(
-        f"SELECT id, embedding <=> %s::vector AS dist, entity, content "
-        f"FROM {table} "
-        f"WHERE content_hash <> %s "
-        f"AND {ACTIVE_ROW_SQL} "
-        # A relation-context sentence describes a graph edge, not a fact of
-        # the entity it mentions. Comparing a new fact against it produced a
-        # "near-duplicate across entities" warning for every entity name that
-        # also appeared in an edge sentence, which is noise, not a fork.
-        f"AND COALESCE(metadata->>'relation_context', 'false') <> 'true' "
-        f"AND embedding IS NOT NULL{exclude_sql} "
-        f"ORDER BY dist ASC LIMIT 1",
-        params,
-    )
-    row = cur.fetchone()
-    if not row:
-        return None
-    similarity = round(1.0 - float(row[1]), 4)
-    if similarity >= NEAR_DUPLICATE_THRESHOLD:
-        return {"id": row[0], "similarity": similarity,
-                "entity": row[2], "content": row[3]}
-    return None
+    return find_near_duplicate(cur, content, project, embedding_vec,
+                               exclude_id)
 
 
 def _scope_of_id(cur, memory_id: str, store_project: str | None) -> str | None:

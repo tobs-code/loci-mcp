@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -15,7 +14,11 @@ from mcp_server.config import (
     SUPERSEDE_SIMILARITY_MIN,
     VALID_SCOPES,
 )
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
+from mcp_server.duplicates import (
+    content_conflict as _content_conflict,
+    same_topic as _shares_subject,
+)
 from mcp_server.envelope import (
     STATUS_CONFLICT,
     STATUS_DELETED,
@@ -32,7 +35,17 @@ from mcp_server.envelope import (
     ok,
 )
 from mcp_server.graph import _relate_edges, _validate_weight
+from mcp_server.graph_store import (
+    delete_entity_everywhere,
+    delete_node,
+    delete_scope_nodes,
+)
 from mcp_server.inference_client import embed, nli_configured
+from mcp_server.lifecycle import (
+    counts as lifecycle_counts,
+    is_expired as _is_past,
+    parse_expires_at,
+)
 from mcp_server.scopes import (
     _all_mem_tables,
     _ensure_project_table,
@@ -43,7 +56,6 @@ from mcp_server.scopes import (
     _project_exists,
     _safe_ident,
     _scope_key,
-    _scope_label,
     _scope_of_table,
     _table_exists,
 )
@@ -176,138 +188,6 @@ def _same_subject_entity(near_dup: dict, entity: str | None) -> bool:
     return _norm_str(near_dup.get("entity")) == _norm_str(entity)
 
 
-_WORD_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
-_CAMEL_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
-_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
-
-_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from",
-    "has", "have", "in", "is", "it", "its", "of", "on", "or", "that", "the",
-    "this", "to", "was", "were", "with", "now", "still", "also",
-    "gets", "get", "new", "old",
-    # Generic predicates describe the template, not the subject: two facts
-    # about a port and a backup job both "run" on the same service.
-    "run", "runs", "using", "use", "uses", "used", "supports", "support",
-    "listens", "listening", "serves", "provides", "includes", "allows",
-    "contains", "stores",
-    # Generic containers are template words too: a port fact and a backup-job
-    # fact about "the service" share them without sharing a subject.
-    "service", "application", "app", "system", "platform", "component",
-    "der", "die", "das", "ein", "eine", "einer", "und", "oder", "ist", "sind",
-    "auf", "fuer", "für", "mit", "von", "zu", "im", "in", "den", "dem",
-    "des", "wird", "werden", "hat", "haben",
-}
-
-# Attribute *values* change when a fact is updated, so they must not count as
-# the shared subject: "runs on friday" -> "runs on saturday" is the same
-# topic, "runs on port 8766" -> "runs a nightly backup" is not.
-_VALUE_WORDS = {
-    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
-    "sunday", "mon", "tue", "wed", "thu", "fri", "sat", "sun",
-    "january", "february", "march", "april", "may", "june", "july",
-    "august", "september", "october", "november", "december",
-    "daily", "weekly", "monthly", "yearly", "annual", "annually",
-    "hourly", "today", "tomorrow", "yesterday", "tonight", "utc", "gmt",
-    # Environment qualifiers are values too: "in staging" vs "in production"
-    # is an environment update, and the same words must not make a port fact
-    # and a backup-job fact look like the same topic.
-    "staging", "production", "prod", "development", "dev", "qa", "uat",
-    "sandbox", "local", "localhost", "postgres", "postgresql", "mysql",
-    "redis", "sqlite", "docker", "kubernetes", "k8s",
-} | _STOPWORDS
-
-_NEGATIONS = {
-    "not", "no", "never", "without", "none", "cannot", "disabled", "false",
-    "nicht", "kein", "keine", "keinen", "ohne", "nie", "niemals",
-}
-
-
-def _entity_tokens(entity: str | None) -> set[str]:
-    """Content-free tokens of an entity name (CamelCase is split).
-
-    The entity name is not a subject term: two facts about the same service
-    always share it, even when one describes its port and the other its
-    backup job. Removing it is what makes the topic check meaningful.
-    """
-    if not entity:
-        return set()
-    tokens: set[str] = set()
-    for chunk in re.split(r"[^A-Za-z0-9]+", str(entity)):
-        if not chunk:
-            continue
-        # The content tokenizer keeps "Round19Svc" as one token, so the
-        # camel-split parts alone would not remove it from the topic words.
-        tokens.add(chunk.lower())
-        for match in _CAMEL_WORD_RE.findall(chunk):
-            tokens.add(match.lower())
-    return tokens
-
-
-def _topic_tokens(text: str, entity: str | None) -> set[str]:
-    """Subject words of a fact: no stopwords, values or the entity name."""
-    tokens = {token.lower() for token in _WORD_RE.findall((text or "").lower())}
-    ignored = _VALUE_WORDS | _entity_tokens(entity)
-    return {token for token in tokens
-            if token not in ignored and not token.isdigit() and len(token) > 1}
-
-
-def _shares_subject(new_content: str, old_content: str,
-                    entity: str | None,
-                    similarity: float | None = None) -> bool:
-    """Whether two facts talk about the same non-entity subject.
-
-    `supersede_last` used to accept any pair above a similarity floor. Two
-    sentences about the same service share their template ("the QA service
-    runs ..."), so a port fact could replace a backup-job fact. This compares
-    the remaining *attribute* words after removing the entity, stopwords and
-    attribute values (numbers, days, intervals). A port update keeps the
-    words "port"/"runs"; a backup job does not.
-
-    Containment (overlap / smaller token set), not Jaccard, is what makes an
-    attribute *update* pass: the new sentence often adds detail words ("up to
-    five times with a 30 second timeout") that inflate the union and used to
-    push a legitimate replacement below the Jaccard floor. Requiring at least
-    two shared terms keeps a generic verb such as "runs" from proving a topic
-    match on its own. A very high similarity still accepts a short reworded
-    fact, so a legitimate one-word update is not blocked.
-    """
-    new_tokens = _topic_tokens(new_content, entity)
-    old_tokens = _topic_tokens(old_content, entity)
-    if new_tokens == old_tokens:
-        # Only attribute values (day, number, interval, environment) changed:
-        # the subject words are identical, so the fact is an update even when
-        # the entity leaves just one word (or none) behind.
-        return True
-    if not new_tokens or not old_tokens:
-        return similarity is not None and similarity >= 0.92
-    overlap = len(new_tokens & old_tokens)
-    if overlap >= 2:
-        containment = overlap / min(len(new_tokens), len(old_tokens))
-        if containment >= 0.5:
-            return True
-    return overlap >= 1 and similarity is not None and similarity >= 0.92
-
-
-def _content_conflict(new_content: str, old_content: str) -> bool:
-    """Cheap signal that two similar texts differ in a number or a negation.
-
-    Such a pair is usually an attribute update or an outright contradiction,
-    not a reworded copy. The near-duplicate warning labels it accordingly so
-    an agent does not blindly accept `on_near_duplicate='reject'` advice for a
-    fact that is actually meant to replace the old value.
-
-    This is deliberately not an NLI call: writes stay cheap. It only decides
-    how the warning reads; `check_contradictions=true` remains the real test.
-    """
-    new_numbers = set(_NUMBER_RE.findall((new_content or "").lower()))
-    old_numbers = set(_NUMBER_RE.findall((old_content or "").lower()))
-    if new_numbers and old_numbers and new_numbers != old_numbers:
-        return True
-    new_words = set(_WORD_RE.findall((new_content or "").lower()))
-    old_words = set(_WORD_RE.findall((old_content or "").lower()))
-    return bool(new_words & _NEGATIONS) != bool(old_words & _NEGATIONS)
-
-
 def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
                             conflict: bool = False,
                             update: bool = False,
@@ -430,11 +310,9 @@ def _ttl_past_warning(value: Any) -> str | None:
     if value is None:
         return None
     try:
-        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        stamp = parse_expires_at(value)
     except (TypeError, ValueError):
         return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
     if stamp <= datetime.now(timezone.utc):
         return (
             "expires_at is in the past: the memory was stored but is "
@@ -464,14 +342,6 @@ def _read_metadata(cur, store_project: str | None, memory_id: str) -> dict:
     except (TypeError, ValueError):
         return {}
     return meta if isinstance(meta, dict) else {}
-
-
-def _is_past(value: Any) -> bool:
-    if not isinstance(value, datetime):
-        return False
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value <= datetime.now(timezone.utc)
 
 
 def _hidden_state_reason(cur, memory_id: str,
@@ -839,11 +709,9 @@ def remember(
         return fail(STATUS_ERROR, "fuzzy_threshold must be between 0.0 and 1.0")
     if expires_at is not None:
         try:
-            datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-        except ValueError:
-            return fail(STATUS_ERROR,
-                        "expires_at must be an ISO 8601 timestamp "
-                        "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
+            parse_expires_at(expires_at)
+        except ValueError as e:
+            return fail(STATUS_ERROR, str(e))
     if metadata is not None:
         metadata, meta_error = _coerce_metadata(metadata)
         if meta_error:
@@ -865,9 +733,9 @@ def remember(
     meta = metadata or {}
     ttl_warning = _ttl_past_warning(expires_at)
     emb = embed([content])[0]
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         created_scope = bool(store_project) and not _project_exists(
             cur, store_project)
         if store_project:
@@ -901,11 +769,11 @@ def remember(
                         cur, store_project, existing_id, entity, supersede,
                         supersede_content, supersede_last, emb, content)
                 except ValueError as e:
-                    conn.rollback()
+                    db.rollback()
                     return fail(STATUS_ERROR, str(e))
                 warnings.extend(extra_warnings)
                 if superseded_now:
-                    conn.commit()
+                    db.commit()
             payload: dict[str, Any] = {
                 "duplicate_mode": mode, "similarity": similarity,
                 "scope": effective_scope,
@@ -921,7 +789,7 @@ def remember(
             warnings.extend(link_warnings)
             if link_results:
                 payload["links"] = link_results
-            conn.commit()
+            db.commit()
             return ok(STATUS_DUPLICATE, id=existing_id,
                       warnings=warnings, **payload)
         # Dedupe only covers the target table. The same content may already be
@@ -972,7 +840,7 @@ def remember(
                 supersede_last, emb, content
             )
         except ValueError as e:
-            conn.rollback()
+            db.rollback()
             return fail(STATUS_ERROR, str(e))
 
         mem_type = _resolve_mem_type(cur, mem_type, superseded, store_project)
@@ -993,7 +861,7 @@ def remember(
             and _content_conflict(content, near_dup.get("content") or ""))
         if near_dup and same_subject and near_policy == "reject" \
                 and near_dup["id"] not in superseded:
-            conn.rollback()
+            db.rollback()
             return ok(
                 STATUS_DUPLICATE, id=near_dup["id"],
                 duplicate_of=near_dup["id"], duplicate_mode="near",
@@ -1083,7 +951,7 @@ def remember(
         # keeps an edge failure from losing the fact.
         link_results, link_warnings = _apply_remember_links(
             cur, links, entity, store_project)
-        conn.commit()
+        db.commit()
 
         warnings: list[str] = []
         warnings.extend(guard_warnings)
@@ -1139,7 +1007,6 @@ def remember(
             warnings.append(
                 "no entity set: the contradiction check compared the fact "
                 "against the nearest memories across all entities")
-        auto_count = 1 if auto_near else 0
         if superseded and not check_contradictions:
             warnings.append(f"superseded {len(superseded)} memory/facts")
         if carried_keys:
@@ -1181,11 +1048,11 @@ def remember(
             payload["links"] = link_results
         return ok(STATUS_STORED, id=mem_id, warnings=warnings, **payload)
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         logger.exception("remember failed")
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
 
 def _norm_str(value: Any) -> str | None:
@@ -1664,7 +1531,7 @@ def remember_batch(
         fexpires = fact.get("expires_at")
         if fexpires is not None:
             try:
-                datetime.fromisoformat(str(fexpires).replace("Z", "+00:00"))
+                parse_expires_at(fexpires)
             except ValueError:
                 prepared.append((None,
                                  "expires_at must be an ISO 8601 timestamp"))
@@ -1698,11 +1565,11 @@ def remember_batch(
             return fail(STATUS_ERROR, f"embedding failed: {e}")
         embeddings = {i: vec for (i, _), vec in zip(valid, vectors)}
 
-    conn = get_conn()
+    db = MemoryStore()
     results: list[dict] = []
     ensured: set[str] = set()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         for i, (spec, err) in enumerate(prepared):
             if spec is None:
                 raw = facts[i].get("content", "") if isinstance(facts[i], dict) else ""
@@ -1983,13 +1850,13 @@ def remember_batch(
                         "no entity set: the contradiction check compared the "
                         "fact against the nearest memories across all entities")
             results.append(entry)
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         logger.exception("remember_batch failed")
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     failed = [r for r in results if r.get("status") == "error"]
     succeeded = len(results) - len(failed)
     if failed and len(failed) == len(results):
@@ -2047,9 +1914,9 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
     table is searched (the explicit scope); without one every scope is
     searched and an ambiguous id is refused.
     """
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         if project:
             tables = [_mem_table(project)]
             if not _table_exists(cur, tables[0]):
@@ -2058,7 +1925,7 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
         else:
             scopes = _memory_scopes(cur, memory_id)
             if len(scopes) > 1:
-                conn.rollback()
+                db.rollback()
                 return fail(STATUS_ERROR,
                             f"ambiguous memory id {memory_id}: it exists in "
                             f"the scopes {scopes}; pass project=<name> to say "
@@ -2081,7 +1948,7 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                 restored += cur.rowcount
                 restored_table = table
                 break
-        conn.commit()
+        db.commit()
         if not restored:
             blocked = _restore_blocked_reason(cur, memory_id, tables)
             if blocked:
@@ -2091,10 +1958,10 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                         id=memory_id)
         scope = _scope_of_table(cur, restored_table) if restored_table else None
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
-        conn.close()
+        db.close()
     return ok(STATUS_RESTORED, id=memory_id, project=scope)
 
 
@@ -2210,12 +2077,9 @@ def update_memory(
     expires_value: datetime | None = None
     if expires_at is not None:
         try:
-            expires_value = datetime.fromisoformat(
-                str(expires_at).replace("Z", "+00:00"))
-        except ValueError:
-            return fail(STATUS_ERROR,
-                        "expires_at must be an ISO 8601 timestamp "
-                        "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
+            expires_value = parse_expires_at(expires_at)
+        except ValueError as e:
+            return fail(STATUS_ERROR, str(e))
     # An expired row is inactive. Editing its content or metadata would
     # silently reactivate a fact whose TTL said "stop using this", so the
     # caller has to revive it explicitly: a future `expires_at` or
@@ -2284,9 +2148,9 @@ def update_memory(
         # A pure refresh: no content change, only the decay age restarts.
         sets.append("updated_at = NOW()")
 
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         if project:
             # Prefer the project copy over the shared one; only the first
             # active match is updated.
@@ -2298,7 +2162,7 @@ def update_memory(
             # arbitrary one of them would be a coin flip.
             scopes = _memory_scopes(cur, memory_id)
             if len(scopes) > 1:
-                conn.rollback()
+                db.rollback()
                 return fail(STATUS_ERROR,
                             f"ambiguous memory id {memory_id}: it exists in "
                             f"the scopes {scopes}; pass project=<name> to say "
@@ -2321,7 +2185,7 @@ def update_memory(
                 break
         if active_table is None:
             reason = _hidden_state_reason(cur, memory_id, tables)
-            conn.rollback()
+            db.rollback()
             if reason:
                 return fail(
                     STATUS_CONFLICT,
@@ -2360,7 +2224,7 @@ def update_memory(
             # A metadata-only edit must age like every other update.
             sets.append("updated_at = NOW()")
         if not sets:
-            conn.rollback()
+            db.rollback()
             return fail(STATUS_ERROR,
                         "nothing to update: pass content, importance, metadata, "
                         "clear_metadata_keys, entity, mem_type, "
@@ -2387,7 +2251,7 @@ def update_memory(
                 dedupe=dedupe, exclude_id=memory_id)
             if duplicate:
                 dup_id, dup_mode, dup_similarity = duplicate
-                conn.rollback()
+                db.rollback()
                 detail = ("exact content hash" if dup_mode == "exact"
                           else f"semantic match (similarity {dup_similarity})")
                 return ok(
@@ -2412,15 +2276,15 @@ def update_memory(
             params + [memory_id],
         )
         if not cur.rowcount:
-            conn.rollback()
+            db.rollback()
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
                         id=memory_id)
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
-        conn.close()
+        db.close()
     warnings = ([_near_duplicate_warning(near_dup, near_entity,
                                          near_conflict, update=True,
                                          new_content=content)]
@@ -2585,8 +2449,7 @@ def update_batch(
             error = "pass either expires_at or clear_expires_at, not both"
         elif error is None and entry_expires is not None:
             try:
-                fields["expires_at"] = datetime.fromisoformat(
-                    str(entry_expires).replace("Z", "+00:00"))
+                fields["expires_at"] = parse_expires_at(entry_expires)
             except ValueError:
                 error = "expires_at must be an ISO 8601 timestamp"
         elif error is None and entry_clear:
@@ -2631,10 +2494,10 @@ def update_batch(
             return fail(STATUS_ERROR, f"embedding failed: {e}")
         embeddings = {i: vec for (i, _), vec in zip(with_content, vectors)}
 
-    conn = get_conn()
+    db = MemoryStore()
     results: list[dict] = []
     try:
-        cur = conn.cursor()
+        cur = db.cur
         for i, (spec, err) in enumerate(prepared):
             if spec is None:
                 raw = updates[i]
@@ -2855,13 +2718,13 @@ def update_batch(
             if spec.get("ttl_warning"):
                 entry.setdefault("warnings", []).append(spec["ttl_warning"])
             results.append(entry)
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         logger.exception("update_batch failed")
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     failed = [r for r in results
               if r.get("status") not in (STATUS_UPDATED, STATUS_RESTORED)]
     succeeded = len(results) - len(failed)
@@ -2951,18 +2814,18 @@ def forget(
         return fail(STATUS_ERROR,
                     "entity='*' removes a whole scope: pass project=<name> "
                     "(the shared scope is addressed with project=\"global\")")
-    conn = get_conn()
+    db = MemoryStore()
     counts = {"memories": 0, "entities": 0, "relations": 0}
     scopes: list[str] = []
     affected_scopes: list[str] = []
     bulk_results: list[dict] = []
     try:
-        cur = conn.cursor()
+        cur = db.cur
         if memory_ids:
             # Bulk forget: process multiple memory ids in one call
             tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
             if project and not _table_exists(cur, tables[0]):
-                return fail(STATUS_NOT_FOUND, f"NOT FOUND: project table does not exist")
+                return fail(STATUS_NOT_FOUND, "NOT FOUND: project table does not exist")
             
             for mid in memory_ids:
                 if not mid or not isinstance(mid, str):
@@ -3013,9 +2876,9 @@ def forget(
             if not dry_run:
                 if not soft:
                     clear_dangling_supersede(cur)
-                conn.commit()
+                db.commit()
             else:
-                conn.rollback()
+                db.rollback()
             
             status = STATUS_OK if dry_run else (STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED)
             return ok(status, counts=counts, dry_run=dry_run, bulk_results=bulk_results,
@@ -3030,7 +2893,7 @@ def forget(
                 # The same id can live in several scopes (an import copies
                 # the id). Removing it from all of them at once would
                 # delete more than the caller asked for.
-                conn.rollback()
+                db.rollback()
                 return fail(STATUS_ERROR,
                             f"ambiguous memory id {memory_id}: it exists in "
                             f"the scopes {scopes}; pass project=<name> to say "
@@ -3063,31 +2926,24 @@ def forget(
                         cur.execute(f"DELETE FROM {table} WHERE id = %s", (memory_id,))
                         counts["memories"] += cur.rowcount
             if not counts["memories"]:
-                conn.rollback()
+                db.rollback()
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
             if not soft and not dry_run:
                 clear_dangling_supersede(cur)
         if entity_name:
-            cur.execute("SET search_path TO ag_catalog, public")
-            en_json = json.dumps(entity_name)
             scope = _scope_key(project)
             if purge_all:
                 # A whole scope goes: its memories, its graph nodes and the
                 # entity/relation mirror rows of that scope.
-                label = _scope_label(project)
                 table = _mem_table(project)
                 if _table_exists(cur, table):
                     # The preview and the real call must agree even about the
                     # rows a soft delete leaves alone: `memories` counts what
                     # this call hides/deletes, `already_forgotten` names the
                     # rows that are already hidden.
-                    cur.execute(
-                        f"SELECT COUNT(*) FILTER (WHERE deleted_at IS NULL), "
-                        f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
-                        f"FROM {table}")
-                    active_rows, forgotten_rows = cur.fetchone()
-                    counts["active_memories"] = active_rows
-                    counts["already_forgotten"] = forgotten_rows
+                    table_counts = lifecycle_counts(cur, table)
+                    counts["active_memories"] = table_counts["active"]
+                    counts["already_forgotten"] = table_counts["forgotten"]
                     if dry_run:
                         # The preview must count what the real call removes:
                         # a soft forget hides the active rows, a hard delete
@@ -3115,20 +2971,16 @@ def forget(
                 )
                 counts["relations"] = cur.fetchone()[0]
                 if not dry_run:
-                    cur.execute(
-                        f"SELECT * FROM cypher('memory_graph', $$ "
-                        f"MATCH (n:{label}) DETACH DELETE n $$) AS (r agtype)",
-                    )
-                    cur.execute("DELETE FROM entities WHERE project = %s", (scope,))
+                    delete_scope_nodes(cur, project)
                 if dry_run:
-                    conn.rollback()
+                    db.rollback()
                 else:
                     if not soft:
                         clear_dangling_supersede(cur)
-                    conn.commit()
+                    db.commit()
                 if not (counts["memories"] or counts["entities"]
                         or counts["relations"]):
-                    conn.rollback()
+                    db.rollback()
                     return fail(STATUS_NOT_FOUND,
                                 f"no memories in scope {scope_name}")
                 status = STATUS_OK if dry_run else (
@@ -3171,23 +3023,11 @@ def forget(
                 relation_count = cur.fetchone()
                 counts["relations"] = relation_count[0] if relation_count else 0
             if project:
-                label = _scope_label(project)
                 if not dry_run:
-                    cur.execute(
-                        f"SELECT * FROM cypher('memory_graph', $$ "
-                        f"MATCH (n:{label} {{name: {en_json}}}) DETACH DELETE n $$) AS (r agtype)",
-                    )
-                    cur.execute(
-                        "DELETE FROM entities WHERE name = %s AND project = %s",
-                        (entity_name, scope),
-                    )
+                    delete_node(cur, project, entity_name)
             else:
                 if not dry_run:
-                    cur.execute(
-                        f"SELECT * FROM cypher('memory_graph', $$ "
-                        f"MATCH (n {{name: {en_json}}}) DETACH DELETE n $$) AS (r agtype)",
-                    )
-                    cur.execute("DELETE FROM entities WHERE name = %s", (entity_name,))
+                    delete_entity_everywhere(cur, entity_name)
 
             # Only the selected scope's memories: forgetting an entity in one
             # project must not wipe the global facts of the same entity.
@@ -3266,26 +3106,26 @@ def forget(
                             (entity_name, entity_name, entity_name))
                         hidden += cur.fetchone()[0]
                 if hidden:
-                    conn.rollback()
+                    db.rollback()
                     return ok(
                         STATUS_OK, id=None, entity=entity_name,
                         project=scope_name, counts=counts, dry_run=dry_run,
                         message=(f"nothing to forget: all {hidden} "
                                  f"memory/memories of {entity_name!r} are "
                                  f"already soft-forgotten"))
-                conn.rollback()
+                db.rollback()
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {entity_name}")
         if dry_run:
-            conn.rollback()
+            db.rollback()
         else:
             if entity_name and not soft:
                 clear_dangling_supersede(cur)
-            conn.commit()
+            db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     status = STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED
     target = memory_id or entity_name or f"{len(memory_ids) if memory_ids else 0} ids"
     extra: dict[str, Any] = {}

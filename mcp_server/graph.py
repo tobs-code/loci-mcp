@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal, NotRequired, TypedDict
 from pydantic import Field
 
 from mcp_server.config import SENTINEL_FORGOTTEN
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
 from mcp_server.envelope import (
     STATUS_DELETED,
     STATUS_ERROR,
@@ -14,9 +14,21 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
+from mcp_server.graph_store import (
+    delete_edge as _delete_edge,
+    drop_orphan_nodes as _drop_orphan_nodes,
+    edge_context as _edge_context,
+    edge_weight as _edge_weight,
+    ensure_entity as _ensure_graph_entity,
+    entity_exists as _entity_exists,
+    entity_ids as _entity_ids,
+    entity_row as _entity_row,
+    paths as _graph_paths,
+    traverse as _traverse,
+    upsert_edge as _upsert_edge,
+)
 from mcp_server.inference_client import embed
 from mcp_server.scopes import (
-    _ag_str,
     _ensure_project_table,
     _mem_table,
     _norm_entity,
@@ -66,84 +78,6 @@ def _forget_relation_context(
         (SENTINEL_FORGOTTEN, from_entity, to_entity, relation_type),
     )
     return cur.rowcount
-
-
-def _drop_orphan_nodes(cur, project: str | None,
-                       names: list[str]) -> list[str]:
-    """Remove graph nodes that an unrelate left without an edge or a memory.
-
-    `relate` auto-creates both endpoints, so deleting the last edge used to
-    leave an empty node behind that `list_entities` still showed. A node is
-    only removed when it has no remaining edge in this scope and no memory
-    row at all, so a node that still backs a fact is never dropped.
-    """
-    label = _scope_label(project)
-    scope = _scope_key(project)
-    table = _mem_table(project)
-    has_table = _table_exists(cur, table)
-    removed: list[str] = []
-    for name in dict.fromkeys(names):
-        name_json = json.dumps(name)
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (n:{label} {{name: {name_json}}})-[r]-() "
-            f"RETURN count(r) $$) AS (c agtype)")
-        row = cur.fetchone()
-        if row and int(str(row[0])) > 0:
-            continue
-        if has_table:
-            cur.execute(
-                f"SELECT 1 FROM {table} WHERE entity = %s LIMIT 1", (name,))
-            if cur.fetchone():
-                continue
-        cur.execute(
-            f"SELECT id FROM entities WHERE name = %s AND project = %s",
-            (name, scope))
-        mirror = cur.fetchone()
-        if mirror:
-            cur.execute(
-                "SELECT 1 FROM relations WHERE source_id = ANY(%s) "
-                "OR target_id = ANY(%s) LIMIT 1",
-                ([mirror[0]], [mirror[0]]))
-            if cur.fetchone():
-                continue
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (n:{label} {{name: {name_json}}}) DETACH DELETE n $$) "
-            f"AS (x agtype)")
-        cur.execute(
-            "DELETE FROM entities WHERE name = %s AND project = %s",
-            (name, scope))
-        removed.append(name)
-    return removed
-
-def _ensure_graph_entity(cur, name: str, project: str | None,
-                         ent_type: str | None = None) -> bool:
-    """Create the AGE node and SQL entity row for one scope (idempotent).
-
-    Returns True when the node did not exist before, so an import can report
-    how many entities it really created instead of how many it processed.
-    """
-    label = _scope_label(project)
-    scope = _scope_key(project)
-    ent_json = json.dumps(name)
-    scope_json = json.dumps(scope)
-    cur.execute(
-        f"SELECT * FROM cypher('memory_graph', $$ "
-        f"MATCH (n:{label} {{name: {ent_json}}}) RETURN n $$) AS (n agtype)"
-    )
-    created = cur.fetchone() is None
-    if created:
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"CREATE (n:{label} {{name: {ent_json}, project: {scope_json}}}) RETURN n $$) AS (n agtype)"
-        )
-    cur.execute(
-        "INSERT INTO entities (name, type, project) VALUES (%s, %s, %s) "
-        "ON CONFLICT (name, project) DO UPDATE SET type = EXCLUDED.type",
-        (name, ent_type or label, scope),
-    )
-    return created
 
 
 def _validate_weight(value: Any) -> float:
@@ -228,7 +162,6 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
     transaction. Uses MERGE, so it is idempotent and keeps both directions
     of the same relation type independent.
     """
-    label = _scope_label(project)
     prepared: list[dict] = []
     for edge in edges:
         frm = _norm_entity(edge.get("from_entity"))
@@ -257,55 +190,26 @@ def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
                 seen.add(ent)
                 entities.append(ent)
 
-    scope = _scope_key(project)
     for ent in entities:
         _ensure_graph_entity(cur, ent, project)
 
     results: list[dict] = []
     for e in prepared:
-        from_json = json.dumps(e["from_entity"])
-        to_json = json.dumps(e["to_entity"])
         rtype = e["relation_type"]
-
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (a:{label} {{name: {from_json}}})-[r:{rtype}]->(b:{label} {{name: {to_json}}}) "
-            f"RETURN r.weight $$) AS (w agtype)"
-        )
-        existing_row = cur.fetchone()
-        existed = existing_row is not None
+        existing_weight = _edge_weight(
+            cur, project, e["from_entity"], e["to_entity"], rtype)
+        existed = existing_weight is not None
         if e["weight"] is None:
             # No weight passed: keep the stored strength (default 1.0 only
             # for a brand-new edge). Otherwise an idempotent `relate` call -
             # e.g. adding a context sentence later - silently reset a
             # deliberately weak edge to 1.0.
-            weight = 1.0
-            if existing_row is not None:
-                try:
-                    weight = _validate_weight(
-                        float(_ag_str(existing_row[0])))
-                except (TypeError, ValueError):
-                    weight = 1.0
+            weight = existing_weight if existed else 1.0
         else:
             weight = e["weight"]
         e["weight"] = weight
-        w_json = json.dumps(weight)
-
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (a:{label} {{name: {from_json}}}), (b:{label} {{name: {to_json}}}) "
-            f"MERGE (a)-[r:{rtype}]->(b) SET r.weight = {w_json} "
-            f"RETURN r $$) AS (r agtype)"
-        )
-        cur.execute(
-            "INSERT INTO relations (source_id, target_id, relation_type, weight) "
-            "SELECT e1.id, e2.id, %s, %s "
-            "FROM entities e1, entities e2 "
-            "WHERE e1.name = %s AND e2.name = %s "
-            "AND e1.project = %s AND e2.project = %s "
-            "ON CONFLICT (source_id, target_id, relation_type) DO UPDATE SET weight = EXCLUDED.weight",
-            (rtype, weight, e["from_entity"], e["to_entity"], scope, scope),
-        )
+        _upsert_edge(cur, project, e["from_entity"], e["to_entity"], rtype,
+                     weight)
         # The context sentence of an edge carries the edge weight in its
         # metadata. A later weight change would leave the old value behind
         # and contradict the graph, so the two are kept in sync.
@@ -402,9 +306,9 @@ def relate(
     if not relation_type:
         return fail(STATUS_ERROR, "relation_type is required")
 
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         if project:
             # Every project that gets a graph node also gets its memory table
             # and its registry entry. Without that the scope existed only in
@@ -419,12 +323,12 @@ def relate(
             "weight": weight,
             "context": context,
         }], project)
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     edge = results[0]
     warnings: list[str] = []
@@ -487,9 +391,9 @@ def relate_batch(
             _norm_project(edge.get("project", project))
         except (TypeError, ValueError) as e:
             return fail(STATUS_ERROR, f"edge {i}: {e}")
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         # Every project that gets a graph node also gets its memory table and
         # its registry entry, so the scope is visible in `init_context(project='*')` and
         # removable with `drop_project`.
@@ -512,13 +416,13 @@ def relate_batch(
                     f"edge(s) at index {positions} failed: {e}") from e
             for (pos, _), result in zip(pairs, batch):
                 results[pos] = result
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         logger.exception("relate_batch failed")
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     warnings: list[str] = []
     self_loops = [r for r in results if r.get("self_loop")]
     if self_loops:
@@ -572,43 +476,26 @@ def unrelate(
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
 
-    label = _scope_label(project)
-    scope = _scope_key(project)
-    from_json = json.dumps(from_entity)
-    to_json = json.dumps(to_entity)
-    conn = get_conn()
+    db = MemoryStore()
     context_removed = 0
     orphans_removed: list[str] = []
     try:
-        cur = conn.cursor()
-        cur.execute("SET search_path TO ag_catalog, public")
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ "
-            f"MATCH (a:{label} {{name: {from_json}}})-[r:{relation_type}]->"
-            f"(b:{label} {{name: {to_json}}}) "
-            f"DELETE r RETURN 1 $$) AS (x agtype)"
-        )
-        deleted = bool(cur.fetchall())
+        cur = db.cur
+        deleted = _delete_edge(
+            cur, project, from_entity, to_entity, relation_type)
         if deleted:
-            cur.execute(
-                "DELETE FROM relations "
-                "WHERE relation_type = %s "
-                "AND source_id = (SELECT id FROM entities WHERE name = %s AND project = %s) "
-                "AND target_id = (SELECT id FROM entities WHERE name = %s AND project = %s)",
-                (relation_type, from_entity, scope, to_entity, scope),
-            )
             if not keep_context:
                 context_removed = _forget_relation_context(
                     cur, project, from_entity, to_entity, relation_type,
                 )
             orphans_removed = _drop_orphan_nodes(
                 cur, project, [from_entity, to_entity])
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     if not deleted:
         return fail(STATUS_NOT_FOUND,
@@ -684,96 +571,32 @@ def find_connections(
             _safe_ident(relation_type, "relation_type")
         except ValueError as e:
             return fail(STATUS_ERROR, str(e))
-    label = _scope_label(project)
-    rtype_cypher = f":{relation_type}" if relation_type else ""
-    name_json = json.dumps(entity_name)
-    if direction == "outgoing":
-        pattern = f"(a:{label})-[r{rtype_cypher}]->(b)"
-    elif direction == "incoming":
-        pattern = f"(a:{label})<-[r{rtype_cypher}]-(b)"
-    else:
-        pattern = f"(a:{label})-[r{rtype_cypher}]-(b)"
-    base_query = f"MATCH {pattern} WHERE a.name = {name_json}"
-    count_query = f"{base_query} RETURN count(r)"
-    data_query = (
-        f"{base_query} "
-        f"RETURN b.name AS connected_entity, type(r) AS relation_type, "
-        f"coalesce(r.weight, 1.0) AS w, startNode(r).name AS src, "
-        f"endNode(r).name AS tgt "
-        f"ORDER BY coalesce(r.weight, 1.0) DESC, b.name, type(r) "
-        f"SKIP {int(offset)} LIMIT {int(limit)}"
-    )
-
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM entities WHERE name = %s AND project = %s LIMIT 1",
-            (entity_name, _scope_key(project)),
-        )
-        if cur.fetchone() is None:
-            conn.rollback()
+        cur = db.cur
+        if not _entity_exists(cur, project, entity_name):
+            db.rollback()
             return fail(STATUS_NOT_FOUND,
                         _entity_not_found_hint(cur, entity_name, project),
                         entity=entity_name, scope=_scope_key(project))
-        cur.execute("SET search_path TO ag_catalog, public")
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ {count_query} $$) AS "
-            f"(total agtype)"
-        )
-        row = cur.fetchone()
-        total = int(str(row[0])) if row else 0
-        cur.execute(
-            f"SELECT * FROM cypher('memory_graph', $$ {data_query} $$) AS "
-            f"(connected_entity agtype, relation_type agtype, weight agtype, "
-            f"src agtype, tgt agtype)",
-        )
-        results = []
-        for row in cur.fetchall():
-            src = _ag_str(row[3])
-            tgt = _ag_str(row[4])
-            if direction == "outgoing":
-                edge_dir = "outgoing"
-            elif direction == "incoming":
-                edge_dir = "incoming"
-            else:
-                edge_dir = "outgoing" if src == entity_name else "incoming"
-            results.append({
-                "entity": _ag_str(row[0]),
-                "relation": _ag_str(row[1]),
-                "weight": float(str(row[2])),
-                "direction": edge_dir,
-                "from_entity": src,
-                "to_entity": tgt,
-            })
+        total, results = _traverse(
+            cur, project, entity_name, direction, relation_type, limit, offset)
         # An edge optionally carries a sentence explaining *why* the two
         # entities are connected. Traversal that returns only the label makes
         # the agent guess; the sentence is already stored as a relation-context
         # memory, so attach it to the edge it belongs to.
-        ctx_table = _mem_table(project) if project else "memories"
-        if _table_exists(cur, ctx_table):
-            for result in results:
-                ctx_entity = (f"{result['from_entity']}_"
-                              f"{result['relation']}_"
-                              f"{result['to_entity']}")
-                cur.execute(
-                    f"SELECT content FROM {ctx_table} "
-                    "WHERE entity = %s AND superseded_by IS NULL "
-                    "AND deleted_at IS NULL "
-                    "AND metadata->>'relation_context' = 'true' "
-                    "AND metadata->>'relation_type' = %s "
-                    "ORDER BY updated_at DESC LIMIT 1",
-                    (ctx_entity, result["relation"]),
-                )
-                context_row = cur.fetchone()
-                if context_row:
-                    result["context"] = context_row[0]
-        conn.commit()
+        for result in results:
+            sentence = _edge_context(
+                cur, project, result["from_entity"], result["to_entity"],
+                result["relation"])
+            if sentence:
+                result["context"] = sentence
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     has_more = total > offset + limit
     warnings: list[str] = []
     if offset > 0 and total > 0 and not results:
@@ -844,9 +667,9 @@ def list_relations(
     from_sql = (f"FROM relations r JOIN entities e1 ON e1.id = r.source_id "
                 f"JOIN entities e2 ON e2.id = r.target_id {where}")
 
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         cur.execute(f"SELECT count(*) {from_sql}", params)
         total = int(cur.fetchone()[0] or 0)
         cur.execute(
@@ -863,12 +686,12 @@ def list_relations(
             "weight": float(row[3] or 1.0),
             "project": "global" if row[4] == "global" else row[4],
         } for row in cur.fetchall()]
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     has_more = total > offset + limit
     warnings: list[str] = []
@@ -927,62 +750,41 @@ def find_paths(from_entity: Annotated[
             "searched")
         max_hops = 10
     label = _scope_label(project)
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         scope = _scope_key(project)
-        cur.execute(
-            "SELECT name FROM entities WHERE project = %s AND name IN (%s, %s)",
-            (scope, from_entity, to_entity),
-        )
-        known_entities = {row[0] for row in cur.fetchall()}
+        known_entities = set(_entity_ids(cur, project))
         missing = [name for name in (from_entity, to_entity)
                    if name not in known_entities]
         if missing:
-            conn.rollback()
+            db.rollback()
             return fail(STATUS_NOT_FOUND,
                         _entity_not_found_hint(cur, missing[0], project),
                         entity=missing[0], scope=scope)
         if from_entity == to_entity:
-            cur.execute(
-                "SELECT id FROM entities WHERE project = %s AND name = %s",
-                (scope, from_entity))
-            row = cur.fetchone()
-            conn.rollback()
+            row = _entity_row(cur, project, from_entity)
+            db.rollback()
             return ok(STATUS_OK, count=1, warnings=warnings, results=[{
                 "nodes": [{"id": row[0] if row else None, "name": from_entity,
                            "label": label}],
                 "relations": [], "hops": 0}])
-        cur.execute("SET search_path TO ag_catalog, public")
-        fe_json = json.dumps(from_entity)
-        te_json = json.dumps(to_entity)
-        cur.execute(
-            f"""SELECT * FROM cypher('memory_graph', $$
-                MATCH p = (a:{label})-[*1..{max_hops}]-(b:{label})
-                WHERE a.name = {fe_json} AND b.name = {te_json}
-                RETURN nodes(p) AS ns, relationships(p) AS rs
-                LIMIT 20
-            $$) AS (ns agtype, rs agtype)""")
-        rows = cur.fetchall()
-        conn.commit()
+        rows = _graph_paths(cur, project, from_entity, to_entity, max_hops)
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     paths = []
     seen_paths: set[tuple] = set()
-    conn = get_conn()
+    db = MemoryStore()
     entity_ids: dict[str, int] = {}
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT name, id FROM entities WHERE project = %s",
-            (_scope_key(project),),
-        )
-        entity_ids = {name: entity_id for name, entity_id in cur.fetchall()}
+        cur = db.cur
+        entity_ids = _entity_ids(cur, project)
     finally:
-        conn.close()
+        db.close()
     for r in rows:
         nodes_str = str(r[0]).replace("::vertex", "").replace("::edge", "")
         rels_str = str(r[1]).replace("::vertex", "").replace("::edge", "")

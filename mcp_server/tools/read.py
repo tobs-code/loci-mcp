@@ -11,37 +11,48 @@ from mcp_server.config import (
     MEMORY_TYPES,
     SENTINEL_FORGOTTEN,
 )
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
+from mcp_server.duplicates import (
+    dedupe_across_scopes as _dedup_rows_across_scopes,
+    dedupe_similar_rows as dedupe_near_duplicates,
+)
+from mcp_server.graph_store import (
+    connections as graph_connections,
+    find_entity as graph_find_entity,
+)
 from mcp_server.inference_client import embed
+from mcp_server.lifecycle import (
+    counts as lifecycle_counts,
+    is_expired as _is_expired,
+    visibility_sql as _visibility_condition,
+)
 from mcp_server.projection import (
     PUBLIC_FIELDS,
-    dedupe_near_duplicates,
     project_bootstrap,
     project_full,
     validate_fields,
 )
 from mcp_server.projection import project as project_row
+from mcp_server.scope import (
+    MODE_BOOTSTRAP,
+    MODE_BROWSE,
+    MODE_LOOKUP,
+    MODE_PROJECT,
+    resolve_scope,
+)
 from mcp_server.scopes import (
-    _ag_str,
     _all_mem_tables,
     _count_entities,
-    _is_global_scope,
     _memory_scopes,
     _norm_entity,
-    _norm_project,
     _project_names,
-    _retrieval_tables,
     _scope_key,
-    _scope_label,
     _scope_of_table,
-    _scopes_of_tables,
-    _unknown_project_warning,
 )
-from mcp_server.scopes import superseded_marker_sql as _superseded_marker
 from mcp_server.scoring import _decay_norm
 from mcp_server.search import (
-    _dedup_rows_across_scopes,
+    SearchRequest,
     _extra_conditions,
     _search_memories,
     _search_memories_graph_boost,
@@ -49,7 +60,6 @@ from mcp_server.search import (
 from mcp_server.storage import (
     ACTIVE_ROW_SQL,
     _log_access,
-    visibility_condition,
 )
 from mcp_server.tools.maintenance import _health_check
 
@@ -92,29 +102,6 @@ def _best_dropped_hint(best_dropped: dict[str, Any]) -> str:
     if preview:
         hint += f": {preview!r}"
     return hint
-
-
-def _visibility_condition(include_deleted: bool, include_superseded: bool,
-                          include_expired: bool) -> str:
-    """SQL filter for the orthogonal visibility flags.
-
-    Active rows are always visible (unless expired); `include_superseded`
-    adds history, `include_deleted` adds forgotten rows, and `include_expired`
-    adds rows whose TTL has passed. A forgotten row stays visible through
-    `include_deleted` even when it was superseded as well, exactly like the
-    listing behaved before expired rows were separated out.
-    """
-    return visibility_condition(include_deleted, include_superseded,
-                                include_expired)
-
-
-def _is_expired(value: Any) -> bool:
-    """True when a stored `expires_at` timestamp is in the past."""
-    if not isinstance(value, datetime):
-        return False
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value <= datetime.now(timezone.utc)
 
 
 def _normalize_metadata_filter(value: Any) -> dict | None:
@@ -315,20 +302,16 @@ def recall(
     """
     logger.info("recall query='%s' entity=%s hybrid=%s include_decay=%s graph_boost=%s min_similarity=%s",
                 query[:80], entity, hybrid, include_decay, graph_boost, min_similarity)
-    # "*" means every scope. It is resolved before the project name is
-    # normalized, otherwise it would become a project called "*".
-    # The raw value tells explicit scope intent apart from the default: an
-    # explicitly requested single scope must not produce a warning that
-    # suggests searching the other scopes.
-    raw_project = project
-    all_projects = project == "*"
+    # "*" means every scope. The raw value tells explicit scope intent apart
+    # from the default: an explicitly requested single scope must not produce
+    # a warning that suggests searching the other scopes.
     try:
-        project = None if all_projects else _norm_project(project)
+        scope = resolve_scope(project, include_global)
+        project = scope.project
         entity = _norm_entity(entity)
         graph_entity = _norm_entity(graph_entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    explicit_scope = bool(raw_project and str(raw_project).strip())
     warnings: list[str] = []
     if not query or not query.strip():
         return fail(STATUS_ERROR, "query must not be empty")
@@ -363,44 +346,47 @@ def recall(
     if only_superseded:
         include_superseded = True
     query_emb = embed([query], mode="query")[0]
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
+        cur = db.cur
         # A scope that does not exist must not look like an empty scope: the
         # search silently falls back to the global table.
-        if not all_projects:
-            unknown = _unknown_project_warning(cur, project)
-            if unknown:
-                warnings.append(unknown)
+        unknown = scope.unknown_warning(cur)
+        if unknown:
+            warnings.append(unknown)
 
         # Neue RRF-Funktion nutzen
-        tables = (_all_mem_tables(cur) if all_projects
-                  else _retrieval_tables(cur, project))
-        if (project or all_projects) and not include_global:
-            tables = [table for table in tables if table != "memories"]
+        tables = scope.tables(cur, MODE_PROJECT)
         # The scopes that were really searched. An agent that finds nothing
         # must be able to see whether other scopes were covered - otherwise
         # "no result" is indistinguishable from "wrong scope".
-        scopes_searched = _scopes_of_tables(cur, tables)
-        other_scopes = [s for s in _scopes_of_tables(cur, _all_mem_tables(cur))
-                        if s not in scopes_searched]
+        scopes_searched = scope.scopes(cur, tables)
+        other_scopes = scope.other_scopes(cur, tables)
 
         stats: dict[str, Any] = {}
         # The page needs `offset + limit` candidates, plus one to know whether
         # a further page exists. Slicing happens after the optional filters so
         # `offset` counts real returned rows.
         fetch_limit = limit + offset + 1
-        results = _search_memories(
-            cur, query_emb, query if (hybrid or query_emb is None) else None,
-            mem_type, entity, fetch_limit, project,
-            include_decay, include_superseded=include_superseded,
+        results = _search_memories(cur, SearchRequest(
+            query_embedding=query_emb,
+            query_text=query if (hybrid or query_emb is None) else None,
+            mem_type=mem_type,
+            entity=entity,
+            limit=fetch_limit,
+            project=project,
+            include_decay=include_decay,
+            include_superseded=include_superseded,
             min_similarity=min_similarity,
-            hybrid=hybrid, tables=tables,
-            updated_after=updated_after, metadata_filter=metadata_filter,
+            hybrid=hybrid,
+            tables=tables,
+            updated_after=updated_after,
+            metadata_filter=metadata_filter,
             exclude_relation_context=not include_relation_context,
-            stats=stats, include_expired=include_expired,
+            stats=stats,
+            include_expired=include_expired,
             include_deleted=include_deleted,
-        )
+        ))
 
         # Graph-enhanced retrieval when enabled
         if graph_boost and boost_entity:
@@ -409,10 +395,11 @@ def recall(
                 include_global=include_global,
                 updated_after=updated_after, metadata_filter=metadata_filter,
                 exclude_relation_context=not include_relation_context,
-                all_projects=all_projects,
+                all_projects=scope.all_projects,
                 include_expired=include_expired,
                 include_deleted=include_deleted,
                 warnings=warnings,
+                cur=cur,
             )
             if results and all(r.get("_relevance_score") is None
                                for r in results if isinstance(r, dict)):
@@ -466,13 +453,13 @@ def recall(
             if isinstance(r, dict) and r.get("id") in hit_ids and "error" not in r:
                 r["access_count"] = (r.get("access_count") or 0) + 1
 
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         logger.exception("recall failed")
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
 
     rows = []
     expired_count = 0
@@ -559,7 +546,7 @@ def recall(
         # switch globals off) must learn that other scopes exist. An
         # explicitly requested scope is no warning: the isolation was the
         # intent, and "use project='*'" would contradict it.
-        if other_scopes and not explicit_scope and include_global:
+        if other_scopes and not scope.explicit and include_global:
             warnings.append(
                 f"only the scope(s) {', '.join(scopes_searched)} were searched; "
                 f"other scopes exist ({', '.join(other_scopes)}) - use "
@@ -870,13 +857,12 @@ def list_memories(
     logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
                 entity, mem_type, limit, offset, project)
     raw_project = project
-    all_projects = project == "*"
     try:
-        project = None if all_projects else _norm_project(project)
+        scope = resolve_scope(project, include_global)
+        project = scope.project
         entity = _norm_entity(entity)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    global_only = not all_projects and _is_global_scope(raw_project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
     if offset < 0:
@@ -992,25 +978,15 @@ def list_memories(
                 "memory_id performs a direct id lookup: "
                 f"{', '.join(ignored)} ignored")
         return result
-    conn = get_conn()
+    db = MemoryStore()
     warnings: list[str] = []
     scopes_searched: list[str] = []
     try:
-        cur = conn.cursor()
-        unknown = _unknown_project_warning(cur, project)
+        cur = db.cur
+        unknown = scope.unknown_warning(cur)
         if unknown:
             warnings.append(unknown)
-        if all_projects:
-            tables = _all_mem_tables(cur)
-        elif project:
-            tables = _retrieval_tables(cur, project)
-        elif global_only:
-            # The caller asked for the shared scope explicitly: only that one.
-            tables = ["memories"]
-        else:
-            tables = _all_mem_tables(cur)
-        if (project or all_projects) and not include_global:
-            tables = [table for table in tables if table != "memories"]
+        tables = scope.tables(cur, MODE_BROWSE)
         conditions: list[str] = [
             _visibility_condition(include_deleted, include_superseded,
                                   include_expired)]
@@ -1035,8 +1011,8 @@ def list_memories(
         conditions.extend(extra_conditions)
         params.extend(extra_params)
         where = " AND ".join(conditions)
-        scopes_searched = _scopes_of_tables(cur, tables)
-        if not project and not all_projects and len(scopes_searched) > 1:
+        scopes_searched = scope.scopes(cur, tables)
+        if not project and not scope.all_projects and len(scopes_searched) > 1:
             # Every other read tool defaults to the global scope. A silent
             # all-scope browse made the same call behave differently, so the
             # wider search is named (no results are hidden, only disclosed).
@@ -1056,26 +1032,27 @@ def list_memories(
                      else project_names.get(table[4:], table[4:]))
             cur.execute(
                 f"SELECT id, content_hash, superseded_by, deleted_at, "
-                f"{order_column} AS _order FROM {table} WHERE {where}",
+                f"expires_at, {order_column} AS _order FROM {table} WHERE {where}",
                 params,
             )
             for (row_id, c_hash, superseded_by,
-                 deleted_at, order_value) in cur.fetchall():
+                 deleted_at, expires_at, order_value) in cur.fetchall():
                 index_rows.append({
                     "id": row_id,
                     "content_hash": c_hash,
                     "superseded_by": superseded_by,
                     "deleted_at": deleted_at,
+                    "expires_at": expires_at,
                     "_order": order_value,
                     "_project": scope,
                     "_table": table,
                 })
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     unique, hidden_duplicates = _dedup_rows_across_scopes(
         index_rows, include_duplicates)
     # Scope transparency: with a project the browse also covers global rows.
@@ -1109,9 +1086,9 @@ def list_memories(
         by_table: dict[str, list[str]] = {}
         for r in window_index:
             by_table.setdefault(r["_table"], []).append(r["id"])
-        conn = get_conn()
+        db = MemoryStore()
         try:
-            cur = conn.cursor()
+            cur = db.cur
             for table, ids in by_table.items():
                 cur.execute(f"SELECT * FROM {table} WHERE id = ANY(%s)", (ids,))
                 columns = [d[0] for d in cur.description]
@@ -1119,12 +1096,12 @@ def list_memories(
                     item = dict(zip(columns, row))
                     item["_project"] = scope_by_key[(table, item["id"])]
                     page[(table, item["id"])] = item
-            conn.commit()
+            db.commit()
         except Exception as e:
-            conn.rollback()
+            db.rollback()
             return fail(STATUS_ERROR, str(e))
         finally:
-            conn.close()
+            db.close()
     window = [page[(r["_table"], r["id"])]
               for r in window_index if (r["_table"], r["id"]) in page]
     if offset > 0 and total > 0 and not window:
@@ -1230,25 +1207,25 @@ def _get_memory(
     raw_project = project
     if raw_project is not None and str(raw_project).strip() == "*":
         raw_project = None
-    global_only = _is_global_scope(raw_project)
     try:
-        project = _norm_project(raw_project)
+        scope = resolve_scope(raw_project, include_global)
+        project = scope.project
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     fields_error = validate_fields(fields)
     if fields_error:
         return fail(STATUS_ERROR, fields_error)
-    conn = get_conn()
+    db = MemoryStore()
     try:
-        cur = conn.cursor()
-        if global_only:
+        cur = db.cur
+        if scope.global_only:
             tables = ["memories"]
         elif project:
-            tables = _retrieval_tables(cur, project)
+            tables = scope.tables(cur, MODE_LOOKUP)
         else:
             scopes = _memory_scopes(cur, memory_id)
             if len(scopes) > 1:
-                conn.rollback()
+                db.rollback()
                 return fail(
                     STATUS_ERROR,
                     f"ambiguous memory id {memory_id}: it exists in the "
@@ -1283,7 +1260,7 @@ def _get_memory(
                 if row:
                     hidden = (table, row[0], row[1], row[2])
                     break
-            conn.rollback()
+            db.rollback()
             if hidden:
                 table, superseded_by, deleted_at, expires_at = hidden
                 reasons = []
@@ -1318,12 +1295,12 @@ def _get_memory(
         expired = _is_expired(found.get("expires_at"))
         if expired and (fields is None or "expired" in fields):
             item["expired"] = True
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
-        conn.close()
+        db.close()
     return ok(STATUS_OK, id=memory_id, project=scope, memory=item)
 
 
@@ -1347,7 +1324,7 @@ def _relation_context_memories(cur, target: str, tables: list[str],
             "(metadata->>'from' = %s OR metadata->>'to' = %s)",
         ]
         params: list[Any] = [target, target]
-        conditions.append(visibility_condition(
+        conditions.append(_visibility_condition(
             include_superseded=include_superseded,
             include_expired=include_expired,
         ))
@@ -1379,7 +1356,7 @@ def _count_entity_memories(cur, target: str, tables: list[str],
     """
     if not tables:
         return 0, 0
-    where = ("entity = %s AND " + visibility_condition(
+    where = ("entity = %s AND " + _visibility_condition(
         include_superseded=include_superseded,
         include_expired=include_expired))
     rows: list[dict] = []
@@ -1472,7 +1449,8 @@ def get_entity(name: Annotated[
             "project name, or use list_entities to browse every scope",
         )
     try:
-        project = _norm_project(project)
+        scope = resolve_scope(project, include_global)
+        project = scope.project
         target = _norm_entity(target)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
@@ -1485,7 +1463,7 @@ def get_entity(name: Annotated[
     fields_error = validate_fields(fields)
     if fields_error:
         return fail(STATUS_ERROR, fields_error)
-    conn = get_conn()
+    db = MemoryStore()
     memories = []
     entity_data = None
     warnings: list[str] = []
@@ -1495,12 +1473,10 @@ def get_entity(name: Annotated[
     memories_by_scope: dict[str, int] = {}
     scope_presence: dict[str, str] = {}
     try:
-        cur = conn.cursor()
-        tables = _retrieval_tables(cur, project) if project else None
-        if project and not include_global:
-            tables = [table for table in tables if table != "memories"]
+        cur = db.cur
+        tables = scope.tables(cur, MODE_PROJECT) if project else None
         used_tables = tables or ["memories"]
-        scopes_searched = _scopes_of_tables(cur, used_tables)
+        scopes_searched = scope.scopes(cur, used_tables)
         # An entity name can exist in several scopes. The caller asked for one
         # lookup, so the answer has to say where else the name occurs instead
         # of silently merging a global memory-only entity with this project's
@@ -1518,12 +1494,16 @@ def get_entity(name: Annotated[
         # Fetch enough rows that the cross-scope copies the dedupe removes
         # cannot leave the page short. Adding just the hidden count keeps a
         # big entity from loading every row for a ten-item page.
-        memories = _search_memories(cur, None, None, None, target,
-                                    offset + limit + 1 + hidden_duplicates,
-                                    project,
-                                    include_superseded=include_superseded,
-                                    include_expired=include_expired,
-                                    tables=tables)
+        memories = _search_memories(cur, SearchRequest(
+            query_embedding=None,
+            query_text=None,
+            entity=target,
+            limit=offset + limit + 1 + hidden_duplicates,
+            project=project,
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+            tables=tables,
+        ))
         # An identical active fact in project and global is one row: the page
         # must apply the same rule as the count, otherwise `total`, `count`
         # and the last page disagree (a 12-row page could claim total=11).
@@ -1552,49 +1532,19 @@ def get_entity(name: Annotated[
             total += 1
             relation_context_count += 1
 
-        scope = _scope_key(project)
-        cur.execute(
-            "SELECT id, name, type, project FROM entities WHERE name = %s AND project = %s",
-            (target, scope),
-        )
-        row = cur.fetchone()
-        if not row:
-            label = _scope_label(project)
-            name_json = json.dumps(target)
-            cur.execute("SET search_path TO ag_catalog, public")
-            cur.execute(
-                f"SELECT * FROM cypher('memory_graph', $$ "
-                f"MATCH (n:{label} {{name: {name_json}}}) RETURN n $$) AS (n agtype)"
-            )
-            if cur.fetchone():
-                row = (None, target, label, scope)
+        row = graph_find_entity(cur, project, target)
         if row:
             entity_data = {"id": row[0], "name": row[1], "type": "graph",
                            "label": row[2], "project": row[3],
-                           "connections": []}
-            # also query AGE for graph neighbors (same scope label)
-            label = _scope_label(project)
-            cur.execute("SET search_path TO ag_catalog, public")
-            name_json = json.dumps(target)
-            cur.execute(
-                f"SELECT * FROM cypher('memory_graph', $$ "
-                f"MATCH (a:{label} {{name: {name_json}}})-[r]-(b) "
-                f"RETURN b.name, type(r), coalesce(r.weight, 1.0), startNode(r).name $$) AS "
-                f"(neighbor agtype, rel agtype, w agtype, src agtype)"
-            )
-            entity_data["connections"] = [
-                {"entity": _ag_str(r[0]), "relation": _ag_str(r[1]),
-                 "weight": float(str(r[2])),
-                 "direction": "outgoing" if _ag_str(r[3]) == target else "incoming"}
-                for r in cur.fetchall()
-            ]
-        conn.commit()
+                           "connections": graph_connections(cur, project,
+                                                          target)}
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         logger.exception("get_entity failed")
         return fail(STATUS_ERROR, str(e), entity=target)
     finally:
-        conn.close()
+        db.close()
     if entity_data is None and memories:
         entity_data = {
             "id": None,
@@ -1705,51 +1655,28 @@ def list_entities(
     """
     logger.info("list_entities entity_type=%s limit=%s offset=%s project=%s",
                 entity_type, limit, offset, project)
-    raw_project = project
-    all_projects = project == "*"
     try:
-        project = None if all_projects else _norm_project(project)
+        scope = resolve_scope(project, include_global)
+        project = scope.project
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    global_only = not all_projects and _is_global_scope(raw_project)
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
     if offset < 0:
         return fail(STATUS_ERROR, "offset must be >= 0")
-    conn = get_conn()
+    db = MemoryStore()
     warnings: list[str] = []
     try:
-        cur = conn.cursor()
-        unknown = _unknown_project_warning(cur, project)
+        cur = db.cur
+        unknown = scope.unknown_warning(cur)
         if unknown:
             warnings.append(unknown)
-        if project:
-            tables = _retrieval_tables(cur, project)
-        elif global_only:
-            tables = ["memories"]
-        else:
-            tables = _all_mem_tables(cur)
-        if (project or all_projects) and not include_global:
-            tables = [table for table in tables if table != "memories"]
+        tables = scope.tables(cur, MODE_BROWSE)
         names = _project_names(cur)
         scope_of = {t: (names.get(t[len("mem_"):], t[len("mem_"):])
                         if t != "memories" else "global") for t in tables}
 
-        if project and include_global:
-            scope_conditions = ["(project = %s OR project = 'global')"]
-            scope_params: list[Any] = [project]
-        elif project:
-            scope_conditions = ["project = %s"]
-            scope_params = [project]
-        elif global_only:
-            scope_conditions = ["project = 'global'"]
-            scope_params = []
-        elif all_projects and not include_global:
-            scope_conditions = ["project <> 'global'"]
-            scope_params = []
-        else:
-            scope_conditions = ["TRUE"]
-            scope_params = []
+        scope_condition, scope_params = scope.graph_filter()
 
 
         # Every graph node of the selected scopes, independent of the type
@@ -1757,7 +1684,7 @@ def list_entities(
         # "memory-only" entity, and it must not be counted twice.
         cur.execute(
             f"SELECT name, project, type FROM entities "
-            f"WHERE {' AND '.join(scope_conditions)}",
+            f"WHERE {scope_condition}",
             scope_params,
         )
         node_rows = cur.fetchall()
@@ -1768,7 +1695,7 @@ def list_entities(
         # used to answer an empty page silently. Name the valid labels instead.
         if (entity_type and entity_type not in ("graph", "memory-only")
                 and entity_type not in graph_labels):
-            conn.rollback()
+            db.rollback()
             if graph_labels:
                 valid = ", ".join(sorted(graph_labels))
                 return fail(
@@ -1782,7 +1709,7 @@ def list_entities(
                 f"no graph labels; use 'graph' for every graph node or "
                 f"'memory-only' for entities without one")
 
-        conditions = list(scope_conditions)
+        conditions = [scope_condition]
         params = list(scope_params)
         # The type filter selects one kind of entity: "graph" selects every
         # graph node, "memory-only" only the entities without one, and a raw
@@ -1856,12 +1783,12 @@ def list_entities(
                 rows.append({"id": None, "name": ent, "type": "memory-only",
                              "label": None, "project": scope,
                              "graph_node": False})
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     # A stable order is what makes `offset` usable.
     rows.sort(key=lambda r: (str(r.get("name") or ""), str(r.get("project") or "")))
     window = rows[offset:offset + limit]
@@ -1927,18 +1854,16 @@ def init_context(project: Annotated[
     without active memories.
     `graph_entities_count` counts the graph nodes of the covered scopes.
     """
-    raw_project = project
-    all_projects = project == "*"
-    explicit_scope = bool(raw_project and str(raw_project).strip())
     try:
-        project = None if all_projects else _norm_project(project)
+        scope = resolve_scope(project, include_global)
+        project = scope.project
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     if detail not in ("slim", "full"):
         return fail(STATUS_ERROR, "detail must be 'slim' or 'full'")
     if limit < 1:
         return fail(STATUS_ERROR, "limit must be >= 1")
-    conn = get_conn()
+    db = MemoryStore()
     memories = []
     total = 0
     active = 0
@@ -1947,30 +1872,32 @@ def init_context(project: Annotated[
     projects: list[str] = []
     warnings: list[str] = []
     try:
-        cur = conn.cursor()
-        unknown = _unknown_project_warning(cur, project)
+        cur = db.cur
+        unknown = scope.unknown_warning(cur)
         if unknown:
             warnings.append(unknown)
-        tables = (_all_mem_tables(cur) if all_projects else
-                  _retrieval_tables(cur, project) if project else ["memories"])
-        if (project or all_projects) and not include_global:
-            tables = [table for table in tables if table != "memories"]
+        tables = scope.tables(cur, MODE_BOOTSTRAP)
         # recent_first: the bootstrap shows what changed last, not what was
         # read most often.
-        memories = _search_memories(cur, None, None, None, None, limit, project,
-                                    include_decay=True, tables=tables,
-                                    recent_first=True)
-        scope_names = _scopes_of_tables(cur, tables)
+        memories = _search_memories(cur, SearchRequest(
+            query_embedding=None,
+            query_text=None,
+            limit=limit,
+            project=project,
+            include_decay=True,
+            tables=tables,
+            recent_first=True,
+        ))
+        scope_names = scope.scopes(cur, tables)
         # Every scope the bootstrap covers is listed - including the shared
         # one. Without it the caller cannot see that global memories were
         # part of the answer.
         projects = list(scope_names)
-        if not all_projects and not explicit_scope:
+        if not scope.all_projects and not scope.explicit:
             # The default bootstrap only shows the shared scope. A session
             # start that reports "0 memories" while a dozen project facts
             # exist must not look like an empty database.
-            other_scopes = [s for s in _scopes_of_tables(cur, _all_mem_tables(cur))
-                            if s not in scope_names]
+            other_scopes = scope.other_scopes(cur, tables)
             if other_scopes:
                 warnings.append(
                     f"only the global scope was summarized; other scopes "
@@ -1978,22 +1905,11 @@ def init_context(project: Annotated[
                     f"bootstrap all of them")
         project_stats: list[dict[str, Any]] = []
         for table, scope in zip(tables, scope_names):
-            cur.execute(
-                f"SELECT COUNT(*), "
-                f"COUNT(*) FILTER (WHERE superseded_by IS NULL AND deleted_at IS NULL), "
-                # Superseded is a history marker orthogonal to the soft
-                # delete: a row can be BOTH superseded and forgotten. Counting
-                # `deleted_at IS NULL` here made a forgotten-but-once-
-                # superseded fact vanish from the superseded counter, and
-                # total - active - forgotten <= superseded broke its promise.
-                # The `__forgotten__` sentinel also lives in `superseded_by`
-                # and must not inflate the superseded count.
-                f"COUNT(*) FILTER (WHERE {_superseded_marker()}), "
-                f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
-                f"FROM {table}"
-            )
-            table_total, table_active, table_superseded, table_forgotten = \
-                cur.fetchone()
+            table_counts = lifecycle_counts(cur, table)
+            table_total = table_counts["total"]
+            table_active = table_counts["active"]
+            table_superseded = table_counts["superseded"]
+            table_forgotten = table_counts["forgotten"]
             total += table_total
             active += table_active
             superseded += table_superseded
@@ -2021,12 +1937,12 @@ def init_context(project: Annotated[
                 })
         project_stats.sort(
             key=lambda r: (r["scope"] != "global", str(r["project"])))
-        conn.commit()
+        db.commit()
     except Exception as e:
-        conn.rollback()
+        db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
-        conn.close()
+        db.close()
     if detail == "slim":
         memories = dedupe_near_duplicates(memories)
     # The key promises recency: sort the selected memories by their last

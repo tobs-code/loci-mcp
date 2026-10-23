@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,9 +17,10 @@ from mcp_server.config import (
     RERANK_TRIGGER_MARGIN,
     RERANK_TRIGGER_SCORE,
     RRF_K,
-    SENTINEL_FORGOTTEN,
 )
-from mcp_server.db import get_conn
+from mcp_server.store import MemoryStore
+from mcp_server.duplicates import is_cross_scope_duplicate
+from mcp_server.graph_store import boost_neighbors, label_node_exists
 from mcp_server.inference_client import rerank
 from mcp_server.scopes import (
     _ag_str,
@@ -36,14 +38,13 @@ from mcp_server.scoring import (
     _now,
     _relevance_score,
 )
-from mcp_server.storage import visibility_condition
+from mcp_server.lifecycle import (
+    is_expired as _is_expired_value,
+    is_visible as _is_current_row,
+    visibility_sql as visibility_condition,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _row_is_active(row: dict) -> bool:
-    """True when the row is neither superseded nor soft-forgotten."""
-    return not row.get("superseded_by") and not row.get("deleted_at")
 
 
 BEST_DROPPED_PREVIEW_CHARS = 160
@@ -52,6 +53,31 @@ BEST_DROPPED_PREVIEW_CHARS = 160
 # the current fact that replaced it. 0.5 is strong enough to flip a near-tie
 # without hiding an old fact that is the only match.
 HISTORY_RELEVANCE_WEIGHT = 0.5
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    """Named search intent, so an internal call never relies on argument order."""
+
+    query_embedding: list[float] | None
+    query_text: str | None
+    mem_type: str | None = None
+    entity: str | None = None
+    limit: int = 10
+    project: str | None = None
+    include_decay: bool = False
+    include_embedding: bool = False
+    include_superseded: bool = False
+    min_similarity: float | None = None
+    hybrid: bool = True
+    tables: list[str] | None = None
+    updated_after: str | None = None
+    metadata_filter: dict | None = None
+    recent_first: bool = False
+    exclude_relation_context: bool = False
+    stats: dict[str, Any] | None = None
+    include_expired: bool = False
+    include_deleted: bool = False
 
 # An exact substring hit is stronger evidence than a stemmed full-text hit:
 # a file name, an id or a token must outrank a memory that merely shares a
@@ -120,8 +146,7 @@ def _hidden_exact_matches(cur, tables: list[str], needle: str,
         hidden_here = 0
         for deleted_at, superseded_by, expires_at in rows:
             row_flags: list[str] = []
-            expired = (expires_at is not None
-                       and expires_at <= datetime.now(timezone.utc))
+            expired = _is_expired_value(expires_at)
             if expired and not include_expired:
                 row_flags.append("include_expired")
             if deleted_at is not None and not include_deleted:
@@ -218,45 +243,6 @@ def _table_of_dropped(dropped: dict[str, Any]) -> str:
     return "memories" if scope == "global" else f"mem_{scope}"
 
 
-def _skip_active_cross_scope_duplicate(
-    row: dict, table: str, seen_active: dict[str, str]
-) -> bool:
-    """Cross-scope dedup for a stream of rows, project tables first.
-
-    Only an *active* row may hide an *active* copy in another scope. History
-    (superseded and soft-forgotten rows) is never dropped: a superseded fact
-    used to disappear from `include_superseded` because an active copy with
-    the same content lived in the other scope. Copies inside one scope stay
-    visible too - `dedupe="off"` deliberately allows them.
-    """
-    c_hash = row.get("content_hash") or ""
-    if not c_hash or not _row_is_active(row):
-        return False
-    previous = seen_active.get(c_hash)
-    if previous is not None and previous != table:
-        return True
-    seen_active[c_hash] = table
-    return False
-
-
-def _is_expired_value(value: Any) -> bool:
-    if not isinstance(value, datetime):
-        return False
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value <= datetime.now(timezone.utc)
-
-
-def _is_current_row(row: dict) -> bool:
-    """True for an active row (not superseded, forgotten or expired)."""
-    if row.get("deleted_at") is not None:
-        return False
-    superseded_by = row.get("superseded_by")
-    if superseded_by is not None and superseded_by != SENTINEL_FORGOTTEN:
-        return False
-    return not _is_expired_value(row.get("expires_at"))
-
-
 def _apply_history_penalty(row: dict) -> None:
     """Rank history below current facts when it is included on purpose.
 
@@ -274,49 +260,6 @@ def _apply_history_penalty(row: dict) -> None:
     if "_final_score" in row:
         row["_final_score"] = round(
             float(row["_final_score"]) * HISTORY_RELEVANCE_WEIGHT, 4)
-
-
-def _dedup_rows_across_scopes(
-    rows: list[dict],
-    include_duplicates: bool = False,
-) -> tuple[list[dict], int]:
-    """Drop active cross-scope copies of the same content.
-
-    Same rule as `_skip_active_cross_scope_duplicate`, but for a complete row
-    set: inactive rows survive, and copies inside the winning scope survive
-    (`dedupe="off"` deliberately allows them). An active project table wins
-    over the global one; when several project tables hold the same content the
-    first one wins, so a row set must be ordered project tables first.
-
-    Returns `(kept, hidden_count)`. The count matters: a browse that silently
-    lists one of two identical rows looks complete while a whole scope is
-    missing from it.
-    """
-    if include_duplicates:
-        return list(rows), 0
-    groups: dict[str, list[dict]] = {}
-    kept: list[dict] = []
-    for row in rows:
-        c_hash = row.get("content_hash") or ""
-        if not c_hash or not _row_is_active(row):
-            kept.append(row)
-            continue
-        groups.setdefault(c_hash, []).append(row)
-    hidden = 0
-    for group in groups.values():
-        def scope(row: dict) -> str:
-            table = row.get("_table")
-            if table:
-                return "global" if table == "memories" else table
-            return row.get("_project") or "global"
-        project_rows = [r for r in group if scope(r) != "global"]
-        winner = scope(project_rows[0]) if project_rows else scope(group[0])
-        for row in group:
-            if scope(row) == winner:
-                kept.append(row)
-            else:
-                hidden += 1
-    return kept, hidden
 
 
 def _fts_lexemes(cur, query_text: str | None) -> list[str]:
@@ -769,7 +712,7 @@ def _search_memories_rrf(
                 d["_project"] = "global"
             else:
                 d["_project"] = project_names.get(table[4:], table[4:])
-            if _skip_active_cross_scope_duplicate(
+            if is_cross_scope_duplicate(
                 d, table, seen_active_hashes
             ):
                 dropped_by_cross_scope_duplicate += 1
@@ -857,28 +800,7 @@ def _search_memories_rrf(
 
 
 
-def _search_memories(
-    cur,
-    query_embedding: list[float] | None,
-    query_text: str | None,
-    mem_type: str | None,
-    entity: str | None,
-    limit: int,
-    project: str | None,
-    include_decay: bool = False,
-    include_embedding: bool = False,
-    include_superseded: bool = False,
-    min_similarity: float | None = None,
-    hybrid: bool = True,  # Default: RRF aktivieren
-    tables: list[str] | None = None,
-    updated_after: str | None = None,
-    metadata_filter: dict | None = None,
-    recent_first: bool = False,
-    exclude_relation_context: bool = False,
-    stats: dict[str, Any] | None = None,
-    include_expired: bool = False,
-    include_deleted: bool = False,
-) -> list[dict]:
+def _search_memories(cur, request: SearchRequest) -> list[dict]:
     """
     Wrapper for search functions. Uses RRF when hybrid=True, otherwise legacy search.
 
@@ -887,6 +809,25 @@ def _search_memories(
     re-ranking by decay score - the session bootstrap needs recency, not the
     most frequently accessed memories.
     """
+    query_embedding = request.query_embedding
+    query_text = request.query_text
+    mem_type = request.mem_type
+    entity = request.entity
+    limit = request.limit
+    project = request.project
+    include_decay = request.include_decay
+    include_embedding = request.include_embedding
+    include_superseded = request.include_superseded
+    min_similarity = request.min_similarity
+    hybrid = request.hybrid
+    tables = request.tables
+    updated_after = request.updated_after
+    metadata_filter = request.metadata_filter
+    recent_first = request.recent_first
+    exclude_relation_context = request.exclude_relation_context
+    stats = request.stats
+    include_expired = request.include_expired
+    include_deleted = request.include_deleted
     if hybrid and (query_embedding is not None or query_text):
         rows = _search_memories_rrf(
             cur, query_embedding, query_text, mem_type, entity, limit, project,
@@ -1008,7 +949,7 @@ def _search_memories(
                     dropped_by_coverage += 1
                     continue
 
-            if _skip_active_cross_scope_duplicate(
+            if is_cross_scope_duplicate(
                 d, table, seen_active_hashes
             ):
                 dropped_by_cross_scope_duplicate += 1
@@ -1098,6 +1039,7 @@ def _search_memories_graph_boost(
     include_expired: bool = False,
     include_deleted: bool = False,
     warnings: list[str] | None = None,
+    cur=None,
 ) -> list[dict]:
     """
     Augments search results with memories from connected entities via the graph.
@@ -1109,7 +1051,6 @@ def _search_memories_graph_boost(
     the entity and where it was looked up.
     """
     tables = None
-    name_json = json.dumps(entity)
     graph_entities: list[tuple[str, float]] = []
     # Relation-context sentences are stored under the synthetic entity
     # `<from>_<relation>_<to>`; they describe the very edge that was just
@@ -1119,11 +1060,17 @@ def _search_memories_graph_boost(
     relation_entities: list[tuple[str, float]] = []
     graph_results: list[dict] = []
 
-    # Dedicated connection: a failing Cypher call must not abort
-    # the running recall transaction.
-    conn = get_conn()
+    # A Cypher failure must not abort the running recall transaction. The
+    # caller can pass its cursor: the expansion then runs behind a savepoint,
+    # so it still crosses the GraphStore seam on the same transaction.
+    own_connection = cur is None
+    db = None
+    if own_connection:
+        db = MemoryStore()
+        cur = db.cur
+    else:
+        cur.execute("SAVEPOINT graph_boost")
     try:
-        cur = conn.cursor()
         if all_projects:
             # Every scope has its own AGE label, so the traversal walks all
             # of them.
@@ -1143,18 +1090,11 @@ def _search_memories_graph_boost(
             labels = [_scope_label(project)]
 
         # 1. Find connected entities via Apache AGE (any edge direction/type)
-        cur.execute("SET search_path TO ag_catalog, public")
         seen_nodes: set[str] = set()
         seen_relation_context: set[str] = set()
         for label in labels:
-            cur.execute(
-                f"SELECT * FROM cypher('memory_graph', $$ "
-                f"MATCH (a:{label} {{name: {name_json}}})-[r]-(b) "
-                f"RETURN b.name, coalesce(r.weight, 1.0), type(r), a.name "
-                f"LIMIT 10 $$) AS "
-                f"(name agtype, weight agtype, rtype agtype, source agtype)"
-            )
-            for name, weight, rtype, source in cur.fetchall():
+            for name, weight, rtype, source in boost_neighbors(
+                    cur, label, entity):
                 node = _ag_str(name)
                 weight_value = float(str(weight))
                 relation = _ag_str(rtype)
@@ -1236,12 +1176,7 @@ def _search_memories_graph_boost(
             # has no node at all: only the latter is a meaningless expansion.
             node_exists = False
             for label in labels:
-                cur.execute(
-                    f"SELECT * FROM cypher('memory_graph', $$ "
-                    f"MATCH (a:{label} {{name: {name_json}}}) RETURN a $$) "
-                    f"AS (a agtype) LIMIT 1"
-                )
-                if cur.fetchone():
+                if label_node_exists(cur, label, entity):
                     node_exists = True
                     break
             if not node_exists and warnings is not None:
@@ -1251,13 +1186,25 @@ def _search_memories_graph_boost(
                     f"graph_boost: entity {entity!r} has no graph node in "
                     f"{scope_label}, so there was nothing to expand; the "
                     f"result contains query hits only (create it with relate)")
-        conn.commit()
+        if own_connection:
+            db.commit()
+        else:
+            cur.execute("RELEASE SAVEPOINT graph_boost")
     except Exception as e:
-        conn.rollback()
+        if own_connection:
+            db.rollback()
+        else:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT graph_boost")
+                cur.execute("RELEASE SAVEPOINT graph_boost")
+            except Exception as rollback_error:
+                logger.warning(
+                    "Graph boost savepoint rollback failed: %s", rollback_error)
         logger.warning("Graph boost failed: %s", e)
         return existing_results
     finally:
-        conn.close()
+        if own_connection:
+            db.close()
 
     # 3. Fuse with existing results
     # Keep the boost relative to the best score so graph candidates cannot

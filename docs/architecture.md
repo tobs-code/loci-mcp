@@ -63,13 +63,18 @@ $$) AS (name agtype, friend_name agtype);
 | `mcp_server/app.py` | FastMCP instance, server instructions and the envelope-aware tool classes |
 | `mcp_server/config.py` | Memory types, scopes and scoring constants |
 | `mcp_server/envelope.py` | Uniform response envelope shared by all tools |
-| `mcp_server/projection.py` | Row projection (`fields`) and near-duplicate detection |
+| `mcp_server/projection.py` | Row projection (`fields`) and field validation |
 | `mcp_server/db.py` | Schema, migrations, connection handling |
+| `mcp_server/store.py` | `MemoryStore`: connection, cursor and transaction lifetime |
 | `mcp_server/scopes.py` | Project slugs, scope labels and per-project tables |
+| `mcp_server/scope.py` | `ScopeSelection` / `resolve_scope`: read-scope resolution |
+| `mcp_server/lifecycle.py` | Active/TTL predicates, visibility SQL and row counts |
 | `mcp_server/scoring.py` | Decay, RRF helpers and ID/content hashing |
-| `mcp_server/storage.py` | Store, supersede, dedup, contradiction and access helpers |
-| `mcp_server/search.py` | Vector + FTS RRF search and graph boost |
-| `mcp_server/graph.py` | Apache AGE relations and traversal tools |
+| `mcp_server/duplicates.py` | Exact/semantic duplicates, subject guards and cross-scope dedupe |
+| `mcp_server/storage.py` | Store, supersede and access helpers |
+| `mcp_server/search.py` | `SearchRequest`, vector + FTS RRF search and graph boost |
+| `mcp_server/graph.py` | Apache AGE relation tools (orchestration only) |
+| `mcp_server/graph_store.py` | Sole owner of Cypher and graph mirror SQL |
 | `mcp_server/backup.py` | Export/import of memories and the graph |
 | `mcp_server/tools/` | Write, read, scope and maintenance MCP tools |
 | `mcp_server/inference_client.py` | HTTP client for `/embed`, `/nli`, `/health` |
