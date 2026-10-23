@@ -21,7 +21,7 @@ from mcp_server.graph_store import (
     connections as graph_connections,
     find_entity as graph_find_entity,
 )
-from mcp_server.inference_client import embed
+from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
     counts as lifecycle_counts,
     is_expired as _is_expired,
@@ -44,11 +44,9 @@ from mcp_server.scope import (
 from mcp_server.scopes import (
     _all_mem_tables,
     _count_entities,
-    _memory_scopes,
     _norm_entity,
     _project_names,
     _scope_key,
-    _scope_of_table,
 )
 from mcp_server.scoring import _decay_norm
 from mcp_server.search import (
@@ -1223,7 +1221,7 @@ def _get_memory(
         elif project:
             tables = scope.tables(cur, MODE_LOOKUP)
         else:
-            scopes = _memory_scopes(cur, memory_id)
+            scopes = db.scopes_of(memory_id)
             if len(scopes) > 1:
                 db.rollback()
                 return fail(
@@ -1236,33 +1234,18 @@ def _get_memory(
             tables = [table for table in tables if table != "memories"]
         where = _visibility_condition(include_deleted, include_superseded,
                                       include_expired)
-        found = None
-        found_table = None
-        for table in tables:
-            cur.execute(f"SELECT * FROM {table} WHERE id = %s AND {where}",
-                        (memory_id,))
-            row = cur.fetchone()
-            if row is None:
-                continue
-            columns = [d[0] for d in cur.description]
-            found = dict(zip(columns, row))
-            found_table = table
-            break
+        found, found_table = db.find(
+            memory_id, tables=tables, where=where)
         if found is None:
             # Explain the miss: the row may exist but be hidden by one of the
             # visibility flags. A bare "not found" would make an agent believe
             # the id never existed.
-            hidden = None
-            for table in tables:
-                cur.execute(f"SELECT superseded_by, deleted_at, expires_at "
-                            f"FROM {table} WHERE id = %s", (memory_id,))
-                row = cur.fetchone()
-                if row:
-                    hidden = (table, row[0], row[1], row[2])
-                    break
+            hidden, hidden_table = db.locate(memory_id, tables=tables)
             db.rollback()
             if hidden:
-                table, superseded_by, deleted_at, expires_at = hidden
+                superseded_by = hidden.get("superseded_by")
+                deleted_at = hidden.get("deleted_at")
+                expires_at = hidden.get("expires_at")
                 reasons = []
                 if deleted_at is not None:
                     reasons.append("soft-forgotten (pass include_deleted=true)")
@@ -1274,10 +1257,10 @@ def _get_memory(
                     STATUS_NOT_FOUND,
                     f"memory {memory_id} exists but is not visible: "
                     + ("; ".join(reasons) if reasons else "hidden by a filter"),
-                    id=memory_id, scope=_scope_of_table(cur, table))
+                    id=memory_id, scope=db.scope_of_table(hidden_table))
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
                         id=memory_id)
-        scope = _scope_of_table(cur, found_table)
+        scope = db.scope_of_table(found_table)
         found["_project"] = scope
         projection_fields = fields
         if include_deleted:

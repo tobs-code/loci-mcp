@@ -21,7 +21,7 @@ from mcp_server.config import (
 from mcp_server.store import MemoryStore
 from mcp_server.duplicates import is_cross_scope_duplicate
 from mcp_server.graph_store import boost_neighbors, label_node_exists
-from mcp_server.inference_client import rerank
+from mcp_server.inference_gateway import rerank
 from mcp_server.scopes import (
     _ag_str,
     _all_mem_tables,

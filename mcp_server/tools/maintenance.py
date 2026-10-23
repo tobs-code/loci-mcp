@@ -18,7 +18,7 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
-from mcp_server.inference_client import health_details, nli_detailed
+from mcp_server.inference_gateway import health_details, nli_detailed
 from mcp_server.lifecycle import ACTIVE_ROW_SQL, counts as lifecycle_counts
 from mcp_server.scopes import (
     _all_mem_tables,
@@ -1171,7 +1171,7 @@ def stats_resource() -> str:
 
 def _health_check() -> bool:
     try:
-        from mcp_server.inference_client import health as h
+        from mcp_server.inference_gateway import health as h
         return h()
     except Exception:
         return False

@@ -40,7 +40,7 @@ from mcp_server.graph_store import (
     delete_node,
     delete_scope_nodes,
 )
-from mcp_server.inference_client import embed, nli_configured
+from mcp_server.inference_gateway import embed, nli_configured
 from mcp_server.lifecycle import (
     counts as lifecycle_counts,
     is_expired as _is_past,
@@ -73,7 +73,6 @@ from mcp_server.storage import (
     _find_near_duplicate,
     _find_superseded_match,
     _scope_of_id,
-    _store_memory,
     _supersede,
 )
 
@@ -883,17 +882,17 @@ def remember(
             auto_near = near_dup
             superseded.append(near_dup["id"])
 
-        mem_id = _store_memory(cur, content, emb, mem_type, entity,
-                               importance, meta, store_project, None,
-                               scope=effective_scope, expires_at=expires_at)
+        mem_id = db.insert(content, emb, mem_type, entity,
+                           importance, meta, project=store_project,
+                           scope=effective_scope, expires_at=expires_at)
 
         for old_id in superseded:
-            _supersede(cur, store_project, mem_id, old_id)
+            db.mark_superseded(old_id, mem_id, project=store_project)
 
         for c in contradictions:
             eid = c["existing_id"]
             if eid not in superseded:
-                _supersede(cur, store_project, mem_id, eid)
+                db.mark_superseded(eid, mem_id, project=store_project)
                 superseded.append(eid)
 
         # A project write that invalidates a SHARED (global) fact hides that
@@ -1731,21 +1730,22 @@ def remember_batch(
 
                 fact_mem_type = _resolve_mem_type(
                     cur, spec["mem_type"], superseded, store_project)
-                mid = _store_memory(
-                    cur, spec["content"], embeddings[i], fact_mem_type,
+                mid = db.insert(
+                    spec["content"], embeddings[i], fact_mem_type,
                     spec["entity"], spec["importance"], spec["metadata"],
-                    store_project, scope=spec["scope"],
+                    project=store_project, scope=spec["scope"],
                     expires_at=spec.get("expires_at"),
                 )
 
                 for old_id in superseded:
-                    _supersede(cur, store_project, mid, old_id)
+                    db.mark_superseded(old_id, mid, project=store_project)
 
                 auto_superseded = []
                 for c in contradictions:
                     if c["existing_id"] in superseded:
                         continue
-                    _supersede(cur, store_project, mid, c["existing_id"])
+                    db.mark_superseded(c["existing_id"], mid,
+                                       project=store_project)
                     auto_superseded.append(c)
 
                 # Carry metadata over from every replaced fact (same contract
@@ -1923,7 +1923,7 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
                             id=memory_id)
         else:
-            scopes = _memory_scopes(cur, memory_id)
+            scopes = db.scopes_of(memory_id)
             if len(scopes) > 1:
                 db.rollback()
                 return fail(STATUS_ERROR,
@@ -1938,14 +1938,9 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
             # NULLIF clears only the forgotten sentinel; a `superseded_by` id
             # from a real supersede stays set, so a restored memory cannot
             # resurrect next to the fact that replaced it.
-            cur.execute(
-                f"UPDATE {table} SET deleted_at = NULL, "
-                f"superseded_by = NULLIF(superseded_by, %s), "
-                f"updated_at = NOW() WHERE id = %s AND deleted_at IS NOT NULL",
-                (SENTINEL_FORGOTTEN, memory_id),
-            )
-            if cur.rowcount:
-                restored += cur.rowcount
+            count = db.restore(memory_id, tables=[table])
+            if count:
+                restored += count
                 restored_table = table
                 break
         db.commit()
@@ -2831,44 +2826,10 @@ def forget(
                 if not mid or not isinstance(mid, str):
                     bulk_results.append({"id": mid, "status": "error", "error": "invalid memory id"})
                     continue
-                found = False
-                for table in tables:
-                    if soft:
-                        if dry_run:
-                            cur.execute(
-                                f"SELECT COUNT(*) FROM {table} "
-                                f"WHERE id = %s AND deleted_at IS NULL",
-                                (mid,),
-                            )
-                            count = cur.fetchone()[0]
-                            if count:
-                                found = True
-                                counts["memories"] += count
-                        else:
-                            cur.execute(
-                                f"UPDATE {table} SET superseded_by = COALESCE(superseded_by, %s), "
-                                f"deleted_at = NOW() WHERE id = %s AND deleted_at IS NULL",
-                                (SENTINEL_FORGOTTEN, mid),
-                            )
-                            if cur.rowcount:
-                                found = True
-                                counts["memories"] += cur.rowcount
-                    else:
-                        if dry_run:
-                            cur.execute(
-                                f"SELECT COUNT(*) FROM {table} WHERE id = %s",
-                                (mid,),
-                            )
-                            count = cur.fetchone()[0]
-                            if count:
-                                found = True
-                                counts["memories"] += count
-                        else:
-                            cur.execute(f"DELETE FROM {table} WHERE id = %s", (mid,))
-                            if cur.rowcount:
-                                found = True
-                                counts["memories"] += cur.rowcount
-                if found:
+                removed, _touched = db.forget_rows(
+                    mid, tables=tables, soft=soft, dry_run=dry_run)
+                if removed:
+                    counts["memories"] += removed
                     bulk_results.append({"id": mid, "status": "deleted" if not soft else "soft_forgotten"})
                 else:
                     bulk_results.append({"id": mid, "status": "not_found"})
@@ -2888,7 +2849,7 @@ def forget(
             tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
             if project and not _table_exists(cur, tables[0]):
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
-            scopes = _memory_scopes(cur, memory_id)
+            scopes = db.scopes_of(memory_id)
             if not project and len(scopes) > 1:
                 # The same id can live in several scopes (an import copies
                 # the id). Removing it from all of them at once would
@@ -2899,32 +2860,9 @@ def forget(
                             f"the scopes {scopes}; pass project=<name> to say "
                             f"which one to remove",
                             id=memory_id, scopes=scopes)
-            for table in tables:
-                if soft:
-                    if dry_run:
-                        cur.execute(
-                            f"SELECT COUNT(*) FROM {table} "
-                            f"WHERE id = %s AND deleted_at IS NULL",
-                            (memory_id,),
-                        )
-                        counts["memories"] += cur.fetchone()[0]
-                    else:
-                        cur.execute(
-                            f"UPDATE {table} SET superseded_by = COALESCE(superseded_by, %s), "
-                            f"deleted_at = NOW() WHERE id = %s AND deleted_at IS NULL",
-                            (SENTINEL_FORGOTTEN, memory_id),
-                        )
-                        counts["memories"] += cur.rowcount
-                else:
-                    if dry_run:
-                        cur.execute(
-                            f"SELECT COUNT(*) FROM {table} WHERE id = %s",
-                            (memory_id,),
-                        )
-                        counts["memories"] += cur.fetchone()[0]
-                    else:
-                        cur.execute(f"DELETE FROM {table} WHERE id = %s", (memory_id,))
-                        counts["memories"] += cur.rowcount
+            removed, _touched = db.forget_rows(
+                memory_id, tables=tables, soft=soft, dry_run=dry_run)
+            counts["memories"] += removed
             if not counts["memories"]:
                 db.rollback()
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
@@ -2941,25 +2879,11 @@ def forget(
                     # rows a soft delete leaves alone: `memories` counts what
                     # this call hides/deletes, `already_forgotten` names the
                     # rows that are already hidden.
-                    table_counts = lifecycle_counts(cur, table)
+                    removed, table_counts = db.forget_scope(
+                        project, soft=soft, dry_run=dry_run)
+                    counts["memories"] += removed
                     counts["active_memories"] = table_counts["active"]
                     counts["already_forgotten"] = table_counts["forgotten"]
-                    if dry_run:
-                        # The preview must count what the real call removes:
-                        # a soft forget hides the active rows, a hard delete
-                        # takes the whole table.
-                        where = ("WHERE deleted_at IS NULL" if soft else "")
-                        cur.execute(f"SELECT COUNT(*) FROM {table} {where}")
-                        counts["memories"] += cur.fetchone()[0]
-                    elif soft:
-                        cur.execute(f"UPDATE {table} SET "
-                                    f"superseded_by = COALESCE(superseded_by, %s), "
-                                    f"deleted_at = NOW() WHERE deleted_at IS NULL",
-                                    (SENTINEL_FORGOTTEN,))
-                        counts["memories"] += cur.rowcount
-                    else:
-                        cur.execute(f"DELETE FROM {table}")
-                        counts["memories"] += cur.rowcount
                 cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s",
                             (scope,))
                 counts["entities"] = cur.fetchone()[0]

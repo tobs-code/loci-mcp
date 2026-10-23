@@ -27,7 +27,7 @@ from mcp_server.graph_store import (
     traverse as _traverse,
     upsert_edge as _upsert_edge,
 )
-from mcp_server.inference_client import embed
+from mcp_server.inference_gateway import embed
 from mcp_server.scopes import (
     _ensure_project_table,
     _mem_table,

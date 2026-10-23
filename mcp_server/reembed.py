@@ -12,7 +12,7 @@ import logging
 import sys
 
 from mcp_server.db import get_conn
-from mcp_server.inference_client import embed, health
+from mcp_server.inference_gateway import embed, health
 
 logger = logging.getLogger(__name__)
 

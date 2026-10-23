@@ -7,7 +7,7 @@ from mcp_server.config import (
     SENTINEL_FORGOTTEN,
 )
 from mcp_server.duplicates import find_duplicate, find_near_duplicate
-from mcp_server.inference_client import nli
+from mcp_server.inference_gateway import nli
 from mcp_server.lifecycle import ACTIVE_ROW_SQL
 from mcp_server.scopes import _mem_table, _retrieval_tables
 from mcp_server.scoring import _gen_id, _now, _content_hash

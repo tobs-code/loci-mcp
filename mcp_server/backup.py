@@ -9,7 +9,7 @@ from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.graph import _ensure_graph_entity, _relate_edges
-from mcp_server.inference_client import embed
+from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import is_expired, parse_expires_at
 from mcp_server.scopes import (
     _ensure_project_table,
