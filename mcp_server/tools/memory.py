@@ -1571,8 +1571,19 @@ def remember_batch(
                     ensured.add(store_project)
 
                 near_dup = None
+                exact_copy: str | None = None
+                fact_dedupe = spec.get("dedupe") or dedupe
+                if not skip_duplicates and fact_dedupe != "off":
+                    # skip_duplicates=false means "store it anyway", but the
+                    # caller still has to learn that an identical active row
+                    # already exists. _find_near_duplicate excludes exact
+                    # hashes, so only this explicit check can report it.
+                    existing_exact = _deduplicate(
+                        cur, spec["content"], store_project, None,
+                        dedupe="exact")
+                    if existing_exact:
+                        exact_copy = existing_exact[0]
                 if skip_duplicates:
-                    fact_dedupe = spec.get("dedupe") or dedupe
                     existing = _deduplicate(cur, spec["content"], store_project,
                                             embeddings[i], spec["fuzzy_threshold"],
                                             dedupe=fact_dedupe)
@@ -1762,6 +1773,10 @@ def remember_batch(
                      "warnings": []}
             if guard_warnings:
                 entry["warnings"] = guard_warnings
+            if exact_copy:
+                entry.setdefault("warnings", []).append(
+                    f"identical content is already active as {exact_copy}; "
+                    f"another copy was stored because skip_duplicates=false")
             if scope_warning:
                 entry.setdefault("warnings", []).append(scope_warning)
             if spec.get("ttl_warning"):
@@ -2744,7 +2759,7 @@ def forget(
     if memory_id and memory_ids:
         return fail(STATUS_ERROR, "memory_id and memory_ids are mutually exclusive")
     if not memory_id and not memory_ids and not entity_name:
-        return fail(STATUS_ERROR, "memory_id, memory_ids or entity_name is required")
+        return fail(STATUS_ERROR, "memory_id, memory_ids or entity is required")
     scope_name = project if project else "global"
     purge_all = entity_name == "*"
     # An explicit `project` names the scope to purge — including the reserved

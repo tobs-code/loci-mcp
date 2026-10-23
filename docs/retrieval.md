@@ -154,10 +154,11 @@ Memories age with a half-life of 90 days.
 - Decay contributes at most 30% of the score (`DECAY_WEIGHT = 0.3`); the
   remaining 70% is relevance, so recency cannot drown out semantics.
 - `min_decay_score` (0..1) filters on the normalized decay (`_decay_norm`):
-  `importance x recency` plus at most a 10% access-frequency bonus. A
-  brand-new memory with `importance=1.0` scores ~0.9, a 90-day-old one ~0.5,
-  so `min_decay_score=0.9` keeps fresh, important facts. The filter runs
-  before the access counters of the current query are counted.
+  `importance x recency` times an access factor of 0.9..1.0. A brand-new
+  memory with `importance=1.0` scores 0.9 (`importance=0.5` scores 0.45), a
+  90-day-old one roughly half of that, so `min_decay_score=0.9` keeps only
+  fresh, top-importance facts. The filter runs before the access counters of
+  the current query are counted.
 - `_decay_score` keeps the raw value (uncapped, can exceed 1.0).
 
 ## Graph boost
@@ -167,7 +168,8 @@ memories per connected entity and adds `_graph_boost = 0.3 * edge weight` on
 top of the relevance (blended with decay only when `include_decay=true`).
 Edge weights are limited to 0.0-1.0, so a single edge cannot dominate the
 ranking. Graph hits have no similarity and count as relevance 0 — they are
-lifted by the boost only.
+lifted by the boost only. Query hits keep their slots: graph-only additions
+fill the remaining page space and never displace a real query match.
 
 The expansion point is `graph_entity`; `entity` is the fallback. With
 `graph_entity` the query search stays unfiltered ("query hits + graph

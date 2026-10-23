@@ -12,7 +12,10 @@ import pytest
 from psycopg2 import sql
 
 DIM = 768
-DEFAULT_TEST_DB = "postgresql://memory:geheim@localhost:5432/loci_test"
+# 127.0.0.1 instead of "localhost": on Windows, "localhost" resolves to ::1
+# first and a Docker port that only listens on IPv4 makes each connection
+# hang for the full TCP timeout before falling back.
+DEFAULT_TEST_DB = "postgresql://memory:geheim@127.0.0.1:5432/loci_test"
 
 
 def _tokens(text: str) -> list[str]:

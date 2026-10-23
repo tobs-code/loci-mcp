@@ -397,6 +397,20 @@ def relate_batch(
     if not edges:
         return fail(STATUS_ERROR, "edges must not be empty: pass at least one "
                                   "edge or omit the call")
+    # Validate per edge before the all-or-nothing transaction: an invalid
+    # edge in a long batch used to abort the whole call with an error that
+    # named neither the offending edge nor its position.
+    for i, edge in enumerate(edges):
+        try:
+            if not _norm_entity(edge.get("from_entity")) \
+                    or not _norm_entity(edge.get("to_entity")):
+                raise ValueError(
+                    "each edge needs 'from_entity' and 'to_entity'")
+            _safe_ident(edge.get("relation_type") or "", "relation_type")
+            _validate_weight(edge.get("weight", 1.0))
+            _norm_project(edge.get("project", project))
+        except (TypeError, ValueError) as e:
+            return fail(STATUS_ERROR, f"edge {i}: {e}")
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -414,7 +428,12 @@ def relate_batch(
                                []).append((i, edge))
         results: list[Any] = [None] * len(edges)
         for scope, pairs in indexed.items():
-            batch = _relate_edges(cur, [edge for _, edge in pairs], scope)
+            try:
+                batch = _relate_edges(cur, [edge for _, edge in pairs], scope)
+            except Exception as e:
+                positions = [pos for pos, _ in pairs]
+                raise ValueError(
+                    f"edge(s) at index {positions} failed: {e}") from e
             for (pos, _), result in zip(pairs, batch):
                 results[pos] = result
         conn.commit()

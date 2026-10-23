@@ -52,8 +52,8 @@ def _decay_norm(created_at: datetime, updated_at: datetime | None,
 
     The score is `importance × recency` with a small access-frequency bonus
     (at most 10%). A brand-new memory with importance 1.0 therefore scores
-    0.90, and `min_decay_score=0.9` keeps fresh, important facts instead of
-    excluding them. Frequency only separates memories of similar age.
+    0.90 and one with importance 0.9 scores 0.81. Frequency only separates
+    memories of similar age.
     """
     recency = _recency_factor(created_at, updated_at)
     access_ratio = min(max(access_count, 0), DECAY_ACCESS_CAP) / DECAY_ACCESS_CAP

@@ -975,6 +975,11 @@ def _search_memories_graph_boost(
             base = relevance
         r["_final_score"] = _clamp01(base + graph_boost)
 
-    # Sort by final score and limit
-    all_results.sort(key=lambda x: -x.get("_final_score", 0))
-    return all_results[:limit]
+    # Query hits always rank before graph-only additions. A graph hit carries
+    # no similarity to the query, so on a tie it must not push a weak but real
+    # query match out of the page: it fills the remaining slots.
+    query_hits = [r for r in all_results if not r.get("_graph_source")]
+    graph_hits = [r for r in all_results if r.get("_graph_source")]
+    query_hits.sort(key=lambda x: -x.get("_final_score", 0))
+    graph_hits.sort(key=lambda x: -x.get("_final_score", 0))
+    return (query_hits + graph_hits)[:limit]

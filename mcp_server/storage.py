@@ -223,6 +223,11 @@ def _find_near_duplicate(cur, content: str, project: str | None,
         f"FROM {table} "
         f"WHERE content_hash <> %s "
         f"AND {ACTIVE_ROW_SQL} "
+        # A relation-context sentence describes a graph edge, not a fact of
+        # the entity it mentions. Comparing a new fact against it produced a
+        # "near-duplicate across entities" warning for every entity name that
+        # also appeared in an edge sentence, which is noise, not a fork.
+        f"AND COALESCE(metadata->>'relation_context', 'false') <> 'true' "
         f"AND embedding IS NOT NULL{exclude_sql} "
         f"ORDER BY dist ASC LIMIT 1",
         params,

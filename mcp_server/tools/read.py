@@ -171,8 +171,9 @@ def recall(
     min_decay_score: Annotated[
         float | None,
         Field(description="Only keep memories with a normalized decay score of at "
-                          "least this value (0.0-1.0). A fresh, important memory "
-                          "scores ~0.9, an old one ~0.5.")] = None,
+                          "least this value (0.0-1.0). A fresh memory with "
+                          "importance 1.0 scores 0.9, importance 0.5 scores "
+                          "0.45; a 90-day-old one ~0.5 of that.")] = None,
     include_superseded: Annotated[
         bool,
         Field(description="Also return superseded memories (history). Forgotten "
@@ -261,6 +262,8 @@ def recall(
     used for the expansion *and* filters the search, so unrelated hits are
     dropped. Graph hits have no similarity: their `_similarity` and
     `_relevance_score` are null and they carry `_graph_boost` instead.
+    Graph-only hits fill the slots left by query hits; they never push a
+    query match out of the page.
     `min_similarity` defaults to 0.40 and only applies to the vector retriever;
     a full-text hit is kept even when its embedding is a poor match, so an
     exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
@@ -283,8 +286,9 @@ def recall(
     plus the graph boost. It is only present with `include_decay=True` or
     `graph_boost=True`; without them the ranking is `_relevance_score`.
     Set include_decay=True to blend in recency/frequency (max 30% of the score).
-    min_decay_score (0..1) filters on the normalized decay score; a fresh,
-    important memory scores ~0.9, an old one ~0.5.
+    min_decay_score (0..1) filters on the normalized decay score; a fresh
+    memory with importance 1.0 scores 0.9 (importance 0.5 scores 0.45), and
+    a 90-day-old one is roughly half of that.
     Set only_superseded=True to return only invalidated facts.
     Set fields=["id", "content"] to receive only the named columns.
     Set include_global=False to restrict a project search to project memories.
@@ -1015,6 +1019,23 @@ def list_memories(
         warnings.append(
             f"{expired_count} result(s) have an expired TTL: they are not "
             f"active memories anymore")
+    if total == 0:
+        # An empty browse with narrowing filters is ambiguous: the scope may
+        # be empty or the filter may have excluded everything. Naming the
+        # active filters lets the caller retry instead of concluding that no
+        # memory exists.
+        filters = [
+            name for name, value in (
+                ("entity", entity), ("mem_type", mem_type),
+                ("contains", contains), ("updated_after", updated_after),
+                ("metadata_filter", metadata_filter),
+            ) if value
+        ]
+        if filters:
+            warnings.append(
+                f"no memories matched: the filter(s) "
+                f"{', '.join(filters)} narrowed the result to zero; widen or "
+                f"remove them")
     return ok(STATUS_OK, count=len(results), total=total, offset=offset,
               has_more=has_more,
               next_offset=(offset + limit) if has_more else None,
@@ -1201,27 +1222,35 @@ def _relation_context_memories(cur, target: str, tables: list[str],
 
 def _count_entity_memories(cur, target: str, tables: list[str],
                            include_superseded: bool,
-                           include_expired: bool = False) -> int:
-    """Number of memories that belong to an entity, across the given tables.
+                           include_expired: bool = False) -> tuple[int, int]:
+    """Number of rows `get_entity` would list for an entity, and how many
+    active cross-scope copies the dedupe hides.
 
-    The count is taken over the union of the tables, so a memory that exists
-    in the project *and* in the global scope is counted once - exactly like
-    the listing itself, which deduplicates by content.
+    The count has to follow the same rule as the listing: an active copy in
+    another scope is hidden, but two identical rows inside one scope stay
+    visible (dedupe="off" deliberately allows them). A plain SQL UNION
+    deduplicated by content hash in *both* cases, so a scope with an
+    intentional duplicate reported fewer rows than the page held.
     """
     if not tables:
-        return 0
+        return 0, 0
     where = ("entity = %s AND " + visibility_condition(
         include_superseded=include_superseded,
         include_expired=include_expired))
-    parts = [
-        f"SELECT COALESCE(content_hash, id) AS key FROM {table} WHERE {where}"
-        for table in tables
-    ]
-    cur.execute(
-        "SELECT COUNT(*) FROM (" + " UNION ".join(parts) + ") AS u",
-        (target,) * len(parts),
-    )
-    return cur.fetchone()[0]
+    rows: list[dict] = []
+    for table in tables:
+        cur.execute(
+            f"SELECT id, content_hash, superseded_by, deleted_at "
+            f"FROM {table} WHERE {where}",
+            (target,),
+        )
+        rows.extend({
+            "id": row[0], "content_hash": row[1],
+            "superseded_by": row[2], "deleted_at": row[3],
+            "_table": table,
+        } for row in cur.fetchall())
+    unique, hidden = _dedup_rows_across_scopes(rows)
+    return len(unique), hidden
 
 
 def get_entity(name: Annotated[
@@ -1332,21 +1361,38 @@ def get_entity(name: Annotated[
         cur.execute("SELECT project FROM entities WHERE name = %s", (target,))
         for (entity_project,) in cur.fetchall():
             scope_presence[entity_project or "global"] = "graph"
+        total, hidden_duplicates = _count_entity_memories(
+            cur, target, used_tables, include_superseded, include_expired)
+        # Fetch enough rows that the cross-scope copies the dedupe removes
+        # cannot leave the page short. Adding just the hidden count keeps a
+        # big entity from loading every row for a ten-item page.
         memories = _search_memories(cur, None, None, None, target,
-                                    limit + offset + 1, project,
+                                    offset + limit + 1 + hidden_duplicates,
+                                    project,
                                     include_superseded=include_superseded,
                                     include_expired=include_expired,
                                     tables=tables)
-        total = _count_entity_memories(cur, target, used_tables,
-                                       include_superseded, include_expired)
+        # An identical active fact in project and global is one row: the page
+        # must apply the same rule as the count, otherwise `total`, `count`
+        # and the last page disagree (a 12-row page could claim total=11).
+        memories, _hidden_duplicates = _dedup_rows_across_scopes(memories)
         # The context sentence of an edge belongs to both of its endpoints.
+        # Its content is deduplicated against the entity rows and against the
+        # other scopes' context sentences for the same reason.
         known_ids = {m.get("id") for m in memories}
+        known_hashes = {m.get("content_hash") for m in memories
+                        if m.get("content_hash")}
         for row in _relation_context_memories(
             cur, target, used_tables, include_superseded, include_expired
         ):
             if row.get("id") in known_ids:
                 continue
+            row_hash = row.get("content_hash")
+            if row_hash and row_hash in known_hashes:
+                continue
             known_ids.add(row.get("id"))
+            if row_hash:
+                known_hashes.add(row_hash)
             memories.append(row)
             total += 1
             relation_context_count += 1

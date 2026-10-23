@@ -613,6 +613,11 @@ def contradictions_report(entity: Annotated[
             try:
                 cur = conn.cursor()
                 tables = _retrieval_tables(cur, project)
+                # Decide every pair before the first write. The UPDATE bumps
+                # `updated_at` of the superseded row, so re-reading timestamps
+                # between pairs would flip its recency and make the same dry
+                # run and real run disagree.
+                plan: list[tuple[dict, str, str]] = []
                 for pair in resolvable:
                     a_id, b_id = pair["a"]["id"], pair["b"]["id"]
                     timestamps = {}
@@ -630,10 +635,28 @@ def contradictions_report(entity: Annotated[
                     b_ts = timestamps.get(b_id)
                     keep_a = a_ts is not None and (b_ts is None or a_ts >= b_ts)
                     older, newer = (b_id, a_id) if keep_a else (a_id, b_id)
+                    plan.append((pair, older, newer))
+
+                # A memory can appear as the older side of several pairs (one
+                # fact conflicts with two neighbours). The real UPDATE then
+                # changes the first resolution only; the dry run has to count
+                # the same way instead of promising more fixes than a real
+                # call performs.
+                invalidated: set[str] = set()
+                for pair, older, newer in plan:
+                    if older in invalidated:
+                        pair["resolution"] = {
+                            "superseded": older, "kept": newer,
+                            **({"dry_run": True} if dry_run else {}),
+                            "skipped": "already superseded by an earlier "
+                                       "pair in this run",
+                        }
+                        continue
                     if dry_run:
                         # Report the decision without writing it: the caller
                         # sees exactly what a real run would invalidate.
                         would_resolve += 1
+                        invalidated.add(older)
                         pair["resolution"] = {
                             "superseded": older, "kept": newer,
                             "dry_run": True,
@@ -650,7 +673,14 @@ def contradictions_report(entity: Annotated[
                         changed += cur.rowcount
                     if changed:
                         resolved += 1
+                        invalidated.add(older)
                         pair["resolution"] = {"superseded": older, "kept": newer}
+                    else:
+                        pair["resolution"] = {
+                            "superseded": older, "kept": newer,
+                            "skipped": "already superseded by an earlier "
+                                       "pair in this run",
+                        }
                 conn.commit()
             except Exception as e:
                 conn.rollback()
@@ -832,8 +862,13 @@ def verify_integrity(
                 f"{len(dangling) + len(self_refs)} broken supersede link(s) "
                 f"hide rows from every read; call verify_integrity(fix=true) "
                 f"to clear them")
-    elif total:
+    elif total and not chains:
         warnings.append("no integrity problems found")
+    if chains:
+        warnings.append(
+            f"{chains} supersede chain(s) found: A replaced by B and B "
+            f"replaced by C is legal, but verify the second replacement was "
+            f"intended (see results)")
     if expired_active:
         warnings.append(
             f"{expired_active} active memory/memories have a passed TTL and "

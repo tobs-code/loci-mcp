@@ -33,7 +33,8 @@ def _export_memories_json(cur, project: str | None,
                           mem_type: str | None = None,
                           updated_after: str | None = None,
                           metadata_filter: dict | None = None,
-                          include_expired: bool = True) -> list[dict]:
+                          include_expired: bool = True,
+                          include_deleted: bool | None = None) -> list[dict]:
     names = _project_names(cur)
     if project:
         tables = [(_mem_table(project), project)]
@@ -49,8 +50,24 @@ def _export_memories_json(cur, project: str | None,
     emb_col = ", embedding" if include_embeddings else ""
     conditions: list[str] = []
     params: list[Any] = []
-    if not include_superseded:
-        conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+    # `include_deleted=None` keeps the historical behaviour: asking for
+    # superseded history always brought flat-out forgotten rows along. An
+    # explicit false separates the two, so a backup of invalidated history no
+    # longer resurrects facts that were deliberately forgotten.
+    if include_deleted is None:
+        if not include_superseded:
+            conditions.append("superseded_by IS NULL AND deleted_at IS NULL")
+    else:
+        if not include_superseded:
+            if include_deleted:
+                # Forgotten rows carry the sentinel in `superseded_by`, so
+                # excluding superseded history must not drop them too.
+                conditions.append(
+                    "(superseded_by IS NULL OR deleted_at IS NOT NULL)")
+            else:
+                conditions.append("superseded_by IS NULL")
+        if not include_deleted:
+            conditions.append("deleted_at IS NULL")
     if not include_expired:
         # Symmetric with every read tool: an expired row is inactive. The
         # default keeps it (a backup must not lose the TTL/history), but a
@@ -208,6 +225,13 @@ def export_memories(
     include_superseded: Annotated[
         bool,
         Field(description="Include superseded (invalidated) memories.")] = False,
+    include_deleted: Annotated[
+        bool | None,
+        Field(description="Include soft-forgotten memories. None (default) "
+                          "follows include_superseded for backwards "
+                          "compatibility; false keeps forgotten rows out "
+                          "even when superseded history is exported; true "
+                          "includes them with their deleted_at.")] = None,
     include_expired: Annotated[
         bool,
         Field(description="Include memories whose TTL has passed (default "
@@ -237,6 +261,9 @@ def export_memories(
     Without `project` every scope is exported and each record carries its
     `project`. IDs, `superseded_by` and timestamps are preserved, so imports
     can restore the exact state. The graph is only included in JSON exports.
+    `include_deleted` separates soft-forgotten rows from superseded history:
+    pass false to export invalidated facts without deliberately forgotten
+    ones, true to include both.
 
     The payload is returned in "data" and can be passed to `import_memories`
     unchanged.
@@ -263,11 +290,13 @@ def export_memories(
                                      entity=entity, mem_type=mem_type,
                                      updated_after=updated_after,
                                      metadata_filter=metadata_filter,
-                                     include_expired=include_expired)
+                                     include_expired=include_expired,
+                                     include_deleted=include_deleted)
         graph = (_export_graph(cur, project, only_global=only_global,
                                entity=entity)
                  if (include_graph and format != "jsonl") else None)
-        excluded = ((0, 0) if include_superseded
+        excluded = ((0, 0)
+                    if (include_superseded and include_deleted is not False)
                     else _export_excluded_counts(cur, project, only_global))
         conn.commit()
     except Exception as e:
@@ -288,7 +317,10 @@ def export_memories(
             "mem_type": r["mem_type"],
             "entity": r["entity"],
             "project": r["project"],
-            "importance": float(r["importance"]) if r.get("importance") is not None else 1.0,
+            # A missing value must not invent a prominence the memory never
+            # had: 0.5 is the same default every write tool uses.
+            "importance": (float(r["importance"])
+                           if r.get("importance") is not None else 0.5),
             "metadata": r.get("metadata") if isinstance(r.get("metadata"), dict) else json.loads(r.get("metadata") or "{}"),
             "created_at": r["created_at"].isoformat() if isinstance(r["created_at"], datetime) else str(r["created_at"]),
             "updated_at": r["updated_at"].isoformat() if isinstance(r["updated_at"], datetime) else str(r["updated_at"]),
@@ -335,6 +367,13 @@ def export_memories(
             "include_expired=false: memories whose TTL has passed were left "
             "out of the export")
     superseded_count, forgotten_count = excluded
+    # The counts cover both kinds of history; drop the kind that was actually
+    # exported (an explicit include_deleted=true with include_superseded=false
+    # keeps forgotten rows, so they must not be reported as excluded).
+    if include_superseded:
+        superseded_count = 0
+    if include_deleted:
+        forgotten_count = 0
     if superseded_count or forgotten_count:
         parts = []
         if superseded_count:
@@ -347,9 +386,16 @@ def export_memories(
             where = f" of project {project!r}"
         else:
             where = " across all scopes"
-        warnings.append(
-            "export excludes " + " and ".join(parts) + " memories"
-            + where + "; pass include_superseded=true for a complete backup")
+        if include_superseded and include_deleted is False:
+            warnings.append(
+                f"export excludes {forgotten_count} soft-forgotten "
+                f"memory/memories{where}; pass include_deleted=true to "
+                f"include them")
+        else:
+            warnings.append(
+                "export excludes " + " and ".join(parts) + " memories"
+                + where + "; pass include_superseded=true for a complete "
+                  "backup")
     if format == "jsonl":
         data = "\n".join(json.dumps(r) for r in records)
         return ok(STATUS_OK, format=format, count=len(records), data=data,
@@ -597,7 +643,9 @@ def import_memories(
                     (mid, content, _content_hash(content), emb,
                      rec.get("type") or rec.get("mem_type", "fact"),
                      "project" if target else "global",
-                     rec.get("entity"), float(rec.get("importance", 1.0)),
+                     rec.get("entity"),
+                     (float(rec["importance"])
+                      if rec.get("importance") is not None else 0.5),
                      json.dumps(meta), int(rec.get("access_count", 0) or 0),
                      rec.get("superseded_by"), _parse_dt(rec.get("deleted_at")),
                      expires, _parse_dt(rec.get("created_at")),
