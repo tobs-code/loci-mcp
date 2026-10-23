@@ -18,6 +18,7 @@ from mcp_server.scopes import (
     _project_names,
     _project_suffix,
     _retrieval_tables,
+    superseded_marker_sql,
 )
 from mcp_server.search import _search_memories
 from mcp_server.storage import ACTIVE_ROW_SQL
@@ -171,9 +172,13 @@ def _nli_workers() -> int:
 
 def contradictions_report(entity: Annotated[
         str | None,
-        Field(description="Entity to check. Without it every active memory in "
-                          "the scope is cross-checked against its nearest "
-                          "neighbours (pairs across entities included).")] = None,
+        Field(description="Entity to check. The scan covers this entity's "
+                          "memories plus untagged (entity-less) memories of "
+                          "the scope as their neighbours: a conflict between "
+                          "a tagged and an untagged fact stays visible. "
+                          "Without it every active memory in the scope is "
+                          "cross-checked against its nearest neighbours "
+                          "(pairs across entities included).")] = None,
     project: Annotated[
         str | None,
         Field(description="Project scope. Without it only global memories are "
@@ -222,7 +227,10 @@ def contradictions_report(entity: Annotated[
     Returns pairs with confidence scores in [0, 1] (higher = more likely contradictory).
     Without `entity` the scan is scope-wide: all active memories compete for
     the candidate slots, so conflicts between differently tagged entities are
-    reported too. With `resolve="newest"` the older memory of every confirmed
+    reported too. With `entity` the scan covers that entity's memories plus
+    untagged neighbours of the scope, so a tagged/untagged conflict stays
+    visible (cross-entity pairs are reported, never auto-resolved). With
+    `resolve="newest"` the older memory of every confirmed
     pair of the SAME entity is superseded by the newer one (the report names
     the ids); cross-entity pairs stay untouched. An empty result says in
     `warnings` why it is empty: nothing to compare, no similar pair, or no
@@ -259,25 +267,48 @@ def contradictions_report(entity: Annotated[
         # decision that contradicts a pattern is a conflict too.
         facts = _search_memories(cur, None, None, None, entity, 200, project,
                                   include_embedding=True, include_superseded=False)
-        if len(facts) < 2:
+        if entity is None and len(facts) < 2:
+            # Only a scope-wide scan can bail early: with an entity a single
+            # seed still competes against untagged neighbours of the scope,
+            # and a tagged/untagged conflict must stay visible.
             conn.commit()
-            scope_desc = (f"entity {entity!r} has" if entity
-                          else "the scope has")
             return ok(STATUS_OK, count=0, results=[], warnings=[
-                f"nothing to compare: {scope_desc} "
+                f"nothing to compare: the scope has "
                 f"{len(facts)} active memory/memories - a contradiction needs "
                 f"at least two"
             ])
 
         tables = _retrieval_tables(cur, project)
+        if entity is not None and len(facts) < 2:
+            # The seeds alone are not comparable, but the scope may still hold
+            # untagged neighbours: only bail when the scope has no other row
+            # to compare against at all.
+            scope_active = 0
+            for table in tables:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {table} "
+                    f"WHERE embedding IS NOT NULL AND " + ACTIVE_ROW_SQL)
+                scope_active += cur.fetchone()[0]
+            if scope_active < 2:
+                conn.commit()
+                return ok(STATUS_OK, count=0, results=[], warnings=[
+                    f"nothing to compare: the scope has "
+                    f"{scope_active} active memory/memories - a contradiction "
+                    f"needs at least two"
+                ])
+
         neighbors_per_fact = _neighbors_per_fact()
         # fact id -> list of (neighbour id, neighbour content)
         checked: set[tuple[str, str]] = set()
         fact_ids = {f["id"] for f in facts}
         # The self-join only sees the entity when one was given: a
         # scope-wide scan must be able to report pairs across entities.
+        # With an entity, untagged neighbours stay in the candidate pool:
+        # a fact stored without an entity can conflict with the entity's
+        # facts, and an entity-scoped scan that hid such a pair would make
+        # the report look clean while the conflict is still active.
         if entity:
-            entity_sql = "AND entity = %s"
+            entity_sql = "AND (entity = %s OR entity IS NULL)"
             entity_params: list[Any] = [entity]
         else:
             entity_sql = ""
@@ -309,7 +340,9 @@ def contradictions_report(entity: Annotated[
                     + [f["embedding"], neighbors_per_fact],
                 )
                 for nid, ncontent, nentity in cur.fetchall():
-                    if nid not in fact_ids:
+                    # Seeds are the entity's memories; an untagged neighbour
+                    # is not in `fact_ids` but is a valid counterpart.
+                    if nid not in fact_ids and nentity is not None:
                         continue
                     pair = tuple(sorted([f["id"], nid]))
                     if pair not in checked:
@@ -743,6 +776,10 @@ def verify_integrity(
     unintended second write. Broken links and chains are listed in `results`;
     `chains` counts them even when `limit` truncates the list. Expired-but-active
     rows are counted as context, not as an error.
+
+    With `fix=true` the counts and `results` describe the state AFTER the
+    repair (`fixed` carries what was cleared), so a call reads as an answer
+    to "is the scope clean now?".
     """
     logger.info("verify_integrity project=%s fix=%s", project, fix)
     try:
@@ -764,75 +801,87 @@ def verify_integrity(
         if not tables:
             return fail(STATUS_ERROR, f"unknown project {name!r}")
 
-        # A supersede link may point into another scope (cross-scope
-        # supersede), so validity is checked against every scope, not only
-        # the selected one.
-        all_ids: set[str] = set()
-        for table in all_tables:
-            cur.execute(f"SELECT id FROM {table}")
-            all_ids |= {row[0] for row in cur.fetchall()}
-
         names = _project_names(cur)
-        details: list[dict[str, Any]] = []
-        dangling: list[tuple[str, str, str]] = []
-        self_refs: list[tuple[str, str, str]] = []
-        links: dict[str, str] = {}
-        link_rows: dict[str, tuple[str, str | None, str]] = {}
+
+        def _scan():
+            # A supersede link may point into another scope (cross-scope
+            # supersede), so validity is checked against every scope, not
+            # only the selected one. The scan returns the full state; the
+            # fix branch re-runs it so the report describes the state AFTER
+            # the fix, not a stale pre-fix picture.
+            all_ids: set[str] = set()
+            for table in all_tables:
+                cur.execute(f"SELECT id FROM {table}")
+                all_ids |= {row[0] for row in cur.fetchall()}
+
+            details: list[dict[str, Any]] = []
+            dangling: list[tuple[str, str, str]] = []
+            self_refs: list[tuple[str, str, str]] = []
+            links: dict[str, str] = {}
+            link_rows: dict[str, tuple[str, str | None, str]] = {}
+            total = 0
+            for table in tables:
+                scope = ("global" if table == "memories"
+                         else names.get(table[len("mem_"):],
+                                        table[len("mem_"):]))
+                cur.execute(
+                    f"SELECT id, superseded_by, entity, content FROM {table} "
+                    f"WHERE superseded_by IS NOT NULL "
+                    f"AND superseded_by <> %s", (SENTINEL_FORGOTTEN,))
+                for mid, sup, entity, content in cur.fetchall():
+                    total += 1
+                    links[mid] = sup
+                    link_rows[mid] = (scope, entity, content)
+                    if sup == mid:
+                        self_refs.append((table, mid, entity))
+                    elif sup not in all_ids:
+                        dangling.append((table, mid, entity))
+                    if len(details) < limit and (sup == mid
+                                                 or sup not in all_ids):
+                        details.append({
+                            "project": scope,
+                            "id": mid,
+                            "superseded_by": sup,
+                            "entity": entity,
+                            "content": content[:200],
+                            "problem": ("self_reference" if sup == mid
+                                        else "dangling_superseded_by"),
+                        })
+            return details, dangling, self_refs, links, link_rows, total
+
+        def _chain_details(links, link_rows, details):
+            # A chain (A -> B -> C) is legal after repeated supersede, but a
+            # chain whose middle link is dangling is not: report the count
+            # and list the rows so a caller can spot repeated rewrites of
+            # one fact instead of only seeing a number.
+            chain_links = [
+                (mid, sup, links[sup]) for mid, sup in links.items()
+                if sup in links and links.get(sup) != mid
+            ]
+            for mid, sup, chain_to in chain_links:
+                if len(details) >= limit:
+                    break
+                scope, entity, content = link_rows[mid]
+                details.append({
+                    "project": scope,
+                    "id": mid,
+                    "superseded_by": sup,
+                    "chain_to": chain_to,
+                    "entity": entity,
+                    "content": content[:200],
+                    "problem": "supersede_chain",
+                })
+            return len(chain_links)
+
+        details, dangling, self_refs, links, link_rows, total = _scan()
         expired_active = 0
-        total = 0
         for table in tables:
-            scope = ("global" if table == "memories"
-                     else names.get(table[len("mem_"):], table[len("mem_"):]))
             cur.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE superseded_by IS NULL "
                 f"AND deleted_at IS NULL AND expires_at IS NOT NULL "
                 f"AND expires_at <= NOW()")
             expired_active += cur.fetchone()[0]
-            cur.execute(
-                f"SELECT id, superseded_by, entity, content FROM {table} "
-                f"WHERE superseded_by IS NOT NULL "
-                f"AND superseded_by <> %s", (SENTINEL_FORGOTTEN,))
-            for mid, sup, entity, content in cur.fetchall():
-                total += 1
-                links[mid] = sup
-                link_rows[mid] = (scope, entity, content)
-                if sup == mid:
-                    self_refs.append((table, mid, entity))
-                elif sup not in all_ids:
-                    dangling.append((table, mid, entity))
-                if len(details) < limit and (sup == mid or sup not in all_ids):
-                    details.append({
-                        "project": scope,
-                        "id": mid,
-                        "superseded_by": sup,
-                        "entity": entity,
-                        "content": content[:200],
-                        "problem": ("self_reference" if sup == mid
-                                    else "dangling_superseded_by"),
-                    })
-
-        # A chain (A -> B -> C) is legal after repeated supersede, but a chain
-        # whose middle link is dangling is not: report the count and list the
-        # rows so a caller can spot repeated rewrites of one fact instead of
-        # only seeing a number.
-        chain_links = [
-            (mid, sup, links[sup]) for mid, sup in links.items()
-            if sup in links and links.get(sup) != mid
-        ]
-        chains = len(chain_links)
-        for mid, sup, chain_to in chain_links:
-            if len(details) >= limit:
-                break
-            scope, entity, content = link_rows[mid]
-            details.append({
-                "project": scope,
-                "id": mid,
-                "superseded_by": sup,
-                "chain_to": chain_to,
-                "entity": entity,
-                "content": content[:200],
-                "problem": "supersede_chain",
-            })
+        chains = _chain_details(links, link_rows, details)
 
         fixed = 0
         if fix and (dangling or self_refs):
@@ -843,6 +892,14 @@ def verify_integrity(
                     (mid,))
                 fixed += 1
             conn.commit()
+            # Re-scan after the fix: the response keys
+            # (`dangling_superseded_by`, `self_references`, `superseded_links`)
+            # and `results` describe the state AFTER the repair, so a caller
+            # can read the call as "is it clean now?" instead of a stale
+            # pre-fix picture; `fixed` carries what was cleared. TTL rows are
+            # unaffected by the fix, so `expired_active` keeps its count.
+            details, dangling, self_refs, links, link_rows, total = _scan()
+            chains = _chain_details(links, link_rows, details)
         else:
             conn.commit()
     except Exception as e:
@@ -852,16 +909,18 @@ def verify_integrity(
         conn.close()
 
     warnings: list[str] = []
-    if dangling or self_refs:
-        if fix:
-            warnings.append(
-                f"cleared {fixed} broken supersede link(s); those memories "
-                f"are readable history now")
-        else:
-            warnings.append(
-                f"{len(dangling) + len(self_refs)} broken supersede link(s) "
-                f"hide rows from every read; call verify_integrity(fix=true) "
-                f"to clear them")
+    if fixed:
+        # After a fix the scan reports the post-fix state (no dangling rows
+        # left, so `dangling`/`self_refs` are empty); `fixed` says what the
+        # repair cleared.
+        warnings.append(
+            f"cleared {fixed} broken supersede link(s); those memories "
+            f"are readable history now")
+    elif dangling or self_refs:
+        warnings.append(
+            f"{len(dangling) + len(self_refs)} broken supersede link(s) "
+            f"hide rows from every read; call verify_integrity(fix=true) "
+            f"to clear them")
     elif total and not chains:
         warnings.append("no integrity problems found")
     if chains:
@@ -942,7 +1001,9 @@ def stats_resource() -> str:
                 # Superseded is orthogonal to the soft delete: count the
                 # history marker itself, not only rows that were never
                 # forgotten (see init_context counting for the same reason).
-                f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
+                # The `__forgotten__` sentinel also lives in `superseded_by`
+                # and must not inflate the superseded count.
+                f"COUNT(*) FILTER (WHERE {superseded_marker_sql()}), "
                 f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
                 f"FROM {table}"
             )

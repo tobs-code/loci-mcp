@@ -32,7 +32,10 @@ keys (`counts` for `forget`, `superseded` for `remember`, `projects` /
 
 Failed calls never raise. Invalid arguments (missing, wrong type, invalid
 TTL/project) return the same envelope with `ok: false` and an `error` naming
-the argument.
+the argument. The schema is the contract: a top-level argument the tool does
+not accept (a forgotten or renamed parameter) is refused with
+`unknown argument(s) ...; accepted arguments are: ...` instead of being
+silently ignored.
 
 ## MCP Tools (22 total)
 
@@ -75,10 +78,10 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`, `budget_seconds` (NLI wall-clock budget, default 25s). Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only; cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. When the budget runs out the scan stops early, sets `budget_exhausted` and lists every unjudged pair in `nli_failures` (`reason: skipped: NLI time budget exhausted`); `nli_failures_count`/`nli_failure_summary` summarize them without reading every entry, and other NLI failures are named there too. |
+| `contradictions_report` | NLI-check conflicting active memories. `entity` optional (an entity scan covers that entity's memories **plus untagged neighbours** of the scope, so a tagged/untagged conflict stays visible; cross-entity pairs are reported, never auto-resolved; without it the scan is scope-wide), `project`, `resolve` (`none`/`newest`), `resolve_min_confidence` (default 0.8), `dry_run`, `limit`, `budget_seconds` (NLI wall-clock budget, default 25s). Pairs carry both entities and `cross_entity`. `newest` resolves same-entity pairs only; cross-entity pairs, pairs below the confidence floor and pairs without a shared content word (`_shares_subject`) stay active with a named warning, so a noisy NLI hit cannot invalidate an unrelated fact. `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing. When the budget runs out the scan stops early, sets `budget_exhausted` and lists every unjudged pair in `nli_failures` (`reason: skipped: NLI time budget exhausted`); `nli_failures_count`/`nli_failure_summary` summarize them without reading every entry, and other NLI failures are named there too. |
 | `export_memories` | Backup in `data`. `format` (`json`/`jsonl`), `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default keeps the historical behaviour: `include_superseded=true` carries forgotten rows; `false` leaves soft-forgotten rows out), `include_expired` (default `true`; `false` leaves expired rows out), `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`. JSON includes the graph; JSONL is flat and warns that `include_graph` was ignored. `entity` narrows the graph too and keeps the other endpoints of the exported edges so the graph stays complete; the other memory filters do not narrow the graph and warn. Warns about excluded history and included expired rows. |
-| `import_memories` | Restore `data` (object or JSON string). `project`, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`. Keeps ids and timestamps; re-import is idempotent. Skips are split into `skipped_reasons`. Broken metadata is reported per record and skipped. `dry_run` adds `would_create`; dangling supersede links left by a partial backup are cleared with a warning. |
-| `verify_integrity` | Find rows hidden by a broken `superseded_by` (target missing or self), report supersede chains and expired active rows. Broken links and chain rows are listed in `results` (`problem` names the kind, chains also carry `chain_to`); `chains` counts them even when `limit` truncates the list; a chain alone adds a warning instead of "no integrity problems found". `project`, `fix` (clear broken links), `limit`. `fix=true` never deletes content or restores a valid supersede. |
+| `import_memories` | Restore `data` (object or JSON string). `project`, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`. Keeps ids and timestamps; re-import is idempotent. Skips are split into `skipped_reasons`. Broken metadata is reported per record and skipped. `dry_run` adds `would_create`; dangling supersede links left by a partial backup are cleared with a warning, and self-referencing or internal (`__forgotten__`) `superseded_by` values of imported records are cleared the same way (`repaired_self_references`). |
+| `verify_integrity` | Find rows hidden by a broken `superseded_by` (target missing or self), report supersede chains and expired active rows. Broken links and chain rows are listed in `results` (`problem` names the kind, chains also carry `chain_to`); `chains` counts them even when `limit` truncates the list; a chain alone adds a warning instead of "no integrity problems found". `project`, `fix` (clear broken links), `limit`. `fix=true` never deletes content or restores a valid supersede, and the counts and `results` then describe the state AFTER the repair (`fixed` carries what was cleared). |
 | `drop_project` | Remove a scope completely: memory table, registry entry, graph nodes, mirror rows. `project`, `dry_run`. `global` is refused. A graph-only scope is removed as well. Dangling supersede links of other scopes are cleared. |
 | `server_health` | Check Postgres, inference and NLI configuration. Reports `version`, `code_fingerprint` (detects a stale container), `started_at`, `toolset`. |
 
@@ -146,8 +149,15 @@ counts and health.
 - `auto_supersede_near_duplicate=true` is an alias for
   `on_near_duplicate="supersede"`. It works in `remember_batch` per fact and at
   the top level, also under `dedupe="off"`.
+- Near-duplicate warnings from `update_memory`/`update_batch` suggest an
+  executable action instead of the write tool's `supersede=<id>` flag: "supersede
+  it in a separate remember call (supersede=X), or rerun this update with
+  `dedupe='off'`".
 - `supersede`/`supersede_content` replace only an existing active memory; an
-  unknown id or unmatched content warns and replaces nothing.
+  unknown id or unmatched content warns and replaces nothing. Both accept a
+  global id from a project write (the replacement hides the global fact in
+  every scope and is reported as a cross-scope supersede);
+  `supersede_content` matches the target scope first, then the global scope.
 - `supersede_last` replaces the best-matching memory, not the newest. With an
   entity it uses that entity's memories from similarity 0.5; without one it
   searches the whole scope at the stricter 0.75 floor. If the topic does not
@@ -274,7 +284,9 @@ counts and health.
     compete and the answer sets `contradictions.cross_entity = true` plus a
     warning.
   - `contradictions_report` loads up to 200 active memories (entity-scoped or
-    scope-wide), fetches 8 neighbours per memory per searched scope table
+    scope-wide; an entity scan covers that entity's memories **plus untagged
+    neighbours** of the scope, so a tagged/untagged conflict stays visible),
+    fetches 8 neighbours per memory per searched scope table
     (`CONTRADICTION_NEIGHBORS`) and NLI-checks the deduplicated pairs in a
     bounded pool (4 workers). The NLI leg has a wall-clock budget
     (`budget_seconds`, default 25s or `CONTRADICTION_SCAN_BUDGET_SECONDS`); when it runs out the scan stops

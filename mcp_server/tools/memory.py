@@ -51,6 +51,7 @@ from mcp_server.scoring import _content_hash
 from mcp_server.storage import (
     ACTIVE_ROW_SQL,
     clear_dangling_supersede,
+    _by_content_hash,
     _check_contradictions,
     _deduplicate,
     _find_by_content,
@@ -109,7 +110,11 @@ class BatchFact(BaseModel):
     supersede: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                            description="Memory id this fact replaces.")
     supersede_content: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
-                                   description="Exact content of the memory this fact replaces.")
+                                   description="Exact content of the memory this fact "
+                                               "replaces. Matches the target scope first, "
+                                               "then the global scope (a global match hides "
+                                               "that fact in every scope and is reported as "
+                                               "a cross-scope supersede).")
     supersede_last: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]},
                                 description="Replace the memory that best "
                                             "matches the new fact (most "
@@ -275,7 +280,8 @@ def _content_conflict(new_content: str, old_content: str) -> bool:
 
 
 def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
-                            conflict: bool = False) -> str:
+                            conflict: bool = False,
+                            update: bool = False) -> str:
     """Warning for a write that dedupe did not match but that still reads
     like a reworded copy of an active memory (remember + remember_batch).
 
@@ -283,6 +289,13 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
     memory's entity, the warning must NOT suggest `supersede`: following that
     advice would replace a fact about a different subject merely because the
     sentences look alike.
+
+    `update=True` marks the update paths (update_memory/update_batch): the
+    edit already applied to one row and the warning names ANOTHER active
+    row. An update call has no `supersede` parameter, so the advice must
+    point at a separate supersede (remember call) or an edit of that row -
+    "pass supersede=<id>" on the tool that is running would be advice the
+    caller cannot execute.
     """
     if not _same_subject_entity(near_dup, entity):
         old_entity = near_dup.get("entity")
@@ -290,6 +303,18 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
         preview = (near_dup.get("content") or "").strip()
         if len(preview) > 120:
             preview = preview[:117] + "..."
+        if update:
+            return (
+                f"near-duplicate across entities: active memory "
+                f"{near_dup['id']} (entity {old_entity!r}) matches the "
+                f"updated content with similarity {near_dup['similarity']}, "
+                f"but this memory belongs to entity {new_entity!r} - the "
+                f"update did not touch that fact. If both describe the same "
+                f"subject, tag them with the same entity; replace the other "
+                f"fact in a separate remember call (supersede="
+                f"{near_dup['id']}) only if you are sure it must be "
+                f"replaced. Matched content: {preview!r}"
+            )
         return (
             f"near-duplicate across entities: active memory {near_dup['id']} "
             f"(entity {old_entity!r}) matches this content with similarity "
@@ -300,6 +325,17 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"be replaced. Matched content: {preview!r}"
         )
     if conflict:
+        if update:
+            return (
+                f"near-duplicate: active memory {near_dup['id']} matches the "
+                f"updated content with similarity {near_dup['similarity']}, "
+                f"but the two differ in a number or a negation - that is an "
+                f"attribute update or a contradiction, not a reworded copy. "
+                f"This update applied without replacing that memory; to "
+                f"retire it, supersede it in a separate remember call "
+                f"(supersede={near_dup['id']}), or rerun this update with "
+                f"dedupe='off' to skip this warning"
+            )
         return (
             f"near-duplicate: active memory {near_dup['id']} matches this "
             f"content with similarity {near_dup['similarity']}, but the two "
@@ -308,6 +344,15 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"check_contradictions=true to let NLI decide, "
             f"supersede={near_dup['id']} to replace the old fact, or "
             f"dedupe='off' to store without this warning"
+        )
+    if update:
+        return (
+            f"near-duplicate: active memory {near_dup['id']} matches the "
+            f"updated content with similarity {near_dup['similarity']} - the "
+            f"edit looks like a reworded copy and that memory is still "
+            f"active. To retire it, supersede it in a separate remember "
+            f"call (supersede={near_dup['id']}); rerun this update with "
+            f"dedupe='off' to skip this warning"
         )
     return (
         f"near-duplicate: active memory {near_dup['id']} matches this content "
@@ -607,7 +652,10 @@ def remember(
                           "'semantic' (also vector similarity) or 'off'.")] = "exact",
     supersede_content: Annotated[
         str | None,
-        Field(description="Exact content of the memory this fact replaces.")] = None,
+        Field(description="Exact content of the memory this fact replaces. "
+                          "Matches the target scope first, then the global "
+                          "scope (a global match hides that fact in every "
+                          "scope and is reported as a cross-scope supersede).")] = None,
     supersede_last: Annotated[
         bool,
         Field(description="Replace the memory that best matches the new fact "
@@ -1219,6 +1267,15 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
             )
     if supersede_content:
         found = _find_by_content(cur, supersede_content, store_project, entity)
+        if not found and store_project and not entity:
+            # A global fact is replaced by its exact content from inside a
+            # project too (like `supersede=<id>` already does with ids); the
+            # replacement hides the global fact in every scope, which the
+            # response names. The entity filter stays out of the fallback:
+            # the caller said "replace this text", and the exact content is
+            # the identity of the target.
+            c_hash = _content_hash((supersede_content or "").strip())
+            found = _by_content_hash(cur, "memories", c_hash, None)
         if found:
             targets.append(found)
         else:
@@ -2257,7 +2314,7 @@ def update_memory(
     finally:
         conn.close()
     warnings = ([_near_duplicate_warning(near_dup, near_entity,
-                                         near_conflict)]
+                                         near_conflict, update=True)]
                 if near_dup else [])
     ttl_warning = _ttl_past_warning(expires_at) if expires_at is not None else None
     if ttl_warning:
@@ -2672,7 +2729,7 @@ def update_batch(
             if near_dup:
                 entry["warnings"] = [
                     _near_duplicate_warning(near_dup, near_entity,
-                                            near_conflict)]
+                                            near_conflict, update=True)]
             if spec.get("ttl_warning"):
                 entry.setdefault("warnings", []).append(spec["ttl_warning"])
             results.append(entry)

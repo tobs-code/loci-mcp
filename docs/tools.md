@@ -42,6 +42,10 @@ Every tool answers with the same shape, so an agent never has to guess:
 - **Failed calls never raise.** An invalid call (missing argument, wrong type)
   answers with the same envelope (`error` names the argument) instead of a raw
   validation error.
+- **The schema is the contract.** An argument the tool does not accept (a
+  forgotten or renamed parameter, e.g. `only_superseded` on `list_memories`)
+  is refused with `unknown argument(s) ...` and the list of accepted names,
+  not silently ignored.
 
 ## Write tools
 
@@ -65,7 +69,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `scope` | `global`\|`project`? | Where to store. Defaults to `project` when a project is given, else `global`. |
 | `project` | string? | Project scope. `global` is reserved and means the shared scope. |
 | `supersede` | string? | Memory id this fact replaces. |
-| `supersede_content` | string? | Exact content of the memory this fact replaces. |
+| `supersede_content` | string? | Exact content of the memory this fact replaces. Matches the target scope first, then the global scope (a global match hides that fact in every scope and is reported as a cross-scope supersede). |
 | `supersede_last` | bool | Replace the memory that matches the new fact best (most similar, not the newest) - of the entity, or across the whole scope when no entity is set. Only if the new fact is about the same topic (similarity >= 0.5; scope-wide without an entity >= 0.75). A topic guard compares the attribute words after removing the entity, stopwords, numbers and time values, so a same-template fact about another attribute (port vs backup job) is refused. Without an entity, a scope-wide best match that belongs to a **tagged** entity is refused: the fact is stored additionally and the warning names the entity/id to use for an explicit replacement. |
 | `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
 | `links` | list? | Graph edges to create in the same write: `[{to_entity, relation_type, weight?, context?, from_entity?}]`; `from_entity` defaults to `entity`. Malformed links are an argument error before the write; a failing edge rolls back to a savepoint, warns (`links failed: ...`) and keeps the fact. Each edge is reported in `links` (`status: created`/`updated`/`duplicate`). |
@@ -86,7 +90,10 @@ in the shared table, and later reads and deletes have to use `project="global"`.
 
 `supersede` and `supersede_content` are checked: an id that does not exist (or
 a content without an active match) produces a warning and replaces nothing -
-the answer never claims a replacement that did not happen.
+the answer never claims a replacement that did not happen. An id may name a
+memory of the global scope from inside a project; `supersede_content` matches
+the target scope first and then the global scope, and a global match is
+reported as a cross-scope supersede (see below).
 
 A write that is still very similar to an active memory (cosine similarity
 >= 0.75) is handled through `on_near_duplicate`: `warn` (default) stores the
@@ -349,10 +356,10 @@ the graph nodes of the covered scopes, not of the whole database.
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older; cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 25s) bounds the NLI leg: when it is exhausted the scan stops early, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); `nli_failures_count` and `nli_failure_summary` give the compact scale without reading every entry; other partial NLI failures are named there too |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); an entity scan covers the entity's memories **plus untagged (entity-less) memories** as their neighbours, so a tagged/untagged conflict stays visible and cross-entity pairs are reported but never auto-resolved; `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older; cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 25s) bounds the NLI leg: when it is exhausted the scan stops early, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); `nli_failures_count` and `nli_failure_summary` give the compact scale without reading every entry; other partial NLI failures are named there too |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default follows `include_superseded`; `false` leaves soft-forgotten rows out), `include_expired`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph and keeps the other endpoints of those edges; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows; `include_expired=false` leaves expired rows out |
-| `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; broken links and chains are listed in `results` (chains carry `chain_to`); `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content |
-| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`); IDs, TTL and timestamps are preserved; an id that already exists is always skipped; `dry_run` validates without writing and adds `would_create`; dangling supersede links are cleared with a warning; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
+| `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; broken links and chains are listed in `results` (chains carry `chain_to`); `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content and re-scans after the repair, so the counts and `results` describe the state AFTER the fix (`fixed` carries what was cleared) |
+| `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`); IDs, TTL and timestamps are preserved; an id that already exists is always skipped; `dry_run` validates without writing and adds `would_create`; dangling supersede links are cleared with a warning, as are self-referencing or internal (`__forgotten__`) `superseded_by` values (`repaired_self_references`); `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |
 | `server_health` | Check Postgres + Inference connectivity; reports `version`, `code_fingerprint` (detects a stale container), `started_at` and the active `toolset` |
 

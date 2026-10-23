@@ -37,6 +37,7 @@ from mcp_server.scopes import (
     _scopes_of_tables,
     _unknown_project_warning,
 )
+from mcp_server.scopes import superseded_marker_sql as _superseded_marker
 from mcp_server.scoring import _decay_norm
 from mcp_server.search import (
     _dedup_rows_across_scopes,
@@ -1831,7 +1832,9 @@ def init_context(project: Annotated[
                 # `deleted_at IS NULL` here made a forgotten-but-once-
                 # superseded fact vanish from the superseded counter, and
                 # total - active - forgotten <= superseded broke its promise.
-                f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
+                # The `__forgotten__` sentinel also lives in `superseded_by`
+                # and must not inflate the superseded count.
+                f"COUNT(*) FILTER (WHERE {_superseded_marker()}), "
                 f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
                 f"FROM {table}"
             )

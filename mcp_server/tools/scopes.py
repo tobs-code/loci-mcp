@@ -26,6 +26,7 @@ from mcp_server.scopes import (
     _scope_key,
     _table_exists,
 )
+from mcp_server.scopes import superseded_marker_sql as _superseded_marker
 
 logger = logging.getLogger(__name__)
 
@@ -195,11 +196,16 @@ def list_projects(
             active_count = 0
             if has_table:
                 if include_counts:
+                    # `superseded` counts only real supersede markers: the
+                    # `__forgotten__` sentinel also lives in `superseded_by`
+                    # and must not inflate the superseded count (it would
+                    # then contradict `recall`/`list_memories`, which exclude
+                    # the sentinel from superseded history).
                     cur.execute(
                         f"SELECT COUNT(*), "
                         f"COUNT(*) FILTER (WHERE superseded_by IS NULL "
                         f"AND deleted_at IS NULL), "
-                        f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
+                        f"COUNT(*) FILTER (WHERE {_superseded_marker()}), "
                         f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
                         f"FROM {table}")
                     total, active, superseded, forgotten = cur.fetchone()

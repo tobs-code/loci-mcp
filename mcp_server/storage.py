@@ -337,6 +337,13 @@ def _find_by_content(cur, content: str, project: str | None,
     entity)."""
     table = _mem_table(project)
     c_hash = _content_hash((content or "").strip())
+    return _by_content_hash(cur, table, c_hash, entity)
+
+
+def _by_content_hash(cur, table: str, c_hash: str,
+                     entity: str | None) -> str | None:
+    """Active row with this content hash in one table (entity filter
+    optional)."""
     params: list[Any] = [c_hash]
     sql = (f"SELECT id FROM {table} WHERE content_hash = %s "
            f"AND {ACTIVE_ROW_SQL}")

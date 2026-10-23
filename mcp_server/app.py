@@ -9,6 +9,7 @@ validation error, it has to come back as `{"ok": false, "error": ...}`.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.tools.base import Tool
@@ -30,6 +31,35 @@ def _format_validation_error(exc: ValidationError) -> str:
     return "invalid arguments - " + "; ".join(parts)
 
 
+def _unknown_arguments(tool_name: str, model: Any,
+                       arguments: dict[str, Any],
+                       context_kwarg: str | None) -> str | None:
+    """Readable one-liner for arguments the tool does not accept.
+
+    Pydantic's default configuration *ignores* unknown keys, so a forgotten
+    or renamed parameter (e.g. `only_superseded` passed to `list_memories`)
+    used to vanish silently and the caller read a result that never applied
+    the flag. The schema is the contract: an unknown argument answers
+    `ok: false` with the accepted names instead of a quiet no-op.
+    """
+    accepted = set(model.model_fields)
+    for info in model.model_fields.values():
+        if info.alias:
+            accepted.add(info.alias)
+    extras = [
+        key for key in arguments
+        if key != context_kwarg and key not in accepted
+    ]
+    if not extras:
+        return None
+    return (
+        "unknown argument(s) "
+        + ", ".join(repr(key) for key in sorted(extras))
+        + f" for {tool_name}; accepted arguments are: "
+        + ", ".join(sorted(accepted))
+    )
+
+
 class EnvelopeTool(Tool):
     """A tool that answers with the envelope, also when the call is invalid.
 
@@ -48,6 +78,15 @@ class EnvelopeTool(Tool):
             result = fail(STATUS_ERROR, _format_validation_error(exc))
         except Exception as exc:  # pragma: no cover - defensive
             result = fail(STATUS_ERROR, f"invalid arguments: {exc}")
+        if result is None:
+            # Pydantic drops unknown keys (extra="ignore"), so the check runs
+            # against the raw, pre-validated arguments: a real contract
+            # breach must reach the caller, not disappear during validation.
+            extra_error = _unknown_arguments(
+                self.name, self.fn_metadata.arg_model, parsed,
+                self.context_kwarg)
+            if extra_error:
+                result = fail(STATUS_ERROR, extra_error)
         if result is None:
             try:
                 return await super().run(arguments, context, convert_result)

@@ -560,6 +560,7 @@ def import_memories(
     skipped_id_exists = 0
     skipped_duplicate_content = 0
     skipped_empty_content = 0
+    self_reference_repairs = 0
     errors: list[str] = []
     graph_entities = 0
     graph_entities_created = 0
@@ -611,6 +612,22 @@ def import_memories(
                 skipped_id_exists += 1
                 continue
 
+            # A record's `superseded_by` column is bookkeeping, not data:
+            # a self-reference (row pointing at itself) is never a valid
+            # replacement, and the internal `__forgotten__` sentinel must
+            # never re-enter a memory table as a supersede id. Both variants
+            # hide the row from every active read; clearing the link here
+            # keeps the restored row readable as history (same contract as
+            # the dangling-link repair below).
+            superseded_by = rec.get("superseded_by")
+            if isinstance(superseded_by, str):
+                superseded_by = superseded_by.strip() or None
+            if superseded_by is not None and (
+                    superseded_by == str(mid)
+                    or superseded_by == SENTINEL_FORGOTTEN):
+                self_reference_repairs += 1
+                superseded_by = None
+
             emb = rec.get("embedding")
             if not emb:
                 emb = embed([content])[0]
@@ -647,7 +664,7 @@ def import_memories(
                      (float(rec["importance"])
                       if rec.get("importance") is not None else 0.5),
                      json.dumps(meta), int(rec.get("access_count", 0) or 0),
-                     rec.get("superseded_by"), _parse_dt(rec.get("deleted_at")),
+                     superseded_by, _parse_dt(rec.get("deleted_at")),
                      expires, _parse_dt(rec.get("created_at")),
                      _parse_dt(rec.get("updated_at")),
                      _parse_dt(rec.get("created_at"))),
@@ -724,6 +741,8 @@ def import_memories(
         result["would_create"] = imported
     elif repaired_links:
         result["repaired_superseded_links"] = repaired_links
+    if self_reference_repairs and not dry_run:
+        result["repaired_self_references"] = self_reference_repairs
     if graph is not None:
         # `graph_entities`/`graph_relations` count the records the import
         # processed; the `*_created` keys count what did not exist before.
@@ -777,6 +796,13 @@ def import_memories(
             f"{repaired_links} superseded link(s) pointed at a memory that "
             f"was not part of the import; they were cleared so those rows "
             f"stay readable as history")
+    if self_reference_repairs:
+        # Normalization happens before the insert (also in a dry run), so
+        # the count is exact in both modes.
+        warnings.append(
+            f"{self_reference_repairs} record(s) carried a self-referencing "
+            f"or internal `superseded_by` value; it was cleared so those "
+            f"rows stay readable as history instead of being hidden")
     if skipped_parts:
         warnings.append("import skipped: " + "; ".join(skipped_parts))
     return ok(STATUS_OK, warnings=warnings, **result)

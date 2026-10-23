@@ -2,8 +2,25 @@ import hashlib
 import json
 import re
 
-from mcp_server.config import FTS_LANGUAGE, _IDENT_RE
+from mcp_server.config import FTS_LANGUAGE, SENTINEL_FORGOTTEN, _IDENT_RE
 from mcp_server.db import drop_vector_indexes, get_conn, ivfflat_lists
+
+
+def superseded_marker_sql() -> str:
+    """SQL fragment that matches only real supersede markers.
+
+    `superseded_by` doubles as a bookkeeping column: a soft-forgotten row
+    carries the `__forgotten__` sentinel there. Counts built straight on
+    `superseded_by IS NOT NULL` reported a forgotten row as "superseded",
+    which contradicted `recall`/`list_memories` (both exclude the sentinel
+    from superseded history). Use this fragment wherever the "superseded"
+    count has to mean exactly what the read tools treat as superseded
+    history.
+    """
+    return (
+        "superseded_by IS NOT NULL "
+        f"AND superseded_by <> '{SENTINEL_FORGOTTEN}'"
+    )
 
 def _safe_ident(value: str, kind: str = "identifier") -> str:
     if not _IDENT_RE.match(value or ""):
