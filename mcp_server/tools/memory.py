@@ -183,6 +183,14 @@ _STOPWORDS = {
     "has", "have", "in", "is", "it", "its", "of", "on", "or", "that", "the",
     "this", "to", "was", "were", "with", "now", "still", "also",
     "gets", "get", "new", "old",
+    # Generic predicates describe the template, not the subject: two facts
+    # about a port and a backup job both "run" on the same service.
+    "run", "runs", "using", "use", "uses", "used", "supports", "support",
+    "listens", "listening", "serves", "provides", "includes", "allows",
+    "contains", "stores",
+    # Generic containers are template words too: a port fact and a backup-job
+    # fact about "the service" share them without sharing a subject.
+    "service", "application", "app", "system", "platform", "component",
     "der", "die", "das", "ein", "eine", "einer", "und", "oder", "ist", "sind",
     "auf", "fuer", "für", "mit", "von", "zu", "im", "in", "den", "dem",
     "des", "wird", "werden", "hat", "haben",
@@ -198,6 +206,12 @@ _VALUE_WORDS = {
     "august", "september", "october", "november", "december",
     "daily", "weekly", "monthly", "yearly", "annual", "annually",
     "hourly", "today", "tomorrow", "yesterday", "tonight", "utc", "gmt",
+    # Environment qualifiers are values too: "in staging" vs "in production"
+    # is an environment update, and the same words must not make a port fact
+    # and a backup-job fact look like the same topic.
+    "staging", "production", "prod", "development", "dev", "qa", "uat",
+    "sandbox", "local", "localhost", "postgres", "postgresql", "mysql",
+    "redis", "sqlite", "docker", "kubernetes", "k8s",
 } | _STOPWORDS
 
 _NEGATIONS = {
@@ -247,16 +261,29 @@ def _shares_subject(new_content: str, old_content: str,
     attribute values (numbers, days, intervals). A port update keeps the
     words "port"/"runs"; a backup job does not.
 
-    Jaccard overlap (not just "one shared word") keeps a generic verb such as
-    "runs" from proving a topic match on its own. Too-short content falls back
-    to a very high similarity so a legitimate one-word update is not blocked.
+    Containment (overlap / smaller token set), not Jaccard, is what makes an
+    attribute *update* pass: the new sentence often adds detail words ("up to
+    five times with a 30 second timeout") that inflate the union and used to
+    push a legitimate replacement below the Jaccard floor. Requiring at least
+    two shared terms keeps a generic verb such as "runs" from proving a topic
+    match on its own. A very high similarity still accepts a short reworded
+    fact, so a legitimate one-word update is not blocked.
     """
     new_tokens = _topic_tokens(new_content, entity)
     old_tokens = _topic_tokens(old_content, entity)
+    if new_tokens == old_tokens:
+        # Only attribute values (day, number, interval, environment) changed:
+        # the subject words are identical, so the fact is an update even when
+        # the entity leaves just one word (or none) behind.
+        return True
     if not new_tokens or not old_tokens:
         return similarity is not None and similarity >= 0.92
     overlap = len(new_tokens & old_tokens)
-    return overlap / len(new_tokens | old_tokens) > 0.5
+    if overlap >= 2:
+        containment = overlap / min(len(new_tokens), len(old_tokens))
+        if containment >= 0.5:
+            return True
+    return overlap >= 1 and similarity is not None and similarity >= 0.92
 
 
 def _content_conflict(new_content: str, old_content: str) -> bool:
@@ -281,7 +308,8 @@ def _content_conflict(new_content: str, old_content: str) -> bool:
 
 def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
                             conflict: bool = False,
-                            update: bool = False) -> str:
+                            update: bool = False,
+                            new_content: str | None = None) -> str:
     """Warning for a write that dedupe did not match but that still reads
     like a reworded copy of an active memory (remember + remember_batch).
 
@@ -323,6 +351,34 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"same subject, tag them with the same entity; only pass "
             f"supersede={near_dup['id']} if you are sure the other fact must "
             f"be replaced. Matched content: {preview!r}"
+        )
+    if (new_content is not None and near_dup.get("content")
+            and not _shares_subject(
+                new_content, near_dup["content"], entity,
+                near_dup.get("similarity"))):
+        # Same entity tag, but the saved fact is about another attribute
+        # (primary vs legacy region). The shared template alone is no reason
+        # to retire a different subject's fact.
+        preview = (near_dup.get("content") or "").strip()
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        if update:
+            return (
+                f"near-duplicate with a different subject: active memory "
+                f"{near_dup['id']} matches the updated content with similarity "
+                f"{near_dup['similarity']}, but the two share no subject term "
+                f"- they describe different subjects/attributes. This update "
+                f"did not touch that memory; only supersede it in a separate "
+                f"remember call (supersede={near_dup['id']}) if you are sure "
+                f"it must be replaced. Matched content: {preview!r}"
+            )
+        return (
+            f"near-duplicate with a different subject: active memory "
+            f"{near_dup['id']} matches this content with similarity "
+            f"{near_dup['similarity']}, but the two share no subject term - "
+            f"they describe different subjects/attributes and were stored as "
+            f"separate facts. Do not pass supersede={near_dup['id']} merely "
+            f"because the wording is close. Matched content: {preview!r}"
         )
     if conflict:
         if update:
@@ -1054,7 +1110,8 @@ def remember(
             # replaced (explicit supersede or the contradiction check) needs
             # no extra advice: the `superseded` list already names it.
             warnings.append(
-                _near_duplicate_warning(near_dup, entity, near_conflict))
+                _near_duplicate_warning(near_dup, entity, near_conflict,
+                                        new_content=content))
         if cross_scope_superseded:
             warnings.append(_cross_scope_warning(cross_scope_superseded))
         if cross_duplicates:
@@ -1859,7 +1916,8 @@ def remember_batch(
                 # advice is needed.
                 entry.setdefault("warnings", []).append(
                     _near_duplicate_warning(near_dup, spec["entity"],
-                                            fact_near_conflict))
+                                            fact_near_conflict,
+                                            new_content=spec["content"]))
             if cross_scope_superseded:
                 entry["cross_scope_superseded"] = cross_scope_superseded
                 entry.setdefault("warnings", []).append(
@@ -2216,7 +2274,7 @@ def update_memory(
             conn.rollback()
             if reason:
                 return fail(
-                    STATUS_NOT_FOUND,
+                    STATUS_CONFLICT,
                     f"memory {memory_id} exists but cannot be updated: {reason}",
                     id=memory_id)
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
@@ -2314,7 +2372,8 @@ def update_memory(
     finally:
         conn.close()
     warnings = ([_near_duplicate_warning(near_dup, near_entity,
-                                         near_conflict, update=True)]
+                                         near_conflict, update=True,
+                                         new_content=content)]
                 if near_dup else [])
     ttl_warning = _ttl_past_warning(expires_at) if expires_at is not None else None
     if ttl_warning:
@@ -2636,8 +2695,10 @@ def update_batch(
                     error = (f"memory {memory_id} exists but cannot be "
                              f"updated: {reason}" if reason
                              else f"NOT FOUND: {memory_id}")
-                    results.append({"id": memory_id, "status": "not_found",
-                                    "error": error})
+                    results.append({
+                        "id": memory_id,
+                        "status": "conflict" if reason else "not_found",
+                        "error": error})
                     continue
                 scope = _scope_of_table(cur, active_table)
                 if spec["metadata_mode"] == "merge" \
@@ -2728,8 +2789,9 @@ def update_batch(
                                      "project": scope}
             if near_dup:
                 entry["warnings"] = [
-                    _near_duplicate_warning(near_dup, near_entity,
-                                            near_conflict, update=True)]
+                    _near_duplicate_warning(
+                        near_dup, near_entity, near_conflict, update=True,
+                        new_content=spec["fields"]["content"])]
             if spec.get("ttl_warning"):
                 entry.setdefault("warnings", []).append(spec["ttl_warning"])
             results.append(entry)
@@ -2955,6 +3017,17 @@ def forget(
                 label = _scope_label(project)
                 table = _mem_table(project)
                 if _table_exists(cur, table):
+                    # The preview and the real call must agree even about the
+                    # rows a soft delete leaves alone: `memories` counts what
+                    # this call hides/deletes, `already_forgotten` names the
+                    # rows that are already hidden.
+                    cur.execute(
+                        f"SELECT COUNT(*) FILTER (WHERE deleted_at IS NULL), "
+                        f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
+                        f"FROM {table}")
+                    active_rows, forgotten_rows = cur.fetchone()
+                    counts["active_memories"] = active_rows
+                    counts["already_forgotten"] = forgotten_rows
                     if dry_run:
                         # The preview must count what the real call removes:
                         # a soft forget hides the active rows, a hard delete
@@ -3170,8 +3243,10 @@ def forget(
                 f"to restrict the removal to one scope")
     if dry_run:
         return ok(STATUS_OK, id=memory_id, entity=entity_name, counts=counts,
+                  project=(scope_name if project else None),
                   dry_run=True, **extra, warnings=warnings,
                   message=f"Would remove {target} (nothing was changed)")
     return ok(status, id=memory_id, entity=entity_name, counts=counts,
+              project=(scope_name if project else None),
               dry_run=False, **extra, warnings=warnings,
               message=f"{'Soft-forgotten' if soft else 'Deleted'} {target}")

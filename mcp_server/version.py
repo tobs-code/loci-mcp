@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-VERSION = os.environ.get("LOCI_VERSION", "0.4.0")
+VERSION = os.environ.get("LOCI_VERSION", "0.5.0")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 

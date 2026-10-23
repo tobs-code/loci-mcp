@@ -70,13 +70,13 @@ def test_update_rejects_superseded_and_forgotten_memories():
 
     superseded = update_memory(old_id, content="Should not be editable")
     assert superseded["ok"] is False
-    assert superseded["status"] == "not_found"
+    assert superseded["status"] == "conflict"
 
     forgotten_id = remember("A deployment fact to forget")["id"]
     forget(forgotten_id)
     forgotten = update_memory(forgotten_id, importance=0.1)
     assert forgotten["ok"] is False
-    assert forgotten["status"] == "not_found"
+    assert forgotten["status"] == "conflict"
 
     active = update_memory(new_id, importance=0.5)
     assert active["ok"] is True

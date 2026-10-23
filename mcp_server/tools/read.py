@@ -8,6 +8,7 @@ from pydantic import Field
 from mcp_server.config import (
     DEFAULT_MIN_SIMILARITY,
     MEMORY_TYPE_HELP,
+    MEMORY_TYPES,
     SENTINEL_FORGOTTEN,
 )
 from mcp_server.db import get_conn
@@ -603,6 +604,113 @@ def recall(
                 f"directly to see it")
     return ok(STATUS_OK, count=len(rows), results=rows, warnings=warnings,
               **payload)
+
+
+def recall_batch(
+    queries: Annotated[
+        list[str],
+        Field(description="Search texts, 1-25 non-empty strings. Each query is "
+                          "ranked independently (its own limit/offset), so one "
+                          "call can cover several intents.")],
+    project: Annotated[
+        str | None,
+        Field(description="Project scope shared by every query. Without it "
+                          "only global memories are searched; '*' searches "
+                          "every scope.")] = None,
+    include_global: Annotated[
+        bool,
+        Field(description="True (default) lets a project search also see "
+                          "global memories.")] = True,
+    limit: Annotated[
+        int,
+        Field(description="Maximum results per query (default 10).")] = 10,
+    offset: Annotated[
+        int,
+        Field(description="Skip this many ranked matches per query.")] = 0,
+    hybrid: Annotated[
+        bool,
+        Field(description="True (default) fuses vector and full-text results.")] = True,
+    min_similarity: Annotated[
+        float | None,
+        Field(description="Vector similarity floor per query (default 0.40); "
+                          "None disables it.")] = 0.40,
+    include_decay: Annotated[
+        bool,
+        Field(description="Blend recency/access into the score.")] = False,
+    include_superseded: Annotated[
+        bool,
+        Field(description="Also return superseded memories.")] = False,
+    include_deleted: Annotated[
+        bool,
+        Field(description="Also return soft-forgotten memories.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Also return memories whose TTL has passed.")] = False,
+    include_relation_context: Annotated[
+        bool,
+        Field(description="True (default) includes edge sentences; False hides "
+                          "them.")] = True,
+    graph_boost: Annotated[
+        bool,
+        Field(description="Add graph-neighbour memories. Without an entity "
+                          "the boost is skipped with a warning.")] = False,
+    entity: Annotated[
+        str | None,
+        Field(description="Only return memories of this entity (also the "
+                          "graph_boost expansion point).")] = None,
+    mem_type: Annotated[
+        str | None,
+        Field(description="Only return memories of this type. " + MEMORY_TYPE_HELP)] = None,
+    detail: Annotated[
+        Literal["full", "slim"],
+        Field(description="'full' (default) returns every public column and "
+                          "score annotation; 'slim' saves tokens.")] = "full",
+    fields: Annotated[
+        list[str] | None,
+        Field(description="Only return these columns per hit, e.g. "
+                          "['id', 'content'].")] = None,
+) -> dict[str, Any]:
+    """Run several independent `recall` queries in one call.
+
+    A multi-intent turn (\"how do we deploy and where are the logs?\") often
+    needs two searches; this tool returns one ranked list per query instead of
+    forcing the agent to concatenate them (which dilutes the vector score).
+    The shared options apply to every query; each entry reports its own
+    `count`, `warnings`, filter counters and `scopes_searched`.
+    """
+    logger.info("recall_batch queries=%s", len(queries or []))
+    if not isinstance(queries, list) or not queries:
+        return fail(STATUS_ERROR, "queries must be a non-empty list of strings")
+    if len(queries) > 25:
+        return fail(STATUS_ERROR,
+                    "queries accepts at most 25 entries per call")
+    cleaned = [str(q).strip() if isinstance(q, str) else "" for q in queries]
+    empty = [i for i, q in enumerate(cleaned) if not q]
+    if empty:
+        return fail(STATUS_ERROR,
+                    f"query {empty[0]} is empty; every query needs text")
+    if mem_type is not None and mem_type not in MEMORY_TYPES:
+        return fail(STATUS_ERROR,
+                    f"Invalid mem_type. Choose from: "
+                    f"{', '.join(sorted(MEMORY_TYPES))}")
+    results: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for index, query in enumerate(cleaned):
+        call = recall(
+            query, mem_type=mem_type, entity=entity, limit=limit,
+            offset=offset, project=project, hybrid=hybrid,
+            include_decay=include_decay, include_superseded=include_superseded,
+            include_deleted=include_deleted, include_expired=include_expired,
+            graph_boost=graph_boost, include_global=include_global,
+            min_similarity=min_similarity, fields=fields, detail=detail,
+            include_relation_context=include_relation_context)
+        entry = {"index": index, "query": query, **call}
+        if not call.get("ok"):
+            warnings.append(
+                f"query {index} ({query!r}) failed: {call.get('error')}")
+        results.append(entry)
+    return ok(STATUS_OK, count=len(results), results=results,
+              warnings=warnings)
 
 
 def list_memories(
@@ -1281,6 +1389,12 @@ def get_entity(name: Annotated[
         bool,
         Field(description="True (default) includes global memories; False "
                           "restricts a project lookup to project memories.")] = True,
+    include_relation_context: Annotated[
+        bool,
+        Field(description="True (default) also lists the relation-context "
+                          "sentences of the entity's graph edges; False "
+                          "hides them (the memories of the entity itself are "
+                          "unaffected).")] = True,
     limit: Annotated[
         int,
         Field(description="Maximum number of memories to return (default 100). "
@@ -1301,7 +1415,8 @@ def get_entity(name: Annotated[
     Set include_global=False to restrict a project lookup to project memories.
     The relation-context sentences of the entity's edges are included, even
     though they are stored under the synthetic entity `<from>_<rel>_<to>`;
-    `total` counts them too.
+    `total` counts them too. Pass `include_relation_context=false` to hide
+    them (the entity's own memories stay).
     The memories are paged with `limit`/`offset`; `total` counts them all, so
     a truncated answer is visible instead of looking complete.
     `project="*"` is rejected: the answer describes exactly one entity.
@@ -1383,9 +1498,12 @@ def get_entity(name: Annotated[
         known_ids = {m.get("id") for m in memories}
         known_hashes = {m.get("content_hash") for m in memories
                         if m.get("content_hash")}
-        for row in _relation_context_memories(
-            cur, target, used_tables, include_superseded, include_expired
-        ):
+        if include_relation_context:
+            context_rows = _relation_context_memories(
+                cur, target, used_tables, include_superseded, include_expired)
+        else:
+            context_rows = []
+        for row in context_rows:
             if row.get("id") in known_ids:
                 continue
             row_hash = row.get("content_hash")

@@ -232,8 +232,9 @@ and warns about the broader comparison, so it is never silent.
    check more.
 5. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
    the entity of both facts and a `cross_entity` flag.
-6. `resolve="newest"` (opt-in) keeps the most recently updated memory of
-   each pair of the **same entity** active and supersedes the older one; the
+6. `resolve="newest"` (opt-in) keeps the most recently **created** memory of
+   each pair of the **same entity** active and supersedes the older one (a
+   decay `touch` does not change the decision); the
    pair reports `resolution` with the `superseded` and `kept` ids. Both
    untagged facts count as the same subject. **Cross-entity pairs are never
    auto-resolved**: recency decides nothing when the two facts belong to

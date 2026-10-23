@@ -67,6 +67,56 @@ def _forget_relation_context(
     )
     return cur.rowcount
 
+
+def _drop_orphan_nodes(cur, project: str | None,
+                       names: list[str]) -> list[str]:
+    """Remove graph nodes that an unrelate left without an edge or a memory.
+
+    `relate` auto-creates both endpoints, so deleting the last edge used to
+    leave an empty node behind that `list_entities` still showed. A node is
+    only removed when it has no remaining edge in this scope and no memory
+    row at all, so a node that still backs a fact is never dropped.
+    """
+    label = _scope_label(project)
+    scope = _scope_key(project)
+    table = _mem_table(project)
+    has_table = _table_exists(cur, table)
+    removed: list[str] = []
+    for name in dict.fromkeys(names):
+        name_json = json.dumps(name)
+        cur.execute(
+            f"SELECT * FROM cypher('memory_graph', $$ "
+            f"MATCH (n:{label} {{name: {name_json}}})-[r]-() "
+            f"RETURN count(r) $$) AS (c agtype)")
+        row = cur.fetchone()
+        if row and int(str(row[0])) > 0:
+            continue
+        if has_table:
+            cur.execute(
+                f"SELECT 1 FROM {table} WHERE entity = %s LIMIT 1", (name,))
+            if cur.fetchone():
+                continue
+        cur.execute(
+            f"SELECT id FROM entities WHERE name = %s AND project = %s",
+            (name, scope))
+        mirror = cur.fetchone()
+        if mirror:
+            cur.execute(
+                "SELECT 1 FROM relations WHERE source_id = ANY(%s) "
+                "OR target_id = ANY(%s) LIMIT 1",
+                ([mirror[0]], [mirror[0]]))
+            if cur.fetchone():
+                continue
+        cur.execute(
+            f"SELECT * FROM cypher('memory_graph', $$ "
+            f"MATCH (n:{label} {{name: {name_json}}}) DETACH DELETE n $$) "
+            f"AS (x agtype)")
+        cur.execute(
+            "DELETE FROM entities WHERE name = %s AND project = %s",
+            (name, scope))
+        removed.append(name)
+    return removed
+
 def _ensure_graph_entity(cur, name: str, project: str | None,
                          ent_type: str | None = None) -> bool:
     """Create the AGE node and SQL entity row for one scope (idempotent).
@@ -502,6 +552,7 @@ def unrelate(
     to_json = json.dumps(to_entity)
     conn = get_conn()
     context_removed = 0
+    orphans_removed: list[str] = []
     try:
         cur = conn.cursor()
         cur.execute("SET search_path TO ag_catalog, public")
@@ -524,6 +575,8 @@ def unrelate(
                 context_removed = _forget_relation_context(
                     cur, project, from_entity, to_entity, relation_type,
                 )
+            orphans_removed = _drop_orphan_nodes(
+                cur, project, [from_entity, to_entity])
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -537,7 +590,8 @@ def unrelate(
     return ok(STATUS_DELETED, from_entity=from_entity, to_entity=to_entity,
               relation_type=relation_type,
               context_memories_removed=context_removed,
-              context_kept=keep_context)
+              context_kept=keep_context,
+              orphan_nodes_removed=orphans_removed)
 
 
 def find_connections(

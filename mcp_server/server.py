@@ -16,6 +16,7 @@ from mcp_server.graph import (
 from mcp_server.scopes import _migrate_fts_indexes
 from mcp_server.tools.maintenance import (
     contradictions_report,
+    prune_memories,
     server_health,
     stats_resource,
     verify_integrity,
@@ -33,6 +34,7 @@ from mcp_server.tools.read import (
     list_entities,
     list_memories,
     recall,
+    recall_batch,
 )
 from mcp_server.tools.scopes import drop_project, list_projects
 
@@ -62,6 +64,7 @@ _ALL_TOOLS = (
     update_batch,
     forget,
     recall,
+    recall_batch,
     list_memories,
     get_entity,
     list_entities,
@@ -74,6 +77,7 @@ _ALL_TOOLS = (
     find_paths,
     contradictions_report,
     verify_integrity,
+    prune_memories,
     server_health,
     export_memories,
     import_memories,
@@ -81,7 +85,7 @@ _ALL_TOOLS = (
 )
 
 # `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14
-# tools); `full` (default) exposes all 22. Maintenance and batch tools are
+# tools); `full` (default) exposes all 24. Maintenance and batch tools are
 # full-only, which keeps the per-turn schema small for interactive agents.
 _toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
 if _toolset == "core":

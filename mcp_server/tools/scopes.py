@@ -83,8 +83,17 @@ def drop_project(
         cur = conn.cursor()
         has_table = _table_exists(cur, table)
         if has_table:
-            cur.execute(f"SELECT COUNT(*) FROM {table}")
-            counts["memories"] = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT COUNT(*), "
+                f"COUNT(*) FILTER (WHERE deleted_at IS NULL), "
+                f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) FROM {table}")
+            total_rows, active_rows, forgotten_rows = cur.fetchone()
+            counts["memories"] = total_rows
+            # `forget(entity='*')` can only hide the active rows while the
+            # project drop removes the table. Naming both numbers makes the
+            # two previews comparable instead of looking contradictory.
+            counts["active_memories"] = active_rows
+            counts["already_forgotten"] = forgotten_rows
         cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s", (scope,))
         counts["entities"] = cur.fetchone()[0]
         cur.execute(

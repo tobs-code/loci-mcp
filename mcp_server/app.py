@@ -143,15 +143,16 @@ TOOLS BY TASK
 - Store/change/remove: `remember`, `remember_batch`, `update_memory`
   (content, TTL, `touch=true` for a decay refresh, `restore=true` to undo a
   soft delete), `update_batch`, `forget`.
-- Search/browse/bootstrap: `recall`, `list_memories` (pass `memory_id` for a
+- Search/browse/bootstrap: `recall`, `recall_batch`, `list_memories` (pass `memory_id` for a
   direct single-memory lookup), `get_entity`, `list_entities`, `init_context`
   (`project="*"` lists every scope with sizes in `project_stats`).
 - Graph: `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`.
 - Maintenance/backup: `server_health`, `contradictions_report`,
-  `export_memories`, `import_memories`, `verify_integrity`, `drop_project`.
+  `export_memories`, `import_memories`, `verify_integrity`, `prune_memories`,
+  `drop_project`.
 
 `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (14 tools);
-the default `full` exposes all 22 (batch, backup and repair included).
+the default `full` exposes all 24 (batch, backup and repair included).
 
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.

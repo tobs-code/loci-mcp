@@ -10,18 +10,27 @@ from pydantic import Field
 
 from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.db import get_conn
-from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
+from mcp_server.envelope import (
+    STATUS_ERROR,
+    STATUS_NOT_FOUND,
+    STATUS_OK,
+    fail,
+    ok,
+)
 from mcp_server.inference_client import health_details, nli_detailed
 from mcp_server.scopes import (
     _all_mem_tables,
+    _mem_table,
     _norm_project,
     _project_names,
     _project_suffix,
     _retrieval_tables,
+    _scope_of_table,
+    _table_exists,
     superseded_marker_sql,
 )
 from mcp_server.search import _search_memories
-from mcp_server.storage import ACTIVE_ROW_SQL
+from mcp_server.storage import ACTIVE_ROW_SQL, clear_dangling_supersede
 from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -199,9 +208,10 @@ def contradictions_report(entity: Annotated[
     resolve: Annotated[
         Literal["none", "newest"],
         Field(description="'none' (default) only reports. 'newest' keeps the "
-                          "most recently updated memory of each SAME-ENTITY "
+                          "most recently created memory of each SAME-ENTITY "
                           "pair active and marks the older one as superseded; "
-                          "cross-entity pairs are reported (cross_entity: "
+                          "`touch` does not change that decision. "
+                          "Cross-entity pairs are reported (cross_entity: "
                           "true) but never auto-resolved, because recency "
                           "says nothing about which fact is correct when the "
                           "entities differ. Pairs without a shared content "
@@ -232,7 +242,8 @@ def contradictions_report(entity: Annotated[
     visible (cross-entity pairs are reported, never auto-resolved). With
     `resolve="newest"` the older memory of every confirmed
     pair of the SAME entity is superseded by the newer one (the report names
-    the ids); cross-entity pairs stay untouched. An empty result says in
+    the ids); "newest" is the creation time, so a `touch` never changes the
+    winner. Cross-entity pairs stay untouched. An empty result says in
     `warnings` why it is empty: nothing to compare, no similar pair, or no
     contradiction among the checked pairs.
     When the NLI provider fails for some pairs, `nli_failures` names exactly
@@ -657,12 +668,17 @@ def contradictions_report(entity: Annotated[
                     for mem_id in (a_id, b_id):
                         for table in tables:
                             cur.execute(
-                                f"SELECT updated_at FROM {table} WHERE id = %s",
+                                f"SELECT created_at, updated_at FROM {table} "
+                                f"WHERE id = %s",
                                 (mem_id,),
                             )
                             row = cur.fetchone()
                             if row:
-                                timestamps[mem_id] = row[0]
+                                # "Newest" is the time the fact was created,
+                                # not the last time it was touched: a decay
+                                # refresh must not decide which side of a
+                                # contradiction survives.
+                                timestamps[mem_id] = row[0] or row[1]
                                 break
                     a_ts = timestamps.get(a_id)
                     b_ts = timestamps.get(b_id)
@@ -949,6 +965,131 @@ def verify_integrity(
         fixed=fixed,
         results=details,
         warnings=warnings,
+    )
+
+
+def prune_memories(
+    project: Annotated[
+        str | None,
+        Field(description="Scope to prune. Without it every scope is pruned; "
+                          "'global' prunes only the shared scope.")] = None,
+    older_than_days: Annotated[
+        float,
+        Field(description="Only remove inactive rows older than this many "
+                          "days (default 30).",
+              ge=0.0)] = 30.0,
+    include_expired: Annotated[
+        bool,
+        Field(description="Remove rows whose TTL passed more than "
+                          "`older_than_days` ago.")] = True,
+    include_forgotten: Annotated[
+        bool,
+        Field(description="Remove soft-forgotten rows whose `deleted_at` is "
+                          "older than `older_than_days`.")] = True,
+    include_superseded: Annotated[
+        bool,
+        Field(description="Also remove superseded history older than "
+                          "`older_than_days`. Off by default: history is "
+                          "usually kept.")] = False,
+    dry_run: Annotated[
+        bool,
+        Field(description="True (default) only reports what would be removed; "
+                          "nothing is deleted.")] = True,
+) -> dict[str, Any]:
+    """Permanently remove inactive memories (expired/forgotten/superseded).
+
+    Active memories are never touched: only rows that every read already
+    hides are eligible. `dry_run=true` is the default, so an accidental call
+    reports instead of deleting. Supersede links that point at a removed row
+    are cleared, so surviving history stays readable.
+    """
+    logger.info("prune_memories project=%s older_than_days=%s dry_run=%s",
+                project, older_than_days, dry_run)
+    if not (include_expired or include_forgotten or include_superseded):
+        return fail(STATUS_ERROR,
+                    "nothing to prune: enable include_expired, "
+                    "include_forgotten or include_superseded")
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    cutoff_sql = "NOW() - (%s * INTERVAL '1 day')"
+    conditions: list[str] = []
+    params: list[Any] = []
+    if include_expired:
+        conditions.append(
+            f"(expires_at IS NOT NULL AND expires_at <= {cutoff_sql})")
+        params.append(older_than_days)
+    if include_forgotten:
+        conditions.append(
+            f"(deleted_at IS NOT NULL AND deleted_at <= {cutoff_sql})")
+        params.append(older_than_days)
+    if include_superseded:
+        conditions.append(
+            f"(superseded_by IS NOT NULL AND superseded_by <> %s "
+            f"AND deleted_at IS NULL "
+            f"AND (expires_at IS NULL OR expires_at > NOW()) "
+            f"AND updated_at <= {cutoff_sql})")
+        params.extend([SENTINEL_FORGOTTEN, older_than_days])
+    where = " OR ".join(conditions)
+
+    conn = get_conn()
+    counts: dict[str, int] = {}
+    total = 0
+    warnings: list[str] = []
+    try:
+        cur = conn.cursor()
+        if project:
+            tables = [_mem_table(project)]
+            if not _table_exists(cur, tables[0]):
+                conn.rollback()
+                return fail(STATUS_NOT_FOUND,
+                            f"unknown project {project!r}: no memory table")
+        else:
+            tables = _all_mem_tables(cur)
+        for table in tables:
+            if not _table_exists(cur, table):
+                continue
+            if dry_run:
+                cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}",
+                            tuple(params))
+                removed = cur.fetchone()[0]
+            else:
+                cur.execute(f"DELETE FROM {table} WHERE {where}",
+                            tuple(params))
+                removed = cur.rowcount
+            if removed:
+                scope = _scope_of_table(cur, table)
+                counts[scope] = counts.get(scope, 0) + removed
+                total += removed
+        if dry_run:
+            conn.rollback()
+        else:
+            clear_dangling_supersede(cur, tables)
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        conn.close()
+
+    scopes = list(counts)
+    if len(scopes) > 1:
+        warnings.append(
+            f"prune covered several scopes ({', '.join(sorted(scopes))}); "
+            f"pass project=<name> to restrict it")
+    return ok(
+        STATUS_OK,
+        project=(project or None),
+        counts={"memories": total, "by_scope": counts},
+        dry_run=dry_run,
+        older_than_days=older_than_days,
+        removed_expired=include_expired,
+        removed_forgotten=include_forgotten,
+        removed_superseded=include_superseded,
+        warnings=warnings,
+        message=("Would remove" if dry_run else "Removed")
+                + f" {total} inactive memor{'y' if total == 1 else 'ies'}",
     )
 
 

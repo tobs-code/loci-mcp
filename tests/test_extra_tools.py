@@ -36,8 +36,9 @@ def test_unrelate_only_touches_the_selected_scope():
     result = unrelate("A", "B", "KNOWS", project="alpha")
 
     assert result["ok"] is True
+    assert sorted(result["orphan_nodes_removed"]) == ["A", "B"]
     assert find_connections("A")["results"]
-    assert not find_connections("A", project="alpha")["results"]
+    assert not find_connections("A", project="alpha").get("results")
 
 
 def test_list_memories_browses_without_a_query():

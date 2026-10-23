@@ -10,7 +10,7 @@
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary; invalid names fall back to `english` |
-| `MCP_TOOLSET` | `full` | `full` (22 tools) or `core` (14 daily read/write/graph tools); an unknown value warns and falls back to `full` |
+| `MCP_TOOLSET` | `full` | `full` (24 tools) or `core` (14 daily read/write/graph tools); an unknown value warns and falls back to `full` |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model (empty = provider default) |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
