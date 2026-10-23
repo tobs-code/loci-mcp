@@ -33,6 +33,7 @@ SCORE_FIELDS = (
     "_rrf_score",
     "_rrf_norm",
     "_relevance_score",
+    "_rerank_score",
     "_scope_boost",
     "_decay_score",
     "_decay_norm",

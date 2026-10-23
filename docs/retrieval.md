@@ -64,7 +64,8 @@ both scopes, the project copy wins.
 | `_similarity` | `1 - cosine distance` (0..1), the same scale as `min_similarity`. |
 | `_distance` | Raw cosine distance to the query. |
 | `_text_score` | Normalized rank of the full-text hit (1.0 = best). |
-| `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. |
+| `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. After reranking this is the rerank probability (plus scope boost) for the rescored block. |
+| `_rerank_score` | Softmax of the cross-encoder logits over the reranked candidate block (0..1, relative to that block). Only present when reranking ran. |
 | `_scope_boost` | The compressed boost a project row gets on top of `_relevance_score`: `0.05 × (1 − relevance)`, at most 0.05 for a weak hit. |
 | `_rrf_score` / `_rrf_norm` | Raw RRF fusion value and its normalized form. |
 | `_decay_score` / `_decay_norm` | Raw decay value (uncapped) and the normalized 0..1 score. |
@@ -82,9 +83,17 @@ ranking is then `_relevance_score`, and the result is ordered by it.
 
 ## The similarity filter
 
-`min_similarity` defaults to **0.40** and filters the **vector** retriever
-only. A full-text hit is kept even when the embedding model scores it badly —
-that is the case the full-text leg exists for.
+`min_similarity` defaults to **0.30**, just above the embedding model's
+measured **0.288 noise floor**, and filters the **vector** retriever only. A
+full-text hit is kept even when the embedding model scores it badly — that is
+the case the full-text leg exists for.
+
+The old **0.40** default came from assuming that unrelated facts score below
+0.30. The model card's own example scores unrelated documents at **0.50-0.61**,
+and the hard paraphrase *"sign-off before shipping code to live customers"*
+against the two-approvals fact scores **0.325**: the 0.40 floor silently
+dropped the correct answer. Callers that want the old strictness can pass
+`min_similarity=0.4` explicitly.
 
 `recall` reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed) and
@@ -98,6 +107,32 @@ In that warning the strongest rejected vector hit is named explicitly, and the
 payload carries `best_dropped_by_similarity` (`id`, `similarity`, `scope`,
 `content_preview`): a fact that missed the cutoff by a hair is shown instead
 of hiding behind the `dropped_by_similarity` counter.
+
+## Cross-encoder reranking
+
+The first stage is a bi-encoder: it embeds query and memory independently, so
+a paraphrase that changes the vocabulary can rank below an unrelated decoy.
+When the first stage is **ambiguous** — the best `_relevance_score` is below
+**0.85** and its margin to the runner-up is below **0.10** — `recall` sends the
+top **10** candidates to a local cross-encoder
+(`mixedbread-ai/mxbai-rerank-base-v1`, Apache-2.0, no API key). A confident
+winner or a clear margin is trusted as is; this keeps the ~2 s CPU cost out of
+the common path. `RERANK_ALWAYS=true` reranks every query,
+`RERANK_ENABLED=false` disables the stage.
+
+Reranked rows carry `_rerank_score` (a softmax over the submitted block, so it
+is relative, not a probability of relevance) and an updated
+`_relevance_score`; `_similarity`, `_rrf_score` and `_rrf_norm` stay the
+first-stage values. The reranked block is ordered by the cross-encoder, the
+remaining first-stage hits follow in their previous order. `recall` reports
+`reranked` (the number of rescored rows); a reranker failure adds
+`rerank_error` and the warning `reranking skipped: ...`, and the first-stage
+ranking is returned unchanged. `recall_batch` inherits this per query.
+
+The model is loaded lazily by the inference service in **float32**: the
+default float16 path on CPU measured roughly five times slower for this model.
+The first ambiguous query pays the model load (the image preloads it), later
+queries only the inference cost.
 
 ## The full-text coverage floor
 
@@ -117,10 +152,10 @@ Actually not a real keyword hit: hits that the vector retriever found are never
 dropped by this filter.
 
 With `min_similarity=null` the filter is disabled and near-zero hits can
-appear as "relevant". When any returned hit has `_similarity < 0.40`, the
-response warns about it (`the min_similarity filter is disabled: N of M
-result(s) ...`), so agents notice the weak hits instead of reading them as
-confident matches.
+appear as "relevant". When any returned hit has
+`_similarity < 0.30` (the default), the response warns about it (`the
+min_similarity filter is disabled: N of M result(s) ...`), so agents notice
+the weak hits instead of reading them as confident matches.
 
 ## The searched scopes
 
@@ -141,9 +176,15 @@ Measured with the current embedding model:
 
 | Query | Similarity |
 |-------|------------|
-| natural-language question that matches | 0.62-0.95 |
+| natural-language question that shares the memory's vocabulary | 0.62-0.95 |
+| natural-language paraphrase with shifted vocabulary | 0.30-0.55 (hard eval pair: 0.325) |
 | bare keyword occurring verbatim in the memory | 0.30-0.61 |
-| unrelated fact | below ~0.30 |
+| unrelated documents in the model card's example | 0.50-0.61 |
+| model's measured noise floor | 0.288 |
+
+The last two rows are the reason a single similarity cutoff cannot be a
+relevance classifier: unrelated text can outscore a true paraphrase. The
+cross-encoder exists for exactly that overlap.
 
 ## Cognitive decay
 

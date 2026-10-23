@@ -214,13 +214,27 @@ counts and health.
   as `best_dropped_by_similarity` (id, similarity, scope, `content_preview`),
   so a barely-missed fact is visible instead of hidden behind a count; the
   empty-result warning names it and suggests `min_similarity=null`.
-- `_similarity` is cosine similarity (0..1). Natural-language matches usually
-  score 0.6-0.95, verbatim keywords 0.3-0.6, unrelated facts below ~0.3. The
-  default `min_similarity` is 0.40; `null` disables it.
+- `_similarity` is cosine similarity (0..1). Natural-language matches that
+  share vocabulary score 0.6-0.95; vocabulary-shifting paraphrases 0.3-0.55
+  (the hard eval pair scored 0.325); verbatim keywords 0.3-0.6. The model
+  card's unrelated-document example scores **0.50-0.61**, so "unrelated is
+  below 0.3" is false; the measured noise floor is **0.288**. The default
+  `min_similarity` is **0.30**, just above that floor; `null` disables it.
+  `min_similarity=0.4` is still available as the old strict setting.
+- When the first stage is ambiguous (best `_relevance_score` < **0.85** and
+  margin to the runner-up < **0.10**), the top **10** candidates are reranked
+  by a local cross-encoder (`mixedbread-ai/mxbai-rerank-base-v1`, Apache-2.0).
+  `RERANK_ALWAYS=true` reranks every query; `RERANK_ENABLED=false` disables
+  it. `recall` reports `reranked`; a failure adds `rerank_error` and the
+  `reranking skipped: ...` warning and keeps the first-stage order.
 - Ranking fields:
   - `_rrf_norm` (0..1) and raw `_rrf_score`.
   - `_relevance_score` (0..1): vector similarity + FTS rank, plus
     `_scope_boost` for project rows (max 0.05). `null` for graph-only hits.
+    After reranking it is the rerank probability (plus scope boost) for the
+    rescored block.
+  - `_rerank_score` (0..1): softmax of the cross-encoder logits over the
+    reranked block; only present when reranking ran.
   - `_final_score` (0..1): relevance blended with decay (70/30) plus graph
     boost. Only present with `include_decay=true` or `graph_boost=true`.
   - `_distance` is raw cosine distance.
@@ -357,6 +371,15 @@ counts and health.
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http`) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http`) |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary (invalid values fall back to `english`) |
+| `RERANK_ENABLED` | `true` | Local cross-encoder reranking of ambiguous first-stage results |
+| `RERANK_MODEL` | `mixedbread-ai/mxbai-rerank-base-v1` | Cross-encoder model; loaded by the inference service |
+| `RERANK_MAX_LENGTH` | `256` | Token limit per query/document pair (64-512) |
+| `RERANK_TOP_K` | `10` | Candidates rescored when the first stage is ambiguous (2-50) |
+| `RERANK_TRIGGER_SCORE` | `0.85` | Best relevance at or above this value is trusted |
+| `RERANK_TRIGGER_MARGIN` | `0.10` | Lead over the runner-up at or above this value is trusted |
+| `RERANK_ALWAYS` | `false` | Rerank every query instead of only ambiguous ones |
+| `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu`, `cuda`; `cuda` still falls back without a visible device |
+| `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | Build arg for the inference image; `https://download.pytorch.org/whl/cpu` builds the smaller CPU-only variant |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto`, `none` |
 | `LLM_MODEL` | provider default | NLI model |
 | `LLM_API_KEY` | – | Generic key, overrides provider-specific keys |
@@ -378,6 +401,12 @@ python -m mcp_server
 # Full stack
 cp .env.example .env
 docker compose up -d
+
+# GPU inference (NVIDIA Container Toolkit required; base compose stays on CPU)
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+
+# Smaller CPU-only inference image
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu docker compose build inference
 
 # After changing embedding model or prompts
 docker compose build inference loci-mcp && docker compose up -d

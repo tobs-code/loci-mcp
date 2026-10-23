@@ -192,7 +192,7 @@ mutually exclusive.
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
 | `recall_batch` | Run 1-25 independent searches in one call; `queries`, shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `fields`, `detail`; each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `memory_ids` (bulk direct lookup, max 200; `missing` and a warning, mutually exclusive with `memory_id`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total` and `relation_context_count` |
@@ -210,7 +210,7 @@ The search tool. `query` is required and non-empty.
 | `project` | string? | Scope. Without it only global memories are searched; `"*"` searches every scope. |
 | `limit` | int | Maximum number of results (default 10). |
 | `hybrid` | bool | True (default) fuses vector and full-text results (RRF). False uses a single retriever. |
-| `min_similarity` | number? | Drop vector hits below this cosine similarity (0..1, default 0.40). `null` disables the filter. |
+| `min_similarity` | number? | Drop vector hits below this cosine similarity (0..1, default 0.30, just above the model's 0.288 noise floor). `null` disables the filter. |
 | `include_decay` | bool | Blend recency/access into the score (max 30% of it). |
 | `min_decay_score` | number? | Keep only memories with at least this normalized decay score (0..1). |
 | `include_superseded` | bool | Also return superseded memories (history). |
@@ -220,12 +220,19 @@ The search tool. `query` is required and non-empty.
 | `entity` | string? | Only return memories of this entity. |
 | `mem_type` | enum? | Only return memories of this type. |
 | `include_global` | bool | True (default) lets a project search also see global memories. |
-| `fields` | list? | Only return these columns, e.g. `["id", "content"]`. Score fields include `_graph_relation_context` for relation-context hits. |
+| `fields` | list? | Only return these columns, e.g. `["id", "content"]`. Score fields include `_rerank_score` for reranked rows and `_graph_relation_context` for relation-context hits. |
 | `detail` | enum | `full` (default) or `slim`. `slim` returns id/content/entity/type/project/importance/timestamps plus the ranking scores, without metadata or history bookkeeping; an explicit `fields` list wins. |
 | `updated_after` | string? | Only memories changed at or after this ISO date. |
 | `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. Scalar values compare tolerantly (the string `"8001"` matches the stored number `8001`); objects and arrays use JSON containment. |
 | `include_relation_context` | bool | True (default) includes the relation-context sentences of graph edges; False hides them. |
 | `offset` | int | Skip this many ranked hits (default 0). The answer reports `has_more` and `next_offset`. |
+
+When the best hit is below **0.85** relevance and leads the runner-up by less
+than **0.10**, the top candidates are rescored by the local cross-encoder
+(`RERANK_TOP_K`, default 10). Reranked rows carry `_rerank_score` (a softmax
+over the rescored block) and an updated `_relevance_score`; the answer reports
+`reranked`. A reranker failure adds `rerank_error` and a
+`reranking skipped: ...` warning and leaves the first-stage order unchanged.
 
 The answer reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),

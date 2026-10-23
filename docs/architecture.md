@@ -8,7 +8,7 @@
 | Vector search | pgvector v0.8.1 (768d, cosine) |
 | Graph | Apache AGE 1.7.0 (Cypher over `memory_graph`) |
 | Server | Python + FastMCP, Streamable HTTP or stdio |
-| Embeddings | Jina v5 nano (239M, local, CPU) |
+| Embeddings | Jina v5 nano (239M, local; CUDA when available, CPU fallback) |
 | Contradiction check | `/nli` against a configurable LLM provider |
 
 ## Schema

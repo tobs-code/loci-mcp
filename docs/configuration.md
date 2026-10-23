@@ -11,6 +11,15 @@
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary; invalid names fall back to `english` |
 | `MCP_TOOLSET` | `full` | `full` (24 tools) or `core` (14 daily read/write/graph tools); an unknown value warns and falls back to `full` |
+| `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu` or `cuda`; `cuda` still falls back if no device is visible |
+| `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | Build arg for the inference image; use `https://download.pytorch.org/whl/cpu` for a CPU-only image |
+| `RERANK_ENABLED` | `true` | Local cross-encoder reranking of ambiguous first-stage results |
+| `RERANK_MODEL` | `mixedbread-ai/mxbai-rerank-base-v1` | Cross-encoder model; the inference service loads it, pass the same value to both containers |
+| `RERANK_MAX_LENGTH` | `256` | Token limit per query/document pair (64-512) |
+| `RERANK_TOP_K` | `10` | Candidates submitted to the reranker when the first stage is ambiguous (2-50) |
+| `RERANK_TRIGGER_SCORE` | `0.85` | A best relevance at or above this value is trusted without reranking |
+| `RERANK_TRIGGER_MARGIN` | `0.10` | A lead over the runner-up at or above this value is trusted without reranking |
+| `RERANK_ALWAYS` | `false` | Rerank every query instead of only ambiguous ones |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model (empty = provider default) |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
@@ -67,14 +76,16 @@ a warning; write tools keep the fact and warn
 (`contradiction check skipped: NLI unavailable: ...`) in `warnings` and
 `contradictions.skipped`.
 
-Embeddings always run locally on CPU — no key needed.
+Embeddings always run locally — no key needed. The default image is CUDA
+enabled and uses an NVIDIA GPU when one is exposed; without a GPU it runs on
+CPU.
 
 ## Docker
 
 | Service | Image / base | Notes |
 |---------|--------------|-------|
 | **Postgres** | `postgres:17-bookworm` + pgvector v0.8.1 + Apache AGE 1.7.0 | `shm_size: 1g` — AGE needs more shared memory |
-| **Inference** | FastAPI + sentence-transformers | CPU only, no GPU required |
+| **Inference** | FastAPI + sentence-transformers + PyTorch CUDA 12.6 | GPU via the compose override, CPU fallback, no GPU required |
 | **Loci MCP** | Python FastMCP server with uvicorn | Streamable HTTP transport |
 
 After changing the embedding model or prompts, rebuild both images and then
@@ -87,6 +98,39 @@ docker compose exec loci-mcp python -m mcp_server.reembed
 
 On startup, the MCP server runs idempotent migrations (`deleted_at` backfill,
 sentinel migration, dedup of duplicate AGE edges).
+
+## GPU
+
+The inference image ships a CUDA 12.6 build of PyTorch and picks the first
+NVIDIA GPU automatically (`INFERENCE_DEVICE=auto`). The base compose file does
+not pass a GPU into the container, so `docker compose up -d` stays on CPU. To
+expose the GPU:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+```
+
+This needs a driver and the NVIDIA Container Toolkit (`nvidia-smi` works and
+`docker info` lists the `nvidia` runtime). The override only adds `gpus: all`
+to `inference`; the image and the other services are unchanged.
+
+`INFERENCE_DEVICE=cpu` forces the CPU path; `cuda` requests the GPU and still
+falls back to CPU when no device is visible. Check what is active:
+
+```bash
+curl -s localhost:8001/health | jq '{device, embedder_device, cuda_device, reranker_device}'
+```
+
+The image is built from `https://download.pytorch.org/whl/cu126` (build arg
+`TORCH_INDEX_URL`). A CPU-only image is smaller and needs no CUDA libraries:
+
+```bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu docker compose build inference
+```
+
+On an RTX 2080 (8 GB) versus the same container on CPU, one text embeds in
+36-49 ms instead of 375-485 ms, and reranking ten documents takes 131 ms
+instead of 2.0 s. The CUDA image also runs on CPU-only hosts.
 
 ## Inference API
 
@@ -116,7 +160,9 @@ contradiction_scores = r.json()["contradiction_scores"]
 error = r.json().get("error")
 ```
 
-`/health` reports the status of both services.
+`/health` reports the status of both services, including `rerank_model`,
+`rerank_loaded` and `rerank_error`, plus the active device (`device`,
+`embedder_device`, `cuda_device`, `reranker_device`).
 
 ## Scoring constants
 
@@ -129,7 +175,7 @@ The tuning knobs live in `mcp_server/config.py`:
 | `DECAY_WEIGHT` | 0.3 | Maximum share of the score that decay may take. |
 | `FTS_WEIGHT` | 0.6 | Weight of the full-text signal in the relevance score. |
 | `RRF_K` | 60 | RRF smoothing constant. |
-| `DEFAULT_MIN_SIMILARITY` | 0.40 | Default vector-hit floor. |
+| `DEFAULT_MIN_SIMILARITY` | 0.30 | Default vector-hit floor, just above the embedding model's 0.288 noise floor. |
 | `DEFAULT_DUPLICATE_THRESHOLD` | 0.85 | Similarity threshold of `dedupe="semantic"`. |
 | `NEAR_DUPLICATE_THRESHOLD` | 0.75 | Similarity at which a stored write is reported as a near-duplicate in `warnings`. |
 | `SUPERSEDE_SIMILARITY_MIN` | 0.5 | Topic similarity below which `supersede_last` refuses. |

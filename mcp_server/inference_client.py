@@ -36,6 +36,37 @@ def embed(texts: list[str], mode: str = "document") -> list[list[float]]:
     return r.json()["embeddings"]
 
 
+def rerank(query: str, documents: list[str], *, timeout: float = 60.0) -> list[float]:
+    """Score query/document pairs with the local cross-encoder.
+
+    Returns one raw logit per document. The values are not probabilities and
+    are not comparable across different candidate sets; callers turn them into
+    a relative score for the block they submitted.
+    """
+    if not documents:
+        return []
+    resp = _get_session().post(
+        f"{INFERENCE_URL}/rerank",
+        json={"query": query, "documents": documents},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f"rerank response was not valid JSON: {e}") from e
+    error = payload.get("error")
+    if error:
+        raise RuntimeError(str(error))
+    scores = payload.get("scores")
+    if not isinstance(scores, list) or len(scores) != len(documents):
+        raise RuntimeError("rerank response did not contain one score per document")
+    try:
+        return [float(score) for score in scores]
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"rerank response contained a non-numeric score: {e}") from e
+
+
 def nli_detailed(query: str,
                  documents: list[str],
                  query_entity: str | None = None,

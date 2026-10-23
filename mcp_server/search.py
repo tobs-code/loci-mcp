@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -8,9 +9,15 @@ from mcp_server.config import (
     FTS_MIN_COVERAGE,
     FTS_WEIGHT,
     PROJECT_SCOPE_BOOST,
+    RERANK_ALWAYS,
+    RERANK_ENABLED,
+    RERANK_TOP_K,
+    RERANK_TRIGGER_MARGIN,
+    RERANK_TRIGGER_SCORE,
     RRF_K,
 )
 from mcp_server.db import get_conn
+from mcp_server.inference_client import rerank
 from mcp_server.scopes import (
     _ag_str,
     _all_mem_tables,
@@ -18,7 +25,6 @@ from mcp_server.scopes import (
     _retrieval_tables,
     _scope_label,
 )
-from mcp_server.storage import ACTIVE_ROW_SQL, visibility_condition
 from mcp_server.scoring import (
     _blend_scores,
     _clamp01,
@@ -28,6 +34,7 @@ from mcp_server.scoring import (
     _now,
     _relevance_score,
 )
+from mcp_server.storage import visibility_condition
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +268,108 @@ def _parse_timestamp(value: str):
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
     return stamp
+
+
+def _softmax(values: list[float]) -> list[float]:
+    """Turn raw cross-encoder logits into a relative 0..1 score."""
+    if not values:
+        return []
+    top = max(values)
+    exps = [math.exp(value - top) for value in values]
+    total = sum(exps)
+    if not total:
+        return [0.0 for _ in values]
+    return [value / total for value in exps]
+
+
+def _rerank_rows(
+    rows: list[dict],
+    query_text: str | None,
+    stats: dict[str, Any] | None,
+    include_decay: bool,
+) -> list[dict]:
+    """Reorder the first-stage candidates with a local cross-encoder.
+
+    The bi-encoder is fast but scores query and memory independently; a
+    vocabulary-shifting paraphrase can therefore sit below `min_similarity`
+    while an unrelated decoy survives. The cross-encoder sees both texts
+    together and is only asked when the first stage is genuinely ambiguous:
+    a confident winner (`>= RERANK_TRIGGER_SCORE`) or a clear margin
+    (`>= RERANK_TRIGGER_MARGIN`) is trusted as is. That keeps the ~2s CPU
+    cost out of the common path without hiding the hard case.
+
+    The raw logits are not probabilities and are not comparable across
+    requests, so `_rerank_score` is a softmax over the reranked block only.
+    `_similarity`, `_rrf_score` and `_rrf_norm` stay the first-stage values;
+    `_relevance_score` is replaced for the reranked rows and the first-stage
+    order is kept for the tail.
+    """
+    if not RERANK_ENABLED or not query_text or not rows:
+        return rows
+    candidates = [
+        row for row in rows
+        if row.get("content") and not row.get("_graph_source")
+    ]
+    candidates.sort(key=lambda row: (-row.get("_relevance_score", 0.0),
+                                     -row.get("_rrf_score", 0.0)))
+    candidates = candidates[:RERANK_TOP_K]
+    if len(candidates) < 2:
+        return rows
+    if not RERANK_ALWAYS:
+        best = float(candidates[0].get("_relevance_score") or 0.0)
+        second = float(candidates[1].get("_relevance_score") or 0.0)
+        if (best >= RERANK_TRIGGER_SCORE
+                or (best - second) >= RERANK_TRIGGER_MARGIN):
+            return rows
+    try:
+        logits = rerank(query_text, [row["content"] for row in candidates])
+    except Exception as exc:
+        logger.warning("reranking skipped: %s", exc)
+        if stats is not None:
+            stats["rerank_error"] = str(exc)
+        return rows
+    if len(logits) != len(candidates):
+        message = ("rerank returned "
+                   f"{len(logits)} scores for {len(candidates)} candidates")
+        logger.warning("reranking skipped: %s", message)
+        if stats is not None:
+            stats["rerank_error"] = message
+        return rows
+    if any(not math.isfinite(score) for score in logits):
+        message = "rerank returned a non-finite score"
+        logger.warning("reranking skipped: %s", message)
+        if stats is not None:
+            stats["rerank_error"] = message
+        return rows
+
+    probabilities = _softmax(logits)
+    for row, probability in zip(candidates, probabilities):
+        row["_rerank_score"] = round(probability, 4)
+        relevance = probability
+        if row.get("_project") not in (None, "global"):
+            boost = round(PROJECT_SCOPE_BOOST * (1.0 - relevance), 4)
+            row["_scope_boost"] = boost
+            relevance += boost
+        row["_relevance_score"] = round(relevance, 4)
+
+    candidate_ids = {id(row) for row in candidates}
+    reranked_head = sorted(candidates,
+                           key=lambda row: -row.get("_rerank_score", 0.0))
+    rows[:] = reranked_head + [row for row in rows
+                               if id(row) not in candidate_ids]
+    if stats is not None:
+        stats["reranked"] = len(candidates)
+
+    if include_decay:
+        for row in rows:
+            relevance = row.get("_relevance_score")
+            if relevance is None:
+                row["_final_score"] = row.get("_decay_norm", 0.0)
+            else:
+                row["_final_score"] = _clamp01(
+                    _blend_scores(relevance, row.get("_decay_norm", 0.0)))
+        rows.sort(key=lambda row: -row.get("_final_score", 0.0))
+    return rows
 
 
 def _search_memories_rrf(
@@ -547,7 +656,7 @@ def _search_memories_rrf(
         rows.sort(key=lambda x: (-x.get("_relevance_score", 0.0),
                                  -x.get("_rrf_score", 0.0)))
 
-    return rows[:limit]
+    return rows
 
 
 
@@ -582,7 +691,7 @@ def _search_memories(
     most frequently accessed memories.
     """
     if hybrid and (query_embedding is not None or query_text):
-        return _search_memories_rrf(
+        rows = _search_memories_rrf(
             cur, query_embedding, query_text, mem_type, entity, limit, project,
             include_decay, include_embedding, include_superseded, min_similarity,
             include_expired=include_expired,
@@ -591,6 +700,8 @@ def _search_memories(
             metadata_filter=metadata_filter,
             exclude_relation_context=exclude_relation_context, stats=stats,
         )
+        _rerank_rows(rows, query_text, stats, include_decay)
+        return rows[:limit]
 
     # Legacy fallback for individual retrievers
     tables = tables if tables is not None else _retrieval_tables(cur, project)
@@ -765,6 +876,8 @@ def _search_memories(
         if not recent_first:
             rows.sort(key=lambda x: -x.get("_final_score", 0))
 
+    if not recent_first:
+        _rerank_rows(rows, query_text, stats, include_decay)
     return rows[:limit]
 
 

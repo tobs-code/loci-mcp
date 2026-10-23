@@ -25,13 +25,19 @@ That starts three services:
 | Service | Port | Description |
 |---------|------|-------------|
 | **PostgreSQL** | `5432` | User/DB: `memory`, password: `geheim` |
-| **Inference API** | `8001` | Embeddings (local, CPU) + NLI (configurable LLM) |
+| **Inference API** | `8001` | Embeddings (local; GPU when available, CPU fallback) + NLI (configurable LLM) |
 | **Loci MCP** | `8766` | The MCP server (Streamable HTTP) |
 
 > Contradiction detection needs an LLM key. Groq is the default; set
 > `LLM_PROVIDER` to `openai`, `anthropic`, `ollama`, `openai-compatible` or
 > `auto` to use another provider, or `none` to disable NLI. Embeddings always
-> run locally on CPU.
+> run locally: the image uses an NVIDIA GPU when Docker exposes one and falls
+> back to CPU otherwise. See [GPU acceleration](docs/configuration.md#gpu).
+>
+> ```bash
+> # Requires a driver and the NVIDIA Container Toolkit
+> docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+> ```
 
 ## Connect your agent
 
@@ -153,6 +159,7 @@ remember(content="The API runs on Postgres", entity="API", project="api")
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
+| `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available), `cpu` or `cuda` |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |

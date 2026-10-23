@@ -1,0 +1,10 @@
+# GPU override for the inference service.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Requires an NVIDIA GPU, a driver and the NVIDIA Container Toolkit. Without
+# these, keep the base compose file: inference detects the missing CUDA device
+# and runs the same image on CPU.
+services:
+  inference:
+    gpus: all

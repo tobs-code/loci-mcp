@@ -103,6 +103,10 @@ with _admin.cursor() as _cur:
 _admin.close()
 
 os.environ["MEMORY_DATABASE_URL"] = TEST_DATABASE_URL
+# The fake inference server has no /rerank endpoint. Reranking has dedicated
+# unit tests that monkeypatch the client; the retrieval tests stay on the
+# first-stage ranking so their scores remain deterministic.
+os.environ["RERANK_ENABLED"] = "false"
 
 from mcp_server.db import ensure_schema, get_conn  # noqa: E402
 

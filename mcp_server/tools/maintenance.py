@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
-from mcp_server.config import SENTINEL_FORGOTTEN
+from mcp_server.config import RERANK_ENABLED, RERANK_MODEL, SENTINEL_FORGOTTEN
 from mcp_server.db import get_conn
 from mcp_server.envelope import (
     STATUS_ERROR,
@@ -1120,6 +1120,14 @@ def server_health() -> dict[str, Any]:
         nli_configured=(inference_details.get("llm_configured")
                         if inference_details is not None
                         and "llm_configured" in inference_details else None),
+        rerank_enabled=RERANK_ENABLED,
+        rerank_model=(inference_details.get("rerank_model")
+                      if inference_details is not None
+                      and "rerank_model" in inference_details else RERANK_MODEL),
+        rerank_loaded=(inference_details.get("rerank_loaded")
+                       if inference_details is not None else None),
+        rerank_error=(inference_details.get("rerank_error")
+                      if inference_details is not None else None),
         toolset=toolset,
     )
 

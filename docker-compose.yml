@@ -18,10 +18,14 @@ services:
       retries: 10
 
   inference:
-    build: ./inference
+    build:
+      context: ./inference
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}
     ports:
       - "8001:8000"
     environment:
+      INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       LLM_PROVIDER: ${LLM_PROVIDER:-groq}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -31,6 +35,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      RERANK_MODEL: ${RERANK_MODEL:-mixedbread-ai/mxbai-rerank-base-v1}
+      RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-256}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -53,6 +59,13 @@ services:
       MEMORY_INFERENCE_URL: http://inference:8000
       MCP_TRANSPORT: streamable-http
       MCP_PORT: "8766"
+      RERANK_ENABLED: ${RERANK_ENABLED:-true}
+      RERANK_MODEL: ${RERANK_MODEL:-mixedbread-ai/mxbai-rerank-base-v1}
+      RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-256}
+      RERANK_TOP_K: ${RERANK_TOP_K:-10}
+      RERANK_TRIGGER_SCORE: ${RERANK_TRIGGER_SCORE:-0.85}
+      RERANK_TRIGGER_MARGIN: ${RERANK_TRIGGER_MARGIN:-0.10}
+      RERANK_ALWAYS: ${RERANK_ALWAYS:-false}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost', 8766), timeout=5); s.close()\""]
       interval: 10s

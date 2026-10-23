@@ -1,6 +1,30 @@
 import os
 import re
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
 MEMORY_TYPES = {
     "fact", "decision", "learning", "preference",
     "pattern", "incident", "runbook", "context",
@@ -96,17 +120,39 @@ NEAR_DUPLICATE_THRESHOLD = 0.75
 
 # Avoid returning clearly unrelated vector hits unless callers opt out.
 #
-# Measured with jina-embeddings-v5-text-nano-retrieval: a natural-language
-# question that matches a fact scores 0.62-0.95, a bare keyword that occurs
-# verbatim in the fact only scores 0.30-0.61 (single tokens dilute the query
-# vector). 0.4 therefore cut off roughly every third true keyword hit, so the
-# default sits lower; full-text matches are never filtered by this value.
-# 0.40 is the compromise: the bottom tail of the keyword range (0.30-0.40) is
-# mostly noise, and a weak vector-only hit that merely shares a function word
-# ("... $500 per month" for "requests per minute limit", similarity 0.38) is
-# dropped. Full-text hits still survive regardless, so exact identifiers are
-# not lost with this value.
-DEFAULT_MIN_SIMILARITY = 0.40
+# Calibrated against the embedding model's own model card: its noise floor is
+# 0.288 and its balanced cutoff is 0.678. The old 0.40 value came from the
+# assumption that unrelated facts score below 0.30; the card's official
+# example scores unrelated documents at 0.50-0.61. That assumption silently
+# dropped true paraphrases: "sign-off before shipping code to live customers"
+# scored 0.325 against the two-approvals fact. 0.30 keeps those hits just
+# above the measured noise floor; full-text matches are never filtered by
+# this value, so exact identifiers stay reachable. Callers that want the old
+# strictness can still pass min_similarity=0.4 explicitly.
+DEFAULT_MIN_SIMILARITY = 0.30
+
+
+# Cross-encoder reranking of the first-stage candidates.
+#
+# The bi-encoder scores a memory and a query independently, so a paraphrase
+# that changes the vocabulary can fall below the similarity floor even when a
+# human would call it the obvious answer. A cross-encoder reads both texts
+# together and ranked the hard eval pair first. It runs locally (Apache-2.0,
+# no API key) but costs ~2s per 10 pairs on the current CPU, so it is only
+# applied when the first stage is ambiguous: the best relevance is below
+# RERANK_TRIGGER_SCORE and the margin to the runner-up is below
+# RERANK_TRIGGER_MARGIN. Set RERANK_ALWAYS=true to rerank every query, or
+# RERANK_ENABLED=false (the test suite does) to skip it.
+RERANK_ENABLED = _env_bool("RERANK_ENABLED", True)
+RERANK_MODEL = (
+    os.getenv("RERANK_MODEL", "mixedbread-ai/mxbai-rerank-base-v1").strip()
+    or "mixedbread-ai/mxbai-rerank-base-v1"
+)
+RERANK_TOP_K = _env_int("RERANK_TOP_K", 10, 2, 50)
+RERANK_TRIGGER_SCORE = _env_float("RERANK_TRIGGER_SCORE", 0.85, 0.0, 1.0)
+RERANK_TRIGGER_MARGIN = _env_float("RERANK_TRIGGER_MARGIN", 0.10, 0.0, 1.0)
+RERANK_ALWAYS = _env_bool("RERANK_ALWAYS", False)
+RERANK_MAX_LENGTH = _env_int("RERANK_MAX_LENGTH", 256, 64, 512)
 
 
 PROJECT_SCOPE_BOOST = 0.05

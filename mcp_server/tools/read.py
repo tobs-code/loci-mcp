@@ -63,7 +63,7 @@ _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 SLIM_RECALL_FIELDS = (
     "id", "content", "mem_type", "entity", "project", "importance",
     "updated_at", "superseded_by", "forgotten", "expired",
-    "_similarity", "_relevance_score", "_final_score",
+    "_similarity", "_relevance_score", "_rerank_score", "_final_score",
     "_graph_boost", "_graph_source", "_graph_relation_context",
 )
 
@@ -207,7 +207,8 @@ def recall(
     min_similarity: Annotated[
         float | None,
         Field(description="Drop vector hits below this cosine similarity "
-                          "(0.0-1.0, default 0.40). Full-text hits are never "
+                          "(0.0-1.0, default 0.30, just above the embedding "
+                          "model's 0.288 noise floor). Full-text hits are never "
                           "dropped by this filter: an exact keyword match "
                           "survives even when the embedding model scores it "
                           "low. Use null to disable the filter.")] = DEFAULT_MIN_SIMILARITY,
@@ -219,10 +220,10 @@ def recall(
                           "created_at, updated_at, project, deleted_at, "
                           "_project, and the score annotations "
                           "_similarity, _distance, _text_score, _rrf_score, "
-                          "_rrf_norm, _relevance_score, _scope_boost, "
-                          "_decay_score, _decay_norm, _final_score, "
-                          "_graph_boost, _graph_source, _graph_weight, "
-                          "_graph_relation_context.")] = None,
+                          "_rrf_norm, _relevance_score, _rerank_score, "
+                          "_scope_boost, _decay_score, _decay_norm, "
+                          "_final_score, _graph_boost, _graph_source, "
+                          "_graph_weight, _graph_relation_context.")] = None,
     detail: Annotated[
         Literal["full", "slim"],
         Field(description="'full' (default) returns every public column and "
@@ -266,7 +267,8 @@ def recall(
     `_relevance_score` are null and they carry `_graph_boost` instead.
     Graph-only hits fill the slots left by query hits; they never push a
     query match out of the page.
-    `min_similarity` defaults to 0.40 and only applies to the vector retriever;
+    `min_similarity` defaults to 0.30, just above the embedding model's
+    measured 0.288 noise floor, and only applies to the vector retriever;
     a full-text hit is kept even when its embedding is a poor match, so an
     exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
     handles that word badly. Pass `None` to disable the filter. The response
@@ -276,6 +278,13 @@ def recall(
     the strongest rejected vector hit, so a natural-language question that
     missed the threshold by a hair is visible and one retry with
     `min_similarity=null` can recover it.
+    When the first stage is ambiguous (best relevance below 0.85 and margin
+    to the runner-up below 0.10), the top candidates are reranked by a local
+    cross-encoder; `reranked` reports how many were rescored. Reranked rows
+    carry `_rerank_score` (a softmax over that candidate block) and an
+    updated `_relevance_score`; `_similarity` still reports the vector score.
+    A reranker failure is reported in `rerank_error` and falls back to the
+    first-stage ranking.
     `_relevance_score` is normalized to 0..1 and combines both signals: the
     cosine similarity of the vector hit and the rank of the full-text hit.
     A memory that both retrievers found scores higher than either signal
@@ -593,6 +602,13 @@ def recall(
         payload["dropped_by_superseded"] = dropped_by_superseded
     if stats.get("fulltext_only"):
         payload["fulltext_only"] = stats["fulltext_only"]
+    if stats.get("reranked"):
+        payload["reranked"] = stats["reranked"]
+    if stats.get("rerank_error"):
+        payload["rerank_error"] = stats["rerank_error"]
+        warnings.append(
+            f"reranking skipped: {stats['rerank_error']}; the first-stage "
+            f"ranking is unchanged")
     if dropped_by_cross_scope:
         # Silent dedup made a cross-scope copy look like a missing memory:
         # report the count so the caller can retry inside the other scope.
@@ -632,8 +648,8 @@ def recall_batch(
         Field(description="True (default) fuses vector and full-text results.")] = True,
     min_similarity: Annotated[
         float | None,
-        Field(description="Vector similarity floor per query (default 0.40); "
-                          "None disables it.")] = 0.40,
+        Field(description="Vector similarity floor per query (default 0.30); "
+                          "None disables it.")] = DEFAULT_MIN_SIMILARITY,
     include_decay: Annotated[
         bool,
         Field(description="Blend recency/access into the score.")] = False,
