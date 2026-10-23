@@ -94,6 +94,10 @@ whenever the `min_decay_score` / `only_superseded` filter removed hits — also
 when other hits survived, so a non-empty result is never quietly short. When
 the result is empty, the warning names **every** filter that removed
 something, so the caller does not have to guess which one was responsible.
+In that warning the strongest rejected vector hit is named explicitly, and the
+payload carries `best_dropped_by_similarity` (`id`, `similarity`, `scope`,
+`content_preview`): a fact that missed the cutoff by a hair is shown instead
+of hiding behind the `dropped_by_similarity` counter.
 
 ## The full-text coverage floor
 

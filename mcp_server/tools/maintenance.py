@@ -600,7 +600,10 @@ def stats_resource() -> str:
             cur.execute(
                 f"SELECT COUNT(*), "
                 f"COUNT(*) FILTER (WHERE superseded_by IS NULL AND deleted_at IS NULL), "
-                f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL AND deleted_at IS NULL), "
+                # Superseded is orthogonal to the soft delete: count the
+                # history marker itself, not only rows that were never
+                # forgotten (see init_context counting for the same reason).
+                f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
                 f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
                 f"FROM {table}"
             )

@@ -61,6 +61,27 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _best_dropped_hint(best_dropped: dict[str, Any]) -> str:
+    """Name the strongest vector hit that the similarity filter rejected.
+
+    A count alone leaves the caller blind: the rejected hit may be exactly
+    the memory the query was after (a natural-language question that missed
+    the threshold by a hair). The hint names id, similarity and scope - and
+    a content preview when it was fetched - so the caller can decide on an
+    explicit retry with `min_similarity=null` without burning a discovery
+    call first.
+    """
+    scope = best_dropped.get("scope") or "global"
+    hint = (
+        f"the strongest rejected vector hit was id '{best_dropped.get('id')}' "
+        f"(similarity {best_dropped.get('similarity')}, scope {scope!r})"
+    )
+    preview = best_dropped.get("content_preview")
+    if preview:
+        hint += f": {preview!r}"
+    return hint
+
+
 def _visibility_condition(include_deleted: bool, include_superseded: bool,
                           include_expired: bool) -> str:
     """SQL filter for the orthogonal visibility flags.
@@ -226,7 +247,11 @@ def recall(
     exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
     handles that word badly. Pass `None` to disable the filter. The response
     reports `candidates` and `dropped_by_similarity`, and warns when the
-    filter removed everything.
+    filter removed everything. When hits were dropped, it also names
+    `best_dropped_by_similarity` (id, similarity, scope, content preview):
+    the strongest rejected vector hit, so a natural-language question that
+    missed the threshold by a hair is visible and one retry with
+    `min_similarity=null` can recover it.
     `_relevance_score` is normalized to 0..1 and combines both signals: the
     cosine similarity of the vector hit and the rank of the full-text hit.
     A memory that both retrievers found scores higher than either signal
@@ -441,6 +466,7 @@ def recall(
     filtered_out = stats.get("dropped_by_similarity", 0)
     dropped_by_coverage = stats.get("dropped_by_coverage", 0)
     candidates = stats.get("candidates", 0)
+    best_dropped = stats.get("best_dropped_by_similarity")
     if not rows and offset > 0 and candidates:
         warnings.append(
             f"no results on this page: offset={offset} is beyond the "
@@ -453,6 +479,8 @@ def recall(
                 f"{filtered_out} vector hit(s) were below "
                 f"min_similarity={min_similarity} (pass min_similarity=null "
                 f"or a lower value to see them)")
+            if best_dropped:
+                reasons.append(_best_dropped_hint(best_dropped))
         if dropped_by_coverage:
             reasons.append(
                 f"{dropped_by_coverage} full-text hit(s) covered too little of "
@@ -515,6 +543,11 @@ def recall(
         # nothing has to know whether other scopes were covered.
         "scopes_searched": scopes_searched,
     }
+    # The strongest rejected vector hit: a count alone hides the natural
+    # language question that barely missed the threshold. With a non-empty
+    # result it is a data field; with none it is the reason list.
+    if best_dropped:
+        payload["best_dropped_by_similarity"] = dict(best_dropped)
     if dropped_by_coverage:
         payload["dropped_by_coverage"] = dropped_by_coverage
     # Filter counters are reported even when hits survive: an agent must be
@@ -1489,9 +1522,10 @@ def init_context(project: Annotated[
     stored fact always shows up, even if it was never read before.
     `projects` lists every scope the answer covers, including the shared
     one ("global"). `active_memories` counts the active rows across the
-    covered tables (a cross-scope copy can be counted in both);
-    `total_memories` counts every row of the scope, so the difference is
-    `superseded_memories` plus `forgotten_memories`.
+    covered tables (a cross-scope copy can be counted in both).
+    `superseded_memories` and `forgotten_memories` are independent counts:
+    a row can be BOTH superseded and forgotten, so the numbers can overlap
+    and do not have to add up to `total_memories - active_memories`.
     `project_stats` lists every covered scope with its own sizes (memories,
     total, superseded, forgotten, entities, relations) and replaces the
     separate project listing; `include_empty_projects=False` drops scopes
@@ -1539,7 +1573,12 @@ def init_context(project: Annotated[
             cur.execute(
                 f"SELECT COUNT(*), "
                 f"COUNT(*) FILTER (WHERE superseded_by IS NULL AND deleted_at IS NULL), "
-                f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL AND deleted_at IS NULL), "
+                # Superseded is a history marker orthogonal to the soft
+                # delete: a row can be BOTH superseded and forgotten. Counting
+                # `deleted_at IS NULL` here made a forgotten-but-once-
+                # superseded fact vanish from the superseded counter, and
+                # total - active - forgotten <= superseded broke its promise.
+                f"COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
                 f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
                 f"FROM {table}"
             )

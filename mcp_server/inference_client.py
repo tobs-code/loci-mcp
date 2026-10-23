@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import time
 
 import requests
 
@@ -64,6 +65,10 @@ def nli_detailed(query: str,
     # model/format hiccup, not an outage: retry once instead of reporting the
     # whole contradiction scan as incomplete.
     for attempt in range(2):
+        if attempt:
+            # A short pause before the retry: the same immediate resend
+            # would most likely hit the very same transient state again.
+            time.sleep(0.5)
         resp = _get_session().post(
             f"{INFERENCE_URL}/nli",
             json=body,

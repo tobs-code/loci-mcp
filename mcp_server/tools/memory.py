@@ -29,6 +29,7 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
+from mcp_server.graph import _relate_edges, _validate_weight
 from mcp_server.inference_client import embed, nli_configured
 from mcp_server.scopes import (
     _all_mem_tables,
@@ -37,6 +38,7 @@ from mcp_server.scopes import (
     _memory_scopes,
     _norm_entity,
     _norm_project,
+    _safe_ident,
     _scope_key,
     _scope_label,
     _scope_of_table,
@@ -403,6 +405,13 @@ def remember(
                           "active reads and dedupe; the row itself stays until "
                           "it is pruned or soft-forgotten. Omit for an "
                           "open-ended memory.")] = None,
+    links: Annotated[
+        list[dict[str, Any]] | None,
+        Field(description="Optional graph edges to create in the same call "
+                          "(instead of a separate `relate` round trip). Each "
+                          "item needs 'to_entity' and 'relation_type'; "
+                          "optional 'from_entity' (default: the memory's "
+                          "entity), 'weight' (0.0-1.0) and 'context'.")] = None,
 ) -> dict[str, Any]:
     """Store a memory (fact, decision, learning, preference, ...).
 
@@ -433,6 +442,9 @@ def remember(
     fact is hidden in every scope now, not only in this project.
     `scope` defaults to "project" when a project is given, else "global".
     scope="global" stores in the shared table even when a project is given.
+    `links` creates graph edges in the same call: each item is a `relate`
+    edge whose `from_entity` defaults to the memory's `entity`. Edge failures
+    are warnings, never a lost fact.
 
     Returns the standard envelope: {"ok", "status", "id", "error", "warnings"}.
     """
@@ -482,6 +494,9 @@ def remember(
                         "(e.g. '2027-01-15' or '2027-01-15T12:00:00Z')")
     if metadata is not None and not isinstance(metadata, dict):
         return fail(STATUS_ERROR, "metadata must be an object")
+    per_link_errors = _validate_links(links, entity)
+    if per_link_errors:
+        return fail(STATUS_ERROR, "; ".join(per_link_errors))
     effective_scope = scope or ("project" if project else "global")
     if effective_scope == "project" and not project:
         if str(raw_project or "").strip().lower() == "global":
@@ -538,9 +553,14 @@ def remember(
                 if cross_now:
                     payload["cross_scope_superseded"] = cross_now
                     warnings.append(_cross_scope_warning(cross_now))
+            link_results, link_warnings = _apply_remember_links(
+                cur, links, entity, store_project)
+            warnings.extend(link_warnings)
+            if link_results:
+                payload["links"] = link_results
+            conn.commit()
             return ok(STATUS_DUPLICATE, id=existing_id,
                       warnings=warnings, **payload)
-
         # No active duplicate, but the content may match a memory that was
         # superseded earlier. Storing it would silently re-activate an
         # outdated fact, so report the match (without blocking the write).
@@ -672,10 +692,16 @@ def remember(
                     f"UPDATE {table} SET metadata = %s::jsonb WHERE id = %s",
                     (json.dumps(meta), mem_id))
 
+        # The graph edges belong to the SAME transaction as the memory: one
+        # commit stores the fact and its links together, and a savepoint
+        # keeps an edge failure from losing the fact.
+        link_results, link_warnings = _apply_remember_links(
+            cur, links, entity, store_project)
         conn.commit()
 
         warnings: list[str] = []
         warnings.extend(guard_warnings)
+        warnings.extend(link_warnings)
         if ttl_warning:
             warnings.append(ttl_warning)
         if superseded_match:
@@ -758,6 +784,8 @@ def remember(
                 # Transparency: the check ran, but beyond the entity tag.
                 contradictions_payload["cross_entity"] = True
             payload["contradictions"] = contradictions_payload
+        if link_results:
+            payload["links"] = link_results
         return ok(STATUS_STORED, id=mem_id, warnings=warnings, **payload)
     except Exception as e:
         conn.rollback()
@@ -765,6 +793,120 @@ def remember(
         return fail(STATUS_ERROR, str(e))
     finally:
         conn.close()
+
+
+def _norm_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _get_field(link: dict, key: str) -> Any:
+    return link.get(key)
+
+
+def _validate_links(links: Any, default_entity: str | None) -> list[str]:
+    """Validate `remember(links=[...])` before anything is stored.
+
+    A malformed link is an argument error, not a warning: the caller built
+    the call around memory + edges, and a silent half-result would need a
+    second discovery round trip. The per-item errors name the index, and the
+    item keys and ranges match the `relate` tool exactly.
+    """
+    if links is None:
+        return []
+    if not isinstance(links, list):
+        return ["links must be a list of edge objects ({to_entity, "
+                "relation_type, weight?, context?, from_entity?})"]
+    errors: list[str] = []
+    for i, link in enumerate(links):
+        if not isinstance(link, dict):
+            errors.append(f"links[{i}] must be an object")
+            continue
+        to_entity = _norm_str(_get_field(link, "to_entity"))
+        from_entity = _norm_str(_get_field(link, "from_entity"))
+        if not to_entity:
+            errors.append(f"links[{i}]: 'to_entity' is required")
+        if not from_entity and not default_entity:
+            errors.append(
+                f"links[{i}]: 'from_entity' is required when the memory "
+                f"has no entity")
+        relation_type = _norm_str(_get_field(link, "relation_type"))
+        if not relation_type:
+            errors.append(f"links[{i}]: 'relation_type' is required")
+        else:
+            try:
+                _safe_ident(relation_type, "relation_type")
+            except ValueError as e:
+                errors.append(f"links[{i}]: {e}")
+        weight = link.get("weight", 1.0)
+        try:
+            _validate_weight(weight)
+        except (TypeError, ValueError) as e:
+            errors.append(f"links[{i}]: weight: {e}")
+        context = link.get("context")
+        if context is not None and not isinstance(context, str):
+            errors.append(f"links[{i}]: 'context' must be a string")
+    return errors
+
+
+def _prepare_links(links: list[dict], default_entity: str | None) -> list[dict]:
+    """Normalize `links` items into `_relate_edges` edge dicts."""
+    edges: list[dict] = []
+    for link in links:
+        edges.append({
+            "from_entity": (_norm_str(link.get("from_entity"))
+                            or default_entity),
+            "to_entity": link.get("to_entity").strip()
+            if isinstance(link.get("to_entity"), str) else "",
+            "relation_type": link.get("relation_type"),
+            "weight": _validate_weight(link.get("weight", 1.0)),
+            "context": link.get("context"),
+        })
+    return edges
+
+
+def _apply_remember_links(
+    cur,
+    links: list[dict] | None,
+    default_entity: str | None,
+    store_project: str | None,
+) -> tuple[list[dict], list[str]]:
+    """Apply `remember(links=[...])` inside the caller's transaction.
+
+    The edges live in the SAME transaction as the memory: a second
+    connection would block on the locks this connection already holds
+    (registry/graph), turning a combined write into a deadlock. An AGE
+    failure rolls back to the savepoint only - the stored fact survives and
+    the failure is a warning, never a lost fact.
+    """
+    results: list[dict] = []
+    warnings: list[str] = []
+    if not links:
+        return results, warnings
+    edges_added = False
+    try:
+        cur.execute("SAVEPOINT remember_links")
+        cur.execute("SET search_path TO ag_catalog, public")
+        edges_added = True
+        for edge in _prepare_links(links, default_entity):
+            for lr in _relate_edges(cur, [edge], store_project):
+                entry = dict(lr)
+                if lr.get("self_loop"):
+                    warnings.append(
+                        f"links: self-loop {entry['from_entity']!r} ->["
+                        f"{entry['relation_type']!r}]-> itself; graph "
+                        "traversal cannot leave that node through this edge")
+                    entry.pop("self_loop", None)
+                results.append(entry)
+        cur.execute("RELEASE SAVEPOINT remember_links")
+    except Exception as e:
+        if edges_added:
+            cur.execute("ROLLBACK TO SAVEPOINT remember_links")
+            cur.execute("RELEASE SAVEPOINT remember_links")
+        warnings.append(f"links failed: {e}")
+    return results, warnings
 
 
 def _supersede_targets(cur, store_project: str | None, entity: str | None,

@@ -47,7 +47,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 
 | Tool | Description |
 |------|-------------|
-| `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, `on_near_duplicate`, `metadata_mode`, optional contradiction check, `scope` global/project) |
+| `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, `on_near_duplicate`, `metadata_mode`, optional contradiction check, `links` for graph edges in the same write, `scope` global/project) |
 | `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `on_near_duplicate`, `auto_supersede_near_duplicate`, `expires_at`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance, metadata, entity, type or TTL (`expires_at`/`clear_expires_at`); `touch=true` refreshes the decay recency without a content change, `restore=true` undoes a soft delete |
 | `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
@@ -68,6 +68,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `supersede_content` | string? | Exact content of the memory this fact replaces. |
 | `supersede_last` | bool | Replace the memory that matches the new fact best (most similar, not the newest) - of the entity, or across the whole scope when no entity is set. Only if the new fact is about the same topic (similarity >= 0.5; scope-wide without an entity >= 0.75), otherwise the fact is stored additionally and a warning is returned. |
 | `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
+| `links` | list? | Graph edges to create in the same write: `[{to_entity, relation_type, weight?, context?, from_entity?}]`; `from_entity` defaults to `entity`. Malformed links are an argument error before the write; a failing edge rolls back to a savepoint, warns (`links failed: ...`) and keeps the fact. Each edge is reported in `links` (`status: created`/`updated`/`duplicate`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
 | `on_near_duplicate` | enum | Action for a reworded copy of an active memory (near-duplicate, similarity >= 0.75): `warn` (default, store and warn), `supersede` (replace it, list it in `superseded`) or `reject` (`duplicate`, nothing stored). Works under `dedupe="off"` when the policy is not `warn`. |
 | `auto_supersede_near_duplicate` | bool | Backwards-compatible alias for `on_near_duplicate="supersede"`. |
@@ -209,7 +210,10 @@ hits survived, so a non-empty result is never quietly short.
 
 An empty result names every filter that removed something (`min_similarity`,
 `min_decay_score`, `only_superseded`, the coverage floor) - not just the first
-one, so the caller does not debug the wrong filter.
+one, so the caller does not debug the wrong filter. The strongest rejected
+vector hit is additionally reported as `best_dropped_by_similarity`
+(`id`, `similarity`, `scope`, `content_preview`) and named in the warning, so
+a barely-missed fact is visible instead of hidden behind a count.
 
 A project that does not exist is not silently ignored: the search falls back
 to the global scope and the answer says so in `warnings`.

@@ -37,6 +37,52 @@ def _row_is_active(row: dict) -> bool:
     return not row.get("superseded_by") and not row.get("deleted_at")
 
 
+BEST_DROPPED_PREVIEW_CHARS = 160
+
+
+def _note_dropped_candidate(
+    dropped: dict[str, Any] | None,
+    row_id: str,
+    table: str,
+    similarity: float,
+) -> None:
+    """Keep the strongest vector hit that `min_similarity` rejected.
+
+    A count alone (`dropped_by_similarity: 10`) hides the agent's best match:
+    the natural-language question that barely missed the threshold. Reporting
+    the strongest rejected candidate (id + similarity + scope) lets the
+    caller decide whether one call with `min_similarity=null` is worth it.
+    """
+    if dropped is None:
+        return
+    if "similarity" in dropped and similarity <= dropped["similarity"]:
+        return
+    dropped.clear()
+    dropped.update({
+        "id": row_id,
+        "similarity": round(similarity, 4),
+        "scope": "global" if table == "memories" else table[4:] or "global",
+    })
+
+
+
+def _fill_dropped_preview(cur, table: str, row_id: str,
+                          dropped: dict[str, Any]) -> None:
+    """Fetch the content preview of the strongest rejected candidate."""
+    try:
+        cur.execute(f"SELECT content FROM {table} WHERE id = %s", (row_id,))
+        row = cur.fetchone()
+    except Exception:
+        return
+    if row and row[0]:
+        dropped["content_preview"] = str(row[0])[:BEST_DROPPED_PREVIEW_CHARS]
+
+
+def _table_of_dropped(dropped: dict[str, Any]) -> str:
+    scope = dropped.get("scope") or "global"
+    return "memories" if scope == "global" else f"mem_{scope}"
+
+
 def _skip_active_cross_scope_duplicate(
     row: dict, table: str, seen_active: dict[str, str]
 ) -> bool:
@@ -231,6 +277,7 @@ def _search_memories_rrf(
     # (rank, matched_lexemes, id, table)
     text_candidates: list[tuple[float, int, str, str]] = []
     dropped_by_similarity = 0
+    best_dropped: dict[str, Any] | None = {}
 
     for table in tables:
         conditions = ["TRUE"]
@@ -265,6 +312,8 @@ def _search_memories_rrf(
                 dist = float(dist)
                 if max_distance is not None and dist > max_distance:
                     dropped_by_similarity += 1
+                    _note_dropped_candidate(
+                        best_dropped, row_id, table, 1.0 - dist)
                     continue
                 vec_candidates.append((dist, row_id, table))
 
@@ -342,11 +391,17 @@ def _search_memories_rrf(
         dropped_by_coverage = len(weak)
     if not fused_scores:
         if stats is not None:
+            if best_dropped:
+                _fill_dropped_preview(
+                    cur, _table_of_dropped(best_dropped),
+                    best_dropped["id"], best_dropped)
             stats.update({"candidates": 0,
                           "dropped_by_similarity": dropped_by_similarity,
                           "dropped_by_coverage": dropped_by_coverage,
                           "min_coverage": FTS_MIN_COVERAGE,
                           "fulltext_only": 0})
+            if best_dropped:
+                stats["best_dropped_by_similarity"] = best_dropped
         return []
 
     max_rrf = max(fused_scores.values()) or 1.0
@@ -414,6 +469,10 @@ def _search_memories_rrf(
             rows.append(d)
 
     if stats is not None:
+        if best_dropped:
+            _fill_dropped_preview(
+                cur, _table_of_dropped(best_dropped),
+                best_dropped["id"], best_dropped)
         stats.update({
             "candidates": len(fused_scores),
             "dropped_by_similarity": dropped_by_similarity,
@@ -422,6 +481,8 @@ def _search_memories_rrf(
             "fulltext_only": sum(1 for key in fused_scores
                                  if key not in similarities),
         })
+        if best_dropped:
+            stats["best_dropped_by_similarity"] = best_dropped
 
     # 5. Re-rank
     if include_decay:
@@ -498,6 +559,7 @@ def _search_memories(
     seen_active_hashes: dict[str, str] = {}
     dropped_by_similarity = 0
     dropped_by_coverage = 0
+    best_dropped: dict[str, Any] | None = {}
 
     project_names = _project_names(cur)
     # Fetch more than the caller asked for: the similarity filter is applied
@@ -566,6 +628,20 @@ def _search_memories(
                 d["_distance"] = float(d.pop("distance"))
                 if max_distance is not None and d["_distance"] > max_distance:
                     dropped_by_similarity += 1
+                    if best_dropped is not None:
+                        sim = 1.0 - d["_distance"]
+                        if ("similarity" not in best_dropped
+                                or sim > best_dropped["similarity"]):
+                            best_dropped.clear()
+                            best_dropped.update({
+                                "id": d["id"],
+                                "similarity": round(sim, 4),
+                                "scope": ("global" if table == "memories"
+                                          else table[4:] or "global"),
+                                "content_preview":
+                                    str(d.get("content") or "")
+                                    [:BEST_DROPPED_PREVIEW_CHARS],
+                            })
                     continue
                 d["_similarity"] = round(1.0 - d["_distance"], 4)
             else:
@@ -616,6 +692,8 @@ def _search_memories(
         for row in rows:
             row["_relevance_score"] = row.get("_similarity", 0.0)
     if stats is not None:
+        if best_dropped:
+            stats["best_dropped_by_similarity"] = best_dropped
         stats.update({
             "candidates": len(rows),
             "dropped_by_similarity": dropped_by_similarity,

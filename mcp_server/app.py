@@ -117,7 +117,10 @@ the default `full` exposes all 21 (batch, backup and repair included).
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.
 - Store/link: `remember(content="Service uses Postgres", entity="API", project="api")` →
-  `relate(from_entity="API", to_entity="Postgres", relation_type="USES", project="api")`.
+  `relate(from_entity="API", to_entity="Postgres", relation_type="USES", project="api")`,
+  or in one step:
+  `remember(content="Service uses Postgres", entity="API", project="api",
+  links=[{"to_entity": "Postgres", "relation_type": "USES"}])`.
 - Explore: `find_connections(entity="API", project="api")` or
   `find_paths(from_entity="API", to_entity="Postgres", project="api")`.
 - Backup/restore: pass `export_memories(format="json").data` to

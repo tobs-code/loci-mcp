@@ -40,7 +40,7 @@ the argument.
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `remember` | Store one memory with embedding. `project`, `scope` (`project`/`global`), `entity`, `mem_type`, `importance`, `metadata`, `expires_at`; `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold`; `supersede` (id), `supersede_content` (exact text), `supersede_last`; `on_near_duplicate` (`warn`/`supersede`/`reject`), alias `auto_supersede_near_duplicate`; `metadata_mode` (`merge`/`replace`); `check_contradictions`. Reports the `scope`/`project` it wrote to. |
+| `remember` | Store one memory with embedding. `project`, `scope` (`project`/`global`), `entity`, `mem_type`, `importance`, `metadata`, `expires_at`; `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold`; `supersede` (id), `supersede_content` (exact text), `supersede_last`; `on_near_duplicate` (`warn`/`supersede`/`reject`), alias `auto_supersede_near_duplicate`; `metadata_mode` (`merge`/`replace`); `check_contradictions`; `links` (`[{to_entity, relation_type, weight?, context?, from_entity?}]` — creates graph edges in the same step, `from_entity` defaults to `entity`). Reports the `scope`/`project` it wrote to and `links` (`status: created/updated/duplicate` per edge). Malformed links are an argument error before the write; edge failures roll back to a savepoint and warn (`links failed: ...`) while the fact stays stored. |
 | `remember_batch` | Store many facts with per-entry savepoints. Top-level `project`, `scope`, `dedupe`, `fuzzy_threshold`, `skip_duplicates`, `on_near_duplicate`, `check_contradictions`; per fact `content`, `project`, `scope`, `entity`, `mem_type`, `importance`, `metadata`, `supersede`, `supersede_content`, `supersede_last`, `dedupe`, `fuzzy_threshold`, `on_near_duplicate`, `expires_at`. Invalid facts are reported individually; the rest are stored. `count` is the number of entries, `succeeded`/`failed` split the outcomes. A supersede carries metadata over like `remember`. |
 | `update_memory` | Change `content` (re-embeds), `importance`, `metadata`, `entity`, `mem_type`, TTL (`expires_at`/`clear_expires_at`); `project`, `dedupe`, `fuzzy_threshold`. `touch=true` only bumps `updated_at` (decay refresh; combinable with `importance`). `restore=true` undoes a soft delete, clears `deleted_at` and the sentinel, never a real `superseded_by`, and is mutually exclusive with other fields. A content change that would duplicate an active memory answers `duplicate` and applies nothing. Unknown ids answer `not_found` before the "nothing to update" check. |
 | `update_batch` | Many `updates` with per-entry savepoints (`memory_id` plus the same fields as `update_memory`, including `project` and `restore`). Invalid, unknown, ambiguous or duplicate entries are reported individually (`partial`); the rest are applied. `count` is the number of entries, `succeeded`/`failed` split the outcomes. |
@@ -174,7 +174,10 @@ counts and health.
   filters **vector** hits only; full-text hits survive a bad embedding score.
   `recall` reports `dropped_by_similarity`, `dropped_by_coverage`,
   `dropped_by_decay` and `dropped_by_superseded`; an empty result names every
-  filter that removed something.
+  filter that removed something. The strongest rejected vector hit is reported
+  as `best_dropped_by_similarity` (id, similarity, scope, `content_preview`),
+  so a barely-missed fact is visible instead of hidden behind a count; the
+  empty-result warning names it and suggests `min_similarity=null`.
 - `_similarity` is cosine similarity (0..1). Natural-language matches usually
   score 0.6-0.95, verbatim keywords 0.3-0.6, unrelated facts below ~0.3. The
   default `min_similarity` is 0.40; `null` disables it.
@@ -254,8 +257,11 @@ counts and health.
   Different subjects stay neutral. Near-identical wording alone does not make
   two pattern instances the same subject.
 - NLI outages are surfaced: `/nli` sets `error` when no score is a real
-  judgment; the client raises. Unparseable JSON is retried once (logged). A
-  partial failure sets `partial_error`/`failed`; `contradictions_report`
+  judgment; the client raises. Unparseable JSON is retried once (logged); the
+  inference side also retries with backoff when the whole `classify` call hits
+  a transient failure (429/5xx, timeout or connection error - 3 attempts, then
+  the provider-level `json_schema`/`json_object`/plain fallback). A partial
+  failure sets `partial_error`/`failed`; `contradictions_report`
   reports an incomplete scan and names `nli_failures`. Write tools keep the
   fact and warn (`contradiction check skipped: NLI unavailable: ...`) in
   `warnings` and `contradictions.skipped`. Zero scores are always trustworthy.

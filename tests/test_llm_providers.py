@@ -250,6 +250,7 @@ def test_classify_aborts_when_every_format_fails(monkeypatch):
         return FakeResponse(status_code=500, text="provider down")
 
     monkeypatch.setattr("inference.llm.requests.post", fake_post)
+    monkeypatch.setattr("inference.llm.time.sleep", lambda s: None)
     config = load_config({"LLM_PROVIDER": "openai", "LLM_API_KEY": "sk-test"})
 
     with pytest.raises(RuntimeError, match="LLM request failed"):

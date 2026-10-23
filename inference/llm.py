@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 
 import requests
@@ -84,6 +85,11 @@ _PROVIDERS = {
 }
 
 _NO_KEY_PROVIDERS = {"ollama", "openai-compatible"}
+
+# HTTP states where a fresh request succeeds after a brief wait: rate limits
+# and provider-side hiccups. A 400-class validation error never recovers and
+# must be surfaced immediately.
+RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 
 
 @dataclass(frozen=True)
@@ -350,18 +356,35 @@ def classify(config: LLMConfig, query: str, document: str,
         # The response format is deterministic, the provider answer is not:
         # an occasional non-JSON reply (rate-limit page, truncated decode)
         # is retried with the same format before falling back to the next
-        # one, so a transient hiccup does not fail the comparison.
+        # one, so a transient hiccup does not fail the comparison. Retries
+        # sleep briefly with linear backoff - an immediate resend hits the
+        # same rate limit or truncation state and burns the attempt.
         for retry in range(3):
+            if retry:
+                time.sleep(0.5 * retry)
             try:
                 resp = requests.post(url, headers=headers, json=body, timeout=60)
                 if resp.status_code >= 400:
                     last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    if resp.status_code in RETRYABLE_HTTP_STATUS:
+                        continue
                     break
                 parsed = parse_nli_json(extract_text(config, resp.json()))
                 if parsed is None:
                     last_error = "response was not valid NLI JSON"
                     continue
                 return nli_score(parsed)
+            except requests.Timeout as exc:
+                # A timed-out request is the classic transient LLM hiccup:
+                # wait briefly and resend before falling back.
+                last_error = f"request timed out: {exc}"
+                continue
+            except requests.ConnectionError as exc:
+                last_error = f"connection failed: {exc}"
+                continue
+            except requests.exceptions.JSONDecodeError as exc:
+                last_error = f"response body was not JSON: {exc}"
+                continue
             except Exception as exc:
                 last_error = exc
                 break
