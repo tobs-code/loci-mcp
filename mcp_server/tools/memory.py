@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -16,6 +17,7 @@ from mcp_server.config import (
 )
 from mcp_server.db import get_conn
 from mcp_server.envelope import (
+    STATUS_CONFLICT,
     STATUS_DELETED,
     STATUS_DUPLICATE,
     STATUS_ERROR,
@@ -43,7 +45,6 @@ from mcp_server.scopes import (
     _scope_key,
     _scope_label,
     _scope_of_table,
-    _scopes_of_tables,
     _table_exists,
 )
 from mcp_server.scoring import _content_hash
@@ -168,7 +169,113 @@ def _same_subject_entity(near_dup: dict, entity: str | None) -> bool:
     return _norm_str(near_dup.get("entity")) == _norm_str(entity)
 
 
-def _near_duplicate_warning(near_dup: dict, entity: str | None = None) -> str:
+_WORD_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
+_CAMEL_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from",
+    "has", "have", "in", "is", "it", "its", "of", "on", "or", "that", "the",
+    "this", "to", "was", "were", "with", "now", "still", "also",
+    "gets", "get", "new", "old",
+    "der", "die", "das", "ein", "eine", "einer", "und", "oder", "ist", "sind",
+    "auf", "fuer", "für", "mit", "von", "zu", "im", "in", "den", "dem",
+    "des", "wird", "werden", "hat", "haben",
+}
+
+# Attribute *values* change when a fact is updated, so they must not count as
+# the shared subject: "runs on friday" -> "runs on saturday" is the same
+# topic, "runs on port 8766" -> "runs a nightly backup" is not.
+_VALUE_WORDS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "daily", "weekly", "monthly", "yearly", "annual", "annually",
+    "hourly", "today", "tomorrow", "yesterday", "tonight", "utc", "gmt",
+} | _STOPWORDS
+
+_NEGATIONS = {
+    "not", "no", "never", "without", "none", "cannot", "disabled", "false",
+    "nicht", "kein", "keine", "keinen", "ohne", "nie", "niemals",
+}
+
+
+def _entity_tokens(entity: str | None) -> set[str]:
+    """Content-free tokens of an entity name (CamelCase is split).
+
+    The entity name is not a subject term: two facts about the same service
+    always share it, even when one describes its port and the other its
+    backup job. Removing it is what makes the topic check meaningful.
+    """
+    if not entity:
+        return set()
+    tokens: set[str] = set()
+    for chunk in re.split(r"[^A-Za-z0-9]+", str(entity)):
+        if not chunk:
+            continue
+        # The content tokenizer keeps "Round19Svc" as one token, so the
+        # camel-split parts alone would not remove it from the topic words.
+        tokens.add(chunk.lower())
+        for match in _CAMEL_WORD_RE.findall(chunk):
+            tokens.add(match.lower())
+    return tokens
+
+
+def _topic_tokens(text: str, entity: str | None) -> set[str]:
+    """Subject words of a fact: no stopwords, values or the entity name."""
+    tokens = {token.lower() for token in _WORD_RE.findall((text or "").lower())}
+    ignored = _VALUE_WORDS | _entity_tokens(entity)
+    return {token for token in tokens
+            if token not in ignored and not token.isdigit() and len(token) > 1}
+
+
+def _shares_subject(new_content: str, old_content: str,
+                    entity: str | None,
+                    similarity: float | None = None) -> bool:
+    """Whether two facts talk about the same non-entity subject.
+
+    `supersede_last` used to accept any pair above a similarity floor. Two
+    sentences about the same service share their template ("the QA service
+    runs ..."), so a port fact could replace a backup-job fact. This compares
+    the remaining *attribute* words after removing the entity, stopwords and
+    attribute values (numbers, days, intervals). A port update keeps the
+    words "port"/"runs"; a backup job does not.
+
+    Jaccard overlap (not just "one shared word") keeps a generic verb such as
+    "runs" from proving a topic match on its own. Too-short content falls back
+    to a very high similarity so a legitimate one-word update is not blocked.
+    """
+    new_tokens = _topic_tokens(new_content, entity)
+    old_tokens = _topic_tokens(old_content, entity)
+    if not new_tokens or not old_tokens:
+        return similarity is not None and similarity >= 0.92
+    overlap = len(new_tokens & old_tokens)
+    return overlap / len(new_tokens | old_tokens) > 0.5
+
+
+def _content_conflict(new_content: str, old_content: str) -> bool:
+    """Cheap signal that two similar texts differ in a number or a negation.
+
+    Such a pair is usually an attribute update or an outright contradiction,
+    not a reworded copy. The near-duplicate warning labels it accordingly so
+    an agent does not blindly accept `on_near_duplicate='reject'` advice for a
+    fact that is actually meant to replace the old value.
+
+    This is deliberately not an NLI call: writes stay cheap. It only decides
+    how the warning reads; `check_contradictions=true` remains the real test.
+    """
+    new_numbers = set(_NUMBER_RE.findall((new_content or "").lower()))
+    old_numbers = set(_NUMBER_RE.findall((old_content or "").lower()))
+    if new_numbers and old_numbers and new_numbers != old_numbers:
+        return True
+    new_words = set(_WORD_RE.findall((new_content or "").lower()))
+    old_words = set(_WORD_RE.findall((old_content or "").lower()))
+    return bool(new_words & _NEGATIONS) != bool(old_words & _NEGATIONS)
+
+
+def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
+                            conflict: bool = False) -> str:
     """Warning for a write that dedupe did not match but that still reads
     like a reworded copy of an active memory (remember + remember_batch).
 
@@ -191,6 +298,16 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None) -> str:
             f"same subject, tag them with the same entity; only pass "
             f"supersede={near_dup['id']} if you are sure the other fact must "
             f"be replaced. Matched content: {preview!r}"
+        )
+    if conflict:
+        return (
+            f"near-duplicate: active memory {near_dup['id']} matches this "
+            f"content with similarity {near_dup['similarity']}, but the two "
+            f"differ in a number or a negation - that is an attribute update "
+            f"or a contradiction, not a reworded copy. Pass "
+            f"check_contradictions=true to let NLI decide, "
+            f"supersede={near_dup['id']} to replace the old fact, or "
+            f"dedupe='off' to store without this warning"
         )
     return (
         f"near-duplicate: active memory {near_dup['id']} matches this content "
@@ -386,10 +503,18 @@ class BatchUpdate(BaseModel):
     importance: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                             description="New importance in 0.0-1.0.")
     metadata: Any = Field(default=None, json_schema_extra={"type": ["object", "null"]},
-                          description="Replacement metadata object, e.g. "
+                          description="Metadata object, e.g. "
                                       "{\"env\": \"test\"}. A JSON-encoded "
                                       "string of an object is accepted and "
-                                      "parsed.")
+                                      "parsed. Replaces the stored object "
+                                      "unless metadata_mode='merge'.")
+    metadata_mode: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"], "enum": ["replace", "merge", None],
+    }, description="'replace' (default) or 'merge' (keep stored keys the new "
+                   "object does not set).")
+    clear_metadata_keys: Any = Field(default=None, json_schema_extra={
+        "type": ["array", "null"], "items": {"type": "string"},
+    }, description="Metadata keys to remove.")
     entity: Any = Field(default=None, json_schema_extra={"type": ["string", "null"]},
                         description="New entity the memory belongs to.")
     mem_type: Any = Field(default=None, json_schema_extra={"type": "string"},
@@ -665,7 +790,7 @@ def remember(
                     (superseded_now, _self_targets, extra_warnings,
                      cross_now) = _apply_duplicate_supersede(
                         cur, store_project, existing_id, entity, supersede,
-                        supersede_content, supersede_last, emb)
+                        supersede_content, supersede_last, emb, content)
                 except ValueError as e:
                     conn.rollback()
                     return fail(STATUS_ERROR, str(e))
@@ -735,7 +860,7 @@ def remember(
         try:
             superseded, guard_warnings = _supersede_targets(
                 cur, store_project, entity, supersede, supersede_content,
-                supersede_last, emb
+                supersede_last, emb, content
             )
         except ValueError as e:
             conn.rollback()
@@ -752,6 +877,9 @@ def remember(
         auto_near: dict | None = None
         same_subject = (near_dup is not None
                         and _same_subject_entity(near_dup, entity))
+        near_conflict = bool(
+            same_subject
+            and _content_conflict(content, near_dup.get("content") or ""))
         if near_dup and same_subject and near_policy == "reject" \
                 and near_dup["id"] not in superseded:
             conn.rollback()
@@ -764,9 +892,13 @@ def remember(
                 warnings=[
                     f"near-duplicate rejected: active memory {near_dup['id']} "
                     f"matches this content with similarity "
-                    f"{near_dup['similarity']}; nothing was stored (pass "
-                    f"on_near_duplicate='supersede' to replace it or 'warn' "
-                    f"to store it anyway)"])
+                    f"{near_dup['similarity']}"
+                    + (", and a number or negation differs - this may be a "
+                       "contradiction rather than a reworded copy"
+                       if near_conflict else "")
+                    + "; nothing was stored (pass on_near_duplicate="
+                      "'supersede' to replace it or 'warn' to store it "
+                      "anyway)"])
         if near_dup and same_subject and near_policy == "supersede" \
                 and near_dup["id"] not in superseded:
             auto_near = near_dup
@@ -865,17 +997,16 @@ def remember(
             warnings.append(
                 f"auto-supersede: replaced near-duplicate "
                 f"{near_dup['id']} (similarity {near_dup['similarity']}) "
-                f"instead of storing a reworded copy")
-        elif near_dup and near_dup["id"] in superseded:
-            # Some other part of this write (explicit supersede or the
-            # contradiction check) already replaced it: the near-duplicate is
-            # handled, so no "pass supersede=<id>" advice is needed.
+                f"instead of storing a reworded copy"
+                + ("; a number or negation differs, so verify this was an "
+                   "intended update and not a contradiction"
+                   if near_conflict else ""))
+        elif near_dup and near_dup["id"] not in superseded:
+            # A near-duplicate that some other part of this write already
+            # replaced (explicit supersede or the contradiction check) needs
+            # no extra advice: the `superseded` list already names it.
             warnings.append(
-                f"near-duplicate {near_dup['id']} (similarity "
-                f"{near_dup['similarity']}) is superseded by this write "
-                f"already; no separate action is needed")
-        elif near_dup:
-            warnings.append(_near_duplicate_warning(near_dup, entity))
+                _near_duplicate_warning(near_dup, entity, near_conflict))
         if cross_scope_superseded:
             warnings.append(_cross_scope_warning(cross_scope_superseded))
         if cross_duplicates:
@@ -1062,7 +1193,8 @@ def _apply_remember_links(
 def _supersede_targets(cur, store_project: str | None, entity: str | None,
                        supersede: str | None, supersede_content: str | None,
                        supersede_last: bool,
-                       embedding: list[float] | None = None
+                       embedding: list[float] | None = None,
+                       content: str | None = None
                        ) -> tuple[list[str], list[str]]:
     """Resolve which existing memories a new fact replaces.
 
@@ -1146,6 +1278,20 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
                     f"with similarity {similarity} < {topic_floor}); the new "
                     f"fact was stored as an additional memory"
                 )
+            elif content is not None and not _shares_subject(
+                    content, old_content,
+                    entity or found_entity, similarity):
+                # Similarity is dominated by the shared sentence template
+                # ("the QA service ..."), so a fact about another attribute
+                # still scores high. Requiring a shared content word after
+                # removing the entity makes the topic check real.
+                pool = repr(entity) if entity else "the scope"
+                warnings.append(
+                    f"supersede_last skipped: the best match in {pool} "
+                    f"({old_content!r}, similarity {similarity}) shares no "
+                    f"subject term with the new fact - it is a different "
+                    f"topic; the new fact was stored as an additional memory"
+                )
             else:
                 targets.append(target_id)
                 if not entity:
@@ -1162,7 +1308,8 @@ def _apply_duplicate_supersede(cur, store_project: str | None,
                                supersede: str | None,
                                supersede_content: str | None,
                                supersede_last: bool,
-                               embedding: list[float] | None
+                               embedding: list[float] | None,
+                               content: str | None = None
                                ) -> tuple[list[str], list[str], list[str],
                                           list[str]]:
     """Apply `supersede` even when the write itself is a duplicate.
@@ -1177,7 +1324,7 @@ def _apply_duplicate_supersede(cur, store_project: str | None,
     """
     targets, warnings = _supersede_targets(
         cur, store_project, entity, supersede, supersede_content,
-        supersede_last, embedding)
+        supersede_last, embedding, content)
     applied = [t for t in targets if t != existing_id]
     self_targets = [t for t in targets if t == existing_id]
     for old_id in applied:
@@ -1451,7 +1598,7 @@ def remember_batch(
                                         spec["entity"], spec.get("supersede"),
                                         spec.get("supersede_content"),
                                         spec.get("supersede_last"),
-                                        embeddings[i]))
+                                        embeddings[i], spec["content"]))
                             except ValueError as exc:
                                 cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                                 results.append({
@@ -1503,7 +1650,7 @@ def remember_batch(
                 superseded, guard_warnings = _supersede_targets(
                     cur, store_project, spec["entity"], spec["supersede"],
                     spec["supersede_content"], spec["supersede_last"],
-                    embeddings[i],
+                    embeddings[i], spec["content"],
                 )
                 # Per-fact near-duplicate policy (same semantics as in
                 # `remember`): reject stores nothing, supersede replaces.
@@ -1513,6 +1660,10 @@ def remember_batch(
                 same_fact_subject = (near_dup is not None
                                      and _same_subject_entity(
                                          near_dup, spec["entity"]))
+                fact_near_conflict = bool(
+                    same_fact_subject
+                    and _content_conflict(spec["content"],
+                                          near_dup.get("content") or ""))
                 if near_dup and same_fact_subject \
                         and fact_near_policy == "reject" \
                         and near_dup["id"] not in superseded:
@@ -1529,8 +1680,11 @@ def remember_batch(
                         "warnings": [
                             f"near-duplicate rejected: active memory "
                             f"{near_dup['id']} matches this content with "
-                            f"similarity {near_dup['similarity']}; nothing "
-                            f"was stored"],
+                            f"similarity {near_dup['similarity']}"
+                            + (", and a number or negation differs - this "
+                               "may be a contradiction rather than a "
+                               "reworded copy" if fact_near_conflict else "")
+                            + "; nothing was stored"],
                     })
                     continue
                 if near_dup and same_fact_subject \
@@ -1618,17 +1772,22 @@ def remember_batch(
                     "values come from the old fact; verify they still apply): "
                     + ", ".join(sorted(set(carried))))
             if near_dup and same_fact_subject \
-                    and spec["on_near_duplicate"] == "supersede":
+                    and spec["on_near_duplicate"] == "supersede" \
+                    and near_dup["id"] in superseded:
                 entry.setdefault("warnings", []).append(
                     f"auto-supersede: replaced near-duplicate "
                     f"{near_dup['id']} (similarity {near_dup['similarity']}) "
-                    f"instead of storing a reworded copy")
-            elif near_dup and near_dup["id"] in superseded:
-                # Already replaced through the explicit supersede path.
-                pass
-            elif near_dup:
+                    f"instead of storing a reworded copy"
+                    + ("; a number or negation differs, so verify this was "
+                       "an intended update and not a contradiction"
+                       if fact_near_conflict else ""))
+            elif near_dup and near_dup["id"] not in superseded:
+                # Already replaced through the explicit supersede path: the
+                # entry's `superseded` list already names it, so no extra
+                # advice is needed.
                 entry.setdefault("warnings", []).append(
-                    _near_duplicate_warning(near_dup, spec["entity"]))
+                    _near_duplicate_warning(near_dup, spec["entity"],
+                                            fact_near_conflict))
             if cross_scope_superseded:
                 entry["cross_scope_superseded"] = cross_scope_superseded
                 entry.setdefault("warnings", []).append(
@@ -1673,13 +1832,13 @@ def remember_batch(
 
 
 def _restore_blocked_reason(cur, memory_id: str,
-                            tables: list[str]) -> str | None:
-    """Why an existing row cannot be restored, or None for an unknown id.
+                            tables: list[str]) -> tuple[str, str] | None:
+    """Status and reason for an existing row that cannot be restored.
 
-    "not soft-forgotten or does not exist" hid the actual state: an active
-    memory has nothing to restore, and a superseded one stays history (a
-    restore never undoes a supersede). Naming the reason stops the caller from
-    looking for a missing id that is in fact there.
+    "not found" was a lie for an active memory: the id exists, it just has
+    nothing to restore. Such a request answers `conflict`; an unknown id stays
+    `not_found`. A superseded history row is a conflict too - a restore never
+    undoes a supersede.
     """
     for table in tables:
         cur.execute(
@@ -1692,14 +1851,20 @@ def _restore_blocked_reason(cur, memory_id: str,
         if deleted_at is None:
             if superseded_by is not None \
                     and superseded_by != SENTINEL_FORGOTTEN:
-                return (f"memory {memory_id} exists but is not soft-forgotten: "
-                        f"it is superseded by {superseded_by}, and a restore "
-                        f"does not undo a supersede (read it with "
-                        f"include_superseded=true)")
-            return (f"memory {memory_id} exists but is not soft-forgotten (it "
-                    f"is active); there is nothing to restore")
-        return (f"memory {memory_id} exists but its deleted_at is not a "
-                f"restorable soft delete")
+                return (
+                    STATUS_CONFLICT,
+                    f"memory {memory_id} exists but is not soft-forgotten: "
+                    f"it is superseded by {superseded_by}, and a restore "
+                    f"does not undo a supersede (read it with "
+                    f"include_superseded=true)")
+            return (
+                STATUS_CONFLICT,
+                f"memory {memory_id} exists but is not soft-forgotten (it "
+                f"is active); there is nothing to restore")
+        return (
+            STATUS_CONFLICT,
+            f"memory {memory_id} exists but its deleted_at is not a "
+            f"restorable soft delete")
     return None
 
 
@@ -1747,11 +1912,12 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                 break
         conn.commit()
         if not restored:
-            reason = _restore_blocked_reason(cur, memory_id, tables)
-            return fail(
-                STATUS_NOT_FOUND,
-                reason or f"NOT FOUND: {memory_id}",
-                id=memory_id)
+            blocked = _restore_blocked_reason(cur, memory_id, tables)
+            if blocked:
+                status, reason = blocked
+                return fail(status, reason, id=memory_id)
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
+                        id=memory_id)
         scope = _scope_of_table(cur, restored_table) if restored_table else None
     except Exception as e:
         conn.rollback()
@@ -1774,9 +1940,19 @@ def update_memory(
     metadata: Annotated[
         Any,
         Field(json_schema_extra={"type": ["object", "null"]},
-              description="Replacement metadata object, e.g. "
-                          "{\"env\": \"test\"}. A JSON-encoded string of an "
-                          "object is accepted and parsed.")] = None,
+              description="Metadata object, e.g. {\"env\": \"test\"}. A "
+                          "JSON-encoded string of an object is accepted and "
+                          "parsed. Replaces the stored object unless "
+                          "metadata_mode='merge'.")] = None,
+    metadata_mode: Annotated[
+        Literal["replace", "merge"],
+        Field(description="'replace' (default) writes the metadata object as "
+                          "given; 'merge' keeps stored keys that the new "
+                          "object does not set.")] = "replace",
+    clear_metadata_keys: Annotated[
+        list[str] | None,
+        Field(description="Metadata keys to remove. Can be combined with "
+                          "metadata and metadata_mode.")] = None,
     project: Annotated[
         str | None,
         Field(description="Project scope. Without it the id is looked up in "
@@ -1845,6 +2021,19 @@ def update_memory(
     if expires_at is not None and clear_expires_at:
         return fail(STATUS_ERROR,
                     "pass either expires_at or clear_expires_at, not both")
+    if metadata_mode not in ("replace", "merge"):
+        return fail(STATUS_ERROR,
+                    "metadata_mode must be 'replace' or 'merge'")
+    clear_keys: list[str] = []
+    if clear_metadata_keys is not None:
+        if not isinstance(clear_metadata_keys, list) or any(
+                not isinstance(key, str) or not key.strip()
+                for key in clear_metadata_keys):
+            return fail(STATUS_ERROR,
+                        "clear_metadata_keys must be a list of non-empty "
+                        "strings")
+        clear_keys = list(dict.fromkeys(
+            key.strip() for key in clear_metadata_keys))
     expires_value: datetime | None = None
     if expires_at is not None:
         try:
@@ -1858,7 +2047,7 @@ def update_memory(
         if (content is not None or importance is not None
                 or metadata is not None or entity is not None
                 or mem_type is not None or expires_at is not None
-                or clear_expires_at or touch):
+                or clear_expires_at or touch or clear_keys):
             return fail(STATUS_ERROR,
                         "restore=true cannot be combined with other update "
                         "fields; it only clears the soft delete")
@@ -1888,12 +2077,11 @@ def update_memory(
             return fail(STATUS_ERROR, "importance must be between 0.0 and 1.0")
         sets.append("importance = %s")
         params.append(importance)
+    metadata_value: dict[str, Any] | None = None
     if metadata is not None:
-        metadata, meta_error = _coerce_metadata(metadata)
+        metadata_value, meta_error = _coerce_metadata(metadata)
         if meta_error:
             return fail(STATUS_ERROR, meta_error)
-        sets.append("metadata = %s::jsonb")
-        params.append(json.dumps(metadata))
     if entity is not None:
         sets.append("entity = %s")
         params.append(entity)
@@ -1960,12 +2148,44 @@ def update_memory(
                     f"memory {memory_id} exists but cannot be updated: {reason}",
                     id=memory_id)
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+        if metadata_value is not None or clear_keys:
+            # Metadata merge and key removal need the stored object. This is
+            # the only field that is computed from the existing row; the
+            # caller's new keys win, missing ones survive in 'merge' mode.
+            cur.execute(
+                f"SELECT metadata FROM {active_table} WHERE id = %s",
+                (memory_id,))
+            row = cur.fetchone()
+            current: dict[str, Any] = {}
+            if row and row[0] is not None:
+                try:
+                    raw = (row[0] if isinstance(row[0], dict)
+                           else json.loads(row[0]))
+                except (TypeError, ValueError):
+                    raw = {}
+                if isinstance(raw, dict):
+                    current = raw
+            if metadata_mode == "merge" or metadata_value is None:
+                # Key removal without a new object edits the stored object;
+                # starting from {} would silently wipe every other key.
+                merged = dict(current)
+                merged.update(metadata_value or {})
+            else:
+                merged = dict(metadata_value or {})
+            for key in clear_keys:
+                merged.pop(key, None)
+            sets.append("metadata = %s::jsonb")
+            params.append(json.dumps(merged))
+        if sets and "updated_at = NOW()" not in sets:
+            # A metadata-only edit must age like every other update.
+            sets.append("updated_at = NOW()")
         if not sets:
             conn.rollback()
             return fail(STATUS_ERROR,
                         "nothing to update: pass content, importance, metadata, "
-                        "entity, mem_type, expires_at/clear_expires_at, "
-                        "touch=true or restore=true",
+                        "clear_metadata_keys, entity, mem_type, "
+                        "expires_at/clear_expires_at, touch=true or "
+                        "restore=true",
                         id=memory_id)
         scope = _scope_of_table(cur, active_table)
         # `entity=None` means "keep the current entity", not "untagged": the
@@ -1991,7 +2211,11 @@ def update_memory(
                 detail = ("exact content hash" if dup_mode == "exact"
                           else f"semantic match (similarity {dup_similarity})")
                 return ok(
-                    STATUS_DUPLICATE, id=memory_id, duplicate_of=dup_id,
+                    # Nothing was changed, so `id` names the existing memory
+                    # that blocked the edit (same contract as remember). The
+                    # id the caller tried to edit is `memory_id`.
+                    STATUS_DUPLICATE, id=dup_id, memory_id=memory_id,
+                    duplicate_of=dup_id,
                     duplicate_mode=dup_mode, similarity=dup_similarity,
                     project=scope,
                     warnings=[f"update not applied: the new content would "
@@ -1999,6 +2223,9 @@ def update_memory(
                               f"nothing was changed"])
             near_dup = _find_near_duplicate(
                 cur, content, dedupe_project, emb, exclude_id=memory_id)
+        near_conflict = bool(
+            near_dup
+            and _content_conflict(content or "", near_dup.get("content") or ""))
         cur.execute(
             f"UPDATE {active_table} SET {', '.join(sets)} "
             "WHERE id = %s AND superseded_by IS NULL AND deleted_at IS NULL",
@@ -2014,7 +2241,8 @@ def update_memory(
         return fail(STATUS_ERROR, str(e), id=memory_id)
     finally:
         conn.close()
-    warnings = ([_near_duplicate_warning(near_dup, near_entity)]
+    warnings = ([_near_duplicate_warning(near_dup, near_entity,
+                                         near_conflict)]
                 if near_dup else [])
     ttl_warning = _ttl_past_warning(expires_at) if expires_at is not None else None
     if ttl_warning:
@@ -2127,6 +2355,19 @@ def update_batch(
                 error = meta_error
             else:
                 fields["metadata"] = metadata
+        entry_metadata_mode = entry.get("metadata_mode") or "replace"
+        if error is None and entry_metadata_mode not in ("replace", "merge"):
+            error = "metadata_mode must be 'replace' or 'merge'"
+        entry_clear_keys = entry.get("clear_metadata_keys")
+        if error is None and entry_clear_keys is not None:
+            if not isinstance(entry_clear_keys, list) or any(
+                    not isinstance(key, str) or not key.strip()
+                    for key in entry_clear_keys):
+                error = ("clear_metadata_keys must be a list of non-empty "
+                         "strings")
+            else:
+                entry_clear_keys = list(dict.fromkeys(
+                    key.strip() for key in entry_clear_keys))
         entity = entry.get("entity")
         if error is None and entity is not None:
             try:
@@ -2172,14 +2413,15 @@ def update_batch(
                              else None)
         entry_restore = bool(entry.get("restore"))
         entry_touch = bool(entry.get("touch"))
-        if error is None and entry_restore and (fields or entry_touch):
+        if error is None and entry_restore and (
+                fields or entry_touch or entry_clear_keys):
             error = ("restore=true cannot be combined with other update "
                      "fields")
         if error is None and not fields and not entry_restore \
-                and not entry_touch:
+                and not entry_touch and not entry_clear_keys:
             error = ("nothing to update: pass content, importance, metadata, "
-                     "entity, mem_type, expires_at/clear_expires_at, "
-                     "touch=true or restore=true")
+                     "clear_metadata_keys, entity, mem_type, "
+                     "expires_at/clear_expires_at, touch=true or restore=true")
         if error:
             prepared.append((None, error))
         else:
@@ -2189,6 +2431,8 @@ def update_batch(
                               "restore": entry_restore,
                               "dedupe": entry_dedupe,
                               "fuzzy_threshold": entry_fuzzy,
+                              "metadata_mode": entry_metadata_mode,
+                              "clear_metadata_keys": entry_clear_keys or [],
                               "ttl_warning": entry_ttl_warning}, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -2255,12 +2499,14 @@ def update_batch(
                             restored_table = table
                             break
                     if not restored:
-                        reason = _restore_blocked_reason(
+                        blocked = _restore_blocked_reason(
                             cur, memory_id, restore_tables)
                         cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                         results.append({
-                            "id": memory_id, "status": "not_found",
-                            "error": (reason or f"NOT FOUND: {memory_id}")})
+                            "id": memory_id,
+                            "status": blocked[0] if blocked else "not_found",
+                            "error": (blocked[1] if blocked
+                                      else f"NOT FOUND: {memory_id}")})
                         continue
                     scope = _scope_of_table(cur, restored_table)
                     cur.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -2276,6 +2522,10 @@ def update_batch(
                                  "embedding = %s::vector"]
                         params += [value, _content_hash(value), embeddings[i]]
                     elif name == "metadata":
+                        if spec["metadata_mode"] == "merge" \
+                                or spec["clear_metadata_keys"]:
+                            # Computed against the stored object below.
+                            continue
                         sets.append("metadata = %s::jsonb")
                         params.append(json.dumps(value))
                     else:
@@ -2318,6 +2568,31 @@ def update_batch(
                                     "error": error})
                     continue
                 scope = _scope_of_table(cur, active_table)
+                if spec["metadata_mode"] == "merge" \
+                        or spec["clear_metadata_keys"]:
+                    cur.execute(
+                        f"SELECT metadata FROM {active_table} WHERE id = %s",
+                        (memory_id,))
+                    row = cur.fetchone()
+                    current: dict[str, Any] = {}
+                    if row and row[0] is not None:
+                        try:
+                            raw = (row[0] if isinstance(row[0], dict)
+                                   else json.loads(row[0]))
+                        except (TypeError, ValueError):
+                            raw = {}
+                        if isinstance(raw, dict):
+                            current = raw
+                    new_meta = spec["fields"].get("metadata")
+                    if spec["metadata_mode"] == "merge" or new_meta is None:
+                        merged = dict(current)
+                        merged.update(new_meta or {})
+                    else:
+                        merged = dict(new_meta or {})
+                    for key in spec["clear_metadata_keys"]:
+                        merged.pop(key, None)
+                    sets.append("metadata = %s::jsonb")
+                    params.append(json.dumps(merged))
                 near_entity = spec["fields"].get("entity")
                 if near_entity is None:
                     cur.execute(
@@ -2341,7 +2616,8 @@ def update_batch(
                                        f"{dup_similarity})")
                         cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                         results.append({
-                            "id": memory_id, "status": "duplicate",
+                            "id": dup_id, "memory_id": memory_id,
+                            "status": "duplicate",
                             "duplicate_of": dup_id,
                             "duplicate_mode": dup_mode,
                             "similarity": dup_similarity,
@@ -2354,6 +2630,11 @@ def update_batch(
                     near_dup = _find_near_duplicate(
                         cur, spec["fields"]["content"], dedupe_project,
                         embeddings[i], exclude_id=memory_id)
+                near_conflict = bool(
+                    near_dup
+                    and _content_conflict(
+                        spec["fields"].get("content") or "",
+                        near_dup.get("content") or ""))
                 cur.execute(
                     f"UPDATE {active_table} SET {', '.join(sets)} "
                     "WHERE id = %s AND superseded_by IS NULL "
@@ -2375,7 +2656,8 @@ def update_batch(
                                      "project": scope}
             if near_dup:
                 entry["warnings"] = [
-                    _near_duplicate_warning(near_dup, near_entity)]
+                    _near_duplicate_warning(near_dup, near_entity,
+                                            near_conflict)]
             if spec.get("ttl_warning"):
                 entry.setdefault("warnings", []).append(spec["ttl_warning"])
             results.append(entry)
@@ -2664,11 +2946,17 @@ def forget(
             scope_args: tuple[Any, ...] = ((entity_name, scope) if project
                                             else (entity_name,))
             cur.execute(
-                f"SELECT id FROM entities WHERE name = %s{scope_clause}",
+                f"SELECT id, project FROM entities WHERE name = %s{scope_clause}",
                 scope_args,
             )
-            entity_ids = [r[0] for r in cur.fetchall()]
+            entity_rows = cur.fetchall()
+            entity_ids = [r[0] for r in entity_rows]
             counts["entities"] = len(entity_ids)
+            affected_scopes: list[str] = []
+            for row in entity_rows:
+                scope_hit = row[1] or "global"
+                if scope_hit not in affected_scopes:
+                    affected_scopes.append(scope_hit)
             if entity_ids:
                 cur.execute(
                     "SELECT COUNT(*) FROM relations "
@@ -2700,10 +2988,10 @@ def forget(
             # project must not wipe the global facts of the same entity.
             tables = (_all_mem_tables(cur) if not project
                       else [_mem_table(project)])
-            affected_scopes = _scopes_of_tables(cur, list(dict.fromkeys(tables)))
             for tbl in dict.fromkeys(tables):
                 if not _table_exists(cur, tbl):
                     continue
+                memories_before = counts["memories"]
                 if dry_run:
                     # A soft forget hides the active rows, a hard delete also
                     # takes the superseded and forgotten ones: the preview
@@ -2748,6 +3036,15 @@ def forget(
                         (entity_name, entity_name),
                     )
                     counts["memories"] += cur.rowcount
+                if counts["memories"] != memories_before:
+                    # Only scopes that actually lost (or would lose) rows are
+                    # affected. Reporting every searched scope made a plain
+                    # "touched multiple scopes" warning fire for a
+                    # single-scope entity whenever an unrelated project
+                    # table existed.
+                    scope_hit = _scope_of_table(cur, tbl)
+                    if scope_hit not in affected_scopes:
+                        affected_scopes.append(scope_hit)
             if not (counts["memories"] or counts["entities"] or counts["relations"]):
                 # An entity whose memories are all soft-forgotten already has
                 # nothing active to hide, but it still exists. Answering

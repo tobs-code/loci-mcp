@@ -1,3 +1,4 @@
+import os
 import re
 
 MEMORY_TYPES = {
@@ -65,7 +66,14 @@ FTS_MIN_COVERAGE = 0.3
 # Text search configuration for the full-text retriever. The dictionary has to
 # match the language of the stored content: stemming and stop words differ per
 # language, so a mismatched dictionary silently degrades recall quality.
-FTS_LANGUAGE = "english"
+#
+# The value is interpolated into SQL (index and query side), so it is
+# restricted to a plain identifier. An empty or malformed value falls back to
+# English instead of breaking startup with a syntax error.
+_fts_language = os.getenv("FTS_LANGUAGE", "english").strip() or "english"
+FTS_LANGUAGE = (_fts_language
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _fts_language)
+                else "english")
 
 
 # Similarity threshold used by the "semantic" dedupe mode.

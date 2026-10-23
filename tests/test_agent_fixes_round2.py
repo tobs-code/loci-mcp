@@ -75,7 +75,9 @@ def test_update_memory_restore_brings_a_soft_forgotten_fact_back():
 
 def test_update_memory_restore_rejects_an_active_or_hard_deleted_fact():
     active_id = remember("This fact was never forgotten")["id"]
-    assert update_memory(active_id, restore=True)["status"] == "not_found"
+    # The id exists, it just has nothing to restore: that is a conflict, not
+    # a missing row.
+    assert update_memory(active_id, restore=True)["status"] == "conflict"
 
     purged_id = remember("This fact is gone for good")["id"]
     forget(purged_id, soft=False)

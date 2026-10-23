@@ -160,6 +160,7 @@ def test_untagged_pairs_are_still_resolved_by_newest():
 
     report = contradictions_report(resolve="newest")
 
+    assert report["results"], report
     pair = report["results"][0]
     assert pair["cross_entity"] is False
     assert report["resolved"] == 1

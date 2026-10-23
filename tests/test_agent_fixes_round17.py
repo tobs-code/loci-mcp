@@ -114,7 +114,7 @@ def test_restore_explains_active_and_superseded_rows():
     old = remember("Round17 restore old fact", project=project)
     active = update_memory(old["id"], restore=True, project=project)
     assert active["ok"] is False
-    assert active["status"] == "not_found"
+    assert active["status"] == "conflict"
     assert "is active" in active["error"]
     assert "nothing to restore" in active["error"]
 

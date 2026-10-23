@@ -21,7 +21,7 @@ Every tool answers with the same envelope:
 | Key | Meaning |
 |-----|---------|
 | `ok` | `false` when the call failed, `true` otherwise |
-| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `restored`, `not_found`, `partial`, `error`, `ok` |
+| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `restored`, `not_found`, `conflict`, `partial`, `error`, `ok` |
 | `id` | Affected memory id (`null` for collections and failures) |
 | `error` | Error message, `null` on success |
 | `warnings` | Non-fatal notes (skipped checks, superseded facts, empty results) |
@@ -42,8 +42,8 @@ the argument.
 |------|------------------------------|
 | `remember` | Store one memory with embedding. `project`, `scope` (`project`/`global`), `entity`, `mem_type`, `importance`, `metadata` (JSON object; a JSON-encoded string of an object is accepted and parsed), `expires_at`; `dedupe` (`exact`/`semantic`/`off`), `fuzzy_threshold`; `supersede` (id), `supersede_content` (exact text), `supersede_last`; `on_near_duplicate` (`warn`/`supersede`/`reject`), alias `auto_supersede_near_duplicate`; `metadata_mode` (`merge`/`replace`); `check_contradictions`; `links` (`[{to_entity, relation_type, weight?, context?, from_entity?}]` — creates graph edges in the same step, `from_entity` defaults to `entity`). Reports the `scope`/`project` it wrote to and `links` (`status: created/updated/duplicate` per edge). A write that had to create a previously unknown project scope warns (`created a new project scope ...`), so a typo in `project` is visible instead of silently starting a new scope. Malformed links are an argument error before the write; edge failures roll back to a savepoint and warn (`links failed: ...`) while the fact stays stored. |
 | `remember_batch` | Store many facts with per-entry savepoints. Top-level `project`, `scope`, `dedupe`, `fuzzy_threshold`, `skip_duplicates`, `on_near_duplicate`, `check_contradictions`; per fact `content`, `project`, `scope`, `entity`, `mem_type`, `importance`, `metadata` (JSON object or JSON-encoded string), `supersede`, `supersede_content`, `supersede_last`, `dedupe`, `fuzzy_threshold`, `on_near_duplicate`, `expires_at`. Invalid facts are reported individually; the rest are stored. `count` is the number of entries, `succeeded`/`failed` split the outcomes. A supersede carries metadata over like `remember`. |
-| `update_memory` | Change `content` (re-embeds), `importance`, `metadata` (JSON object or JSON-encoded string), `entity`, `mem_type`, TTL (`expires_at`/`clear_expires_at`); `project`, `dedupe`, `fuzzy_threshold`. `touch=true` only bumps `updated_at` (decay refresh; combinable with `importance`). `restore=true` undoes a soft delete, clears `deleted_at` and the sentinel, never a real `superseded_by`, and is mutually exclusive with other fields. A content change that would duplicate an active memory answers `duplicate` and applies nothing. Unknown ids answer `not_found` before the "nothing to update" check. |
-| `update_batch` | Many `updates` with per-entry savepoints (`memory_id` plus the same fields as `update_memory`, including `project`, `touch` and `restore`). Invalid, unknown, ambiguous or duplicate entries are reported individually (`partial`); the rest are applied. `count` is the number of entries, `succeeded`/`failed` split the outcomes. |
+| `update_memory` | Change `content` (re-embeds), `importance`, `metadata` (JSON object or JSON-encoded string; `metadata_mode` `replace` default or `merge`; `clear_metadata_keys` removes stored keys), `entity`, `mem_type`, TTL (`expires_at`/`clear_expires_at`); `project`, `dedupe`, `fuzzy_threshold`. `touch=true` only bumps `updated_at` (decay refresh; combinable with `importance`). `restore=true` undoes a soft delete, clears `deleted_at` and the sentinel, never a real `superseded_by`, and is mutually exclusive with other fields; a known id with nothing to restore answers `conflict`. A content change that would duplicate an active memory answers `duplicate`, applies nothing, and names the blocking row: `id`/`duplicate_of` are the blocking id, `memory_id` the edited one. Unknown ids answer `not_found` before the "nothing to update" check. |
+| `update_batch` | Many `updates` with per-entry savepoints (`memory_id` plus the same fields as `update_memory`, including `project`, `touch`, `restore`, `metadata_mode` and `clear_metadata_keys`). Invalid, unknown, ambiguous or duplicate entries are reported individually (`partial`); the rest are applied. `count` is the number of entries, `succeeded`/`failed` split the outcomes. |
 | `forget` | Remove by `memory_id`, `memory_ids` or `entity`; `project`, `soft` (default `true`), `dry_run`. Soft delete sets `deleted_at` and a forgotten sentinel. `entity` also removes that scope's graph node and memories; without `project` it touches every scope. `entity="*"` empties the given project only. An entity with only soft-forgotten rows answers `ok` with a `message` instead of `not_found`. Hard deletes clear dangling supersede links. `memory_id` and `memory_ids` are mutually exclusive; `counts` splits memories/entities/relations, and an entity delete without `project` reports `scopes_affected` (with a warning when it touched several scopes). |
 
 Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
@@ -55,7 +55,7 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
 | `recall` | Hybrid vector + FTS search with RRF. `query`, `project`, `include_global`, `limit`, `offset`, `hybrid`; `min_similarity`, `min_decay_score`, `include_decay`; `include_superseded`, `only_superseded`, `include_deleted`, `include_expired`; `graph_boost`, `graph_entity`, `entity`; `updated_after`, `metadata_filter`; `include_relation_context`; `fields`, `detail` (`full`/`slim`). Logs `access_count`. Reports `candidates`, `dropped_by_*` (including `dropped_by_cross_scope_duplicate`), `scopes_searched`, `detail`, `has_more`/`next_offset`. Hidden rows carry `forgotten`/`expired` markers. |
-| `list_memories` | Browse without a query, newest first. `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by` (`updated_at`/`created_at`/`access_count`/`importance`), `contains` (case-insensitive literal), `memory_id`; `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates`. `total`/`has_more`/`next_offset` describe the deduped row set; identical content in another scope is hidden by default and counted in `duplicates_hidden` with a warning (`include_duplicates=true` shows every copy). Reports `scopes_searched` plus `total_by_scope` (before dedup) and `listed_by_scope` (after dedup). With `memory_id` it is the direct lookup: the answer carries the single `memory` (plus a one-item `results`), a hidden row answers `ok: false` and names the flag that reveals it, an id in several scopes is refused with `scopes`, `"*"` searches every scope, and browse filters are reported as ignored. |
+| `list_memories` | Browse without a query, newest first. `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by` (`updated_at`/`created_at`/`access_count`/`importance`), `contains` (case-insensitive literal), `memory_id`, `memory_ids` (bulk direct lookup, max 200; reports `missing` and a warning, mutually exclusive with `memory_id`); `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates`. `total`/`has_more`/`next_offset` describe the deduped row set; identical content in another scope is hidden by default and counted in `duplicates_hidden` with a warning (`include_duplicates=true` shows every copy). Reports `scopes_searched` plus `total_by_scope` (before dedup) and `listed_by_scope` (after dedup). With `memory_id` it is the direct lookup: the answer carries the single `memory` (plus a one-item `results`), a hidden row answers `ok: false` and names the flag that reveals it, an id in several scopes is refused with `scopes`, `"*"` searches every scope, and browse filters are reported as ignored. |
 | `get_entity` | Entity details, linked memories and graph connections. `entity` (alias `name`), `project`, `include_global`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`. Reports `total`, `relation_context_count`, `has_more`, `scopes_searched`, `memories_by_scope`; when the name exists in several scopes, `details.scopes_with_entity` names each occurrence and a warning names the scope `details` describes. `project="*"` is rejected. |
 | `list_entities` | Browse entities. `entity_type` (`graph`, `memory-only`, or an existing raw AGE label), `project`, `include_global`, `limit`, `offset`. An unknown `entity_type` is an argument error that names the labels present in the selected scope. Synthetic relation-context entities are hidden. `count` is the page size, `total` the full match count. Sorted by name. |
 | `list_projects` | Discover every scope without guessing names. `include_empty` (default `true`), `include_counts` (default `true`). Each row reports `project` (the value to pass to every other tool), `scope` (`global`/`project`), `has_table` and `has_graph`; with counts it also reports memories/total/superseded/forgotten/entities/relations, without counts those keys are omitted entirely. `include_empty=false` keeps scopes with active memories or graph data. `relate` also creates the scope's memory table, so `has_table=false` only appears for legacy graph-only scopes. |
@@ -104,7 +104,9 @@ counts and health.
     project + global when set. `init_context` accepts `"*"` for all scopes.
   - `list_memories`, `list_entities`: all scopes when `project` is omitted or
     `"*"`; project + global when a project is set; `"global"` for only the
-    shared scope.
+    shared scope. An implicit all-scope `list_memories` browse warns when more
+    than one scope was searched, so a merged list is never mistaken for a
+    single scope.
   - `include_global=false` restricts project reads to project rows.
   - An unknown project falls back to global and says so in `warnings`
     (`recall`, `list_memories`, `list_entities`, `init_context`).
@@ -137,7 +139,10 @@ counts and health.
   the matched memory has a different entity, `supersede`/`reject` are not
   applied; the fact is stored and `remember`/`remember_batch` warn with
   `near-duplicate across entities` (both entities and a content preview).
-  Similarity alone never deletes another subject's fact.
+  Similarity alone never deletes another subject's fact. When the new content
+  differs in a number or a negation, the warning calls it a **possible
+  contradiction**; an `auto_supersede` additionally says to verify it was an
+  intended update (use `check_contradictions=true` for a real NLI verdict).
 - `auto_supersede_near_duplicate=true` is an alias for
   `on_near_duplicate="supersede"`. It works in `remember_batch` per fact and at
   the top level, also under `dedupe="off"`.
@@ -146,9 +151,12 @@ counts and health.
 - `supersede_last` replaces the best-matching memory, not the newest. With an
   entity it uses that entity's memories from similarity 0.5; without one it
   searches the whole scope at the stricter 0.75 floor. If the topic does not
-  match, the new fact is stored additionally and the answer warns. Without an
-  entity a scope-wide match that belongs to a tagged entity is refused, so a
-  broad write cannot silently replace another subject's fact.
+  match, the new fact is stored additionally and the answer warns. A topic
+  guard compares the attribute words (entity, stopwords, numbers and time
+  values removed), so a same-template fact about another attribute (port vs
+  backup job) is refused even above the similarity floor. Without an entity a
+  scope-wide match that belongs to a tagged entity is refused, so a broad
+  write cannot silently replace another subject's fact.
 - Replaced metadata is carried over by default (`metadata_mode="merge"`);
   explicitly passed keys win. `metadata_mode="replace"` drops the old keys.
 - A cross-scope supersede is named: `cross_scope_superseded` plus a warning.
@@ -182,6 +190,8 @@ counts and health.
 - `recall` searches the project table (when set) and the global table. An
   active copy of the same content in another scope is deduped; history stays
   visible with the matching flags.
+- Vector search is exact on scopes below 10,000 rows: no IVFFlat index is
+  built there, so a nearby row is never missed by an unprobed list.
 - FTS is OR-based; the text score is multiplied by query coverage, and a
   full-text-only hit below `FTS_MIN_COVERAGE` (0.3) is dropped. `min_similarity`
   filters **vector** hits only; full-text hits survive a bad embedding score.
@@ -234,8 +244,10 @@ counts and health.
 - `init_context` returns the most recently changed memories (not a decay
   ranking). `detail="full"` returns all public columns without score
   annotations.
-- The FTS dictionary is English (`FTS_LANGUAGE`). Index and query side always
-  match; a changed dictionary migrates at startup.
+- The FTS dictionary defaults to English and is configurable via
+  `FTS_LANGUAGE` (a PostgreSQL dictionary name; invalid values fall back to
+  `english`). Index and query side always match; a changed dictionary migrates
+  at startup.
 - Embeddings are prompt-aware: queries use `mode="query"`, stored content uses
   `mode="document"`. After changing the model or prompts, re-embed:
   `docker compose exec loci-mcp python -m mcp_server.reembed`.
@@ -325,6 +337,7 @@ counts and health.
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http`) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http`) |
+| `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary (invalid values fall back to `english`) |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto`, `none` |
 | `LLM_MODEL` | provider default | NLI model |
 | `LLM_API_KEY` | – | Generic key, overrides provider-specific keys |

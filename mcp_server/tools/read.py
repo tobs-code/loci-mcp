@@ -659,6 +659,12 @@ def list_memories(
                           "scope is searched; an id in several scopes is "
                           "refused. Browse filters are ignored for this "
                           "lookup.")] = None,
+    memory_ids: Annotated[
+        list[str] | None,
+        Field(description="Bulk id lookup: returns every requested memory in "
+                          "`results` and names the ids that are missing or "
+                          "ambiguous. Mutually exclusive with `memory_id`; "
+                          "browse filters are ignored.")] = None,
     include_deleted: Annotated[
         bool,
         Field(description="Also list soft-forgotten memories (recognizable by "
@@ -749,6 +755,64 @@ def list_memories(
         return fail(STATUS_ERROR,
                     "order_by must be one of updated_at, created_at, "
                     "access_count, importance")
+    if memory_ids is not None:
+        if memory_id:
+            return fail(STATUS_ERROR,
+                        "pass either memory_id or memory_ids, not both")
+        if not isinstance(memory_ids, list) or not memory_ids or any(
+                not isinstance(mid, str) or not mid.strip()
+                for mid in memory_ids):
+            return fail(STATUS_ERROR,
+                        "memory_ids must be a non-empty list of memory ids")
+        wanted = list(dict.fromkeys(mid.strip() for mid in memory_ids))
+        if len(wanted) > 200:
+            return fail(STATUS_ERROR,
+                        "memory_ids accepts at most 200 ids per call")
+        ignored = [
+            name for name, value in (
+                ("entity", entity), ("mem_type", mem_type),
+                ("contains", contains), ("updated_after", updated_after),
+                ("metadata_filter", metadata_filter),
+            ) if value is not None
+        ]
+        if offset:
+            ignored.append("offset")
+        if order_by != "updated_at":
+            ignored.append("order_by")
+        results: list[dict] = []
+        missing: list[str] = []
+        errors: list[dict] = []
+        for mid in wanted:
+            found = _get_memory(
+                memory_id=mid, project=raw_project,
+                include_superseded=include_superseded,
+                include_deleted=include_deleted,
+                include_expired=include_expired, fields=fields,
+                include_global=include_global)
+            if found.get("ok"):
+                results.append(found["memory"])
+            elif found.get("scopes"):
+                errors.append({"id": mid, "status": found.get("status"),
+                               "error": found.get("error"),
+                               "scopes": found["scopes"]})
+            else:
+                missing.append(mid)
+        warnings = []
+        if ignored:
+            warnings.append("memory_ids performs a bulk id lookup: "
+                            f"{', '.join(ignored)} ignored")
+        if missing:
+            warnings.append(
+                f"{len(missing)} id(s) not found or hidden: "
+                + ", ".join(missing[:10])
+                + (" ..." if len(missing) > 10 else ""))
+        if errors:
+            warnings.append(
+                f"{len(errors)} id(s) are ambiguous across scopes; pass "
+                f"project=<name> to resolve them")
+        return ok(STATUS_OK, count=len(results), results=results,
+                  missing=missing, errors=errors, warnings=warnings)
+
     if memory_id:
         # Direct id lookup: one memory, its history state and the reason it is
         # hidden. The browse filters (entity, contains, ...) would contradict
@@ -823,6 +887,15 @@ def list_memories(
         params.extend(extra_params)
         where = " AND ".join(conditions)
         scopes_searched = _scopes_of_tables(cur, tables)
+        if not project and not all_projects and len(scopes_searched) > 1:
+            # Every other read tool defaults to the global scope. A silent
+            # all-scope browse made the same call behave differently, so the
+            # wider search is named (no results are hidden, only disclosed).
+            warnings.append(
+                "no project given: browsed every scope ("
+                + ", ".join(scopes_searched)
+                + "); pass project=<name> for one scope or project='*' to "
+                  "make this explicit")
         # Two phases. First the light columns of every match: dedup and paging
         # must see the whole set, otherwise `total`, `has_more` and the page
         # disagree. Only then the full rows of this page are loaded, so a

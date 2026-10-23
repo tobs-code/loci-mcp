@@ -13,6 +13,32 @@ DATABASE_URL = os.environ.get(
     "postgresql://memory:geheim@localhost:5432/memory",
 )
 
+# An IVFFlat index probes only `ivfflat.probes` lists (default 1). With 100
+# lists on a table that holds a handful of rows, that routinely probes an
+# empty list, so nearby rows are never returned (missed near-duplicates,
+# empty contradiction scans). Small tables are therefore scanned exactly;
+# the ANN index is only built once it can actually help.
+IVFFLAT_MIN_ROWS = 10_000
+
+
+def ivfflat_lists(row_count: int) -> int | None:
+    """Number of IVFFlat lists for a table, or None to stay exact."""
+    if row_count < IVFFLAT_MIN_ROWS:
+        return None
+    return min(400, max(10, row_count // 1000))
+
+
+def drop_vector_indexes(cur, table: str) -> None:
+    """Drop any approximate vector index of `table` (exact scan remains)."""
+    cur.execute(
+        "SELECT indexname FROM pg_indexes "
+        "WHERE schemaname = 'public' AND tablename = %s "
+        "AND indexdef LIKE '%%USING ivfflat%%'",
+        (table,),
+    )
+    for (name,) in cur.fetchall():
+        cur.execute(f'DROP INDEX IF EXISTS "{name}"')
+
 
 def get_conn():
     conn = psycopg2.connect(DATABASE_URL)
@@ -122,14 +148,10 @@ def ensure_schema():
         # Dynamic IVFFlat lists based on the current size
         cur.execute("SELECT COUNT(*) FROM memories")
         count = cur.fetchone()[0] if cur.rowcount > 0 else 0
-        
-        if count < 50000:
-            lists = 100
-        elif count < 200000:
-            lists = 200
-        else:
-            lists = 400
-        
+        lists = ivfflat_lists(count)
+        if lists is None:
+            drop_vector_indexes(cur, "memories")
+
         # The full-text index must use the same dictionary as the query side
         # (config.FTS_LANGUAGE). If the configured language changed, the old
         # index is dropped so it can be rebuilt with the new definition.
@@ -142,8 +164,13 @@ def ensure_schema():
             cur.execute("DROP INDEX IF EXISTS idx_memories_tsvector")
             logger.info("Recreating full-text index with dictionary %s", FTS_LANGUAGE)
 
-        for idx in [
-            f"CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists})",
+        index_statements = []
+        if lists is not None:
+            index_statements.append(
+                "CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories "
+                f"USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists})"
+            )
+        for idx in index_statements + [
             f"CREATE INDEX IF NOT EXISTS idx_memories_tsvector ON memories USING GIN (to_tsvector('{FTS_LANGUAGE}', content))",
             "CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash)",
             "CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity)",

@@ -36,6 +36,12 @@ ORDER BY embedding <=> '[0.1, 0.2, ...]'
 LIMIT 5;
 ```
 
+Small scopes (fewer than 10,000 rows) are scanned exactly. An IVFFlat index
+is built only once a table is large enough to benefit: on a tiny table it
+probes a single list and can miss nearby rows entirely, which silently hides
+near-duplicates and contradiction candidates. Project tables follow the same
+rule.
+
 ### Graph queries
 
 ```sql

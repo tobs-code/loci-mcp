@@ -3,7 +3,7 @@ import json
 import re
 
 from mcp_server.config import FTS_LANGUAGE, _IDENT_RE
-from mcp_server.db import get_conn
+from mcp_server.db import drop_vector_indexes, get_conn, ivfflat_lists
 
 def _safe_ident(value: str, kind: str = "identifier") -> str:
     if not _IDENT_RE.match(value or ""):
@@ -257,28 +257,24 @@ def _ensure_project_table(cur, project: str) -> None:
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
     # Look indexes up by table + definition: long project names get truncated
     # by PostgreSQL to 63 characters, so the exact index name is unreliable.
-    cur.execute(
-        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = %s "
-        "AND indexdef LIKE '%%ivfflat%%'",
-        (f"mem_{safe}",),
-    )
-    if not cur.fetchone():
-        # Dynamic lists based on expected scaling
-        # For 768d: 100 up to ~50k, 200-400 up to ~200k records
-        cur.execute(f"SELECT COUNT(*) FROM mem_{safe}")
-        count = cur.fetchone()[0] if cur.rowcount > 0 else 0
-        
-        if count < 50000:
-            lists = 100
-        elif count < 200000:
-            lists = 200
-        else:
-            lists = 400
-        
-        cur.execute(f"""
-            CREATE INDEX {emb_idx}
-            ON mem_{safe} USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists})
-        """)
+    cur.execute(f"SELECT COUNT(*) FROM mem_{safe}")
+    count = cur.fetchone()[0]
+    lists = ivfflat_lists(count)
+    if lists is None:
+        # A table this small is faster and, above all, exact without an ANN
+        # index: IVFFlat with default probes misses rows in unprobed lists.
+        drop_vector_indexes(cur, f"mem_{safe}")
+    else:
+        cur.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = %s "
+            "AND indexdef LIKE '%%ivfflat%%'",
+            (f"mem_{safe}",),
+        )
+        if not cur.fetchone():
+            cur.execute(f"""
+                CREATE INDEX {emb_idx}
+                ON mem_{safe} USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists})
+            """)
     cur.execute(
         "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = %s "
         "AND indexdef LIKE '%%content_hash%%'",

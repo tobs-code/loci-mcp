@@ -29,7 +29,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | Key | Meaning |
 |-----|---------|
 | `ok` | `false` when the call failed, `true` otherwise |
-| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `restored`, `not_found`, `partial`, `error`, `ok` |
+| `status` | `stored`, `created`, `duplicate`, `updated`, `deleted`, `soft_forgotten`, `restored`, `not_found`, `conflict`, `partial`, `error`, `ok` |
 | `id` | Id of the affected memory (`null` for collections and for failures) |
 | `error` | Error message, `null` on success |
 | `warnings` | Non-fatal notes (skipped checks, superseded facts) |
@@ -50,7 +50,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, `on_near_duplicate`, `metadata_mode`, optional contradiction check, `links` for graph edges in the same write, `scope` global/project) |
 | `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `on_near_duplicate`, `auto_supersede_near_duplicate`, `expires_at`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance, metadata, entity, type or TTL (`expires_at`/`clear_expires_at`); `touch=true` refreshes the decay recency without a content change, `restore=true` undoes a soft delete |
-| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `touch`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
+| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `metadata_mode`, `clear_metadata_keys`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `touch`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete by `memory_id`, `memory_ids` or entity; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
 
 ### `remember`
@@ -66,11 +66,11 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `project` | string? | Project scope. `global` is reserved and means the shared scope. |
 | `supersede` | string? | Memory id this fact replaces. |
 | `supersede_content` | string? | Exact content of the memory this fact replaces. |
-| `supersede_last` | bool | Replace the memory that matches the new fact best (most similar, not the newest) - of the entity, or across the whole scope when no entity is set. Only if the new fact is about the same topic (similarity >= 0.5; scope-wide without an entity >= 0.75). Without an entity, a scope-wide best match that belongs to a **tagged** entity is refused: the fact is stored additionally and the warning names the entity/id to use for an explicit replacement. |
+| `supersede_last` | bool | Replace the memory that matches the new fact best (most similar, not the newest) - of the entity, or across the whole scope when no entity is set. Only if the new fact is about the same topic (similarity >= 0.5; scope-wide without an entity >= 0.75). A topic guard compares the attribute words after removing the entity, stopwords, numbers and time values, so a same-template fact about another attribute (port vs backup job) is refused. Without an entity, a scope-wide best match that belongs to a **tagged** entity is refused: the fact is stored additionally and the warning names the entity/id to use for an explicit replacement. |
 | `check_contradictions` | bool | NLI-check against the nearest active memories of the scope and auto-supersede contradictions; with an entity that entity's memories are candidates first, without one all entities compete (`contradictions.cross_entity`). |
 | `links` | list? | Graph edges to create in the same write: `[{to_entity, relation_type, weight?, context?, from_entity?}]`; `from_entity` defaults to `entity`. Malformed links are an argument error before the write; a failing edge rolls back to a savepoint, warns (`links failed: ...`) and keeps the fact. Each edge is reported in `links` (`status: created`/`updated`/`duplicate`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
-| `on_near_duplicate` | enum | Action for a reworded copy of an active memory (near-duplicate, similarity >= 0.75): `warn` (default, store and warn), `supersede` (replace it, list it in `superseded`) or `reject` (`duplicate`, nothing stored). Works under `dedupe="off"` when the policy is not `warn`. **Same-entity guard:** when the matched memory belongs to a different entity, the policy is not applied (the fact is stored and a `near-duplicate across entities` warning names both entities). A high vector similarity alone never deletes another subject's fact. |
+| `on_near_duplicate` | enum | Action for a reworded copy of an active memory (near-duplicate, similarity >= 0.75): `warn` (default, store and warn), `supersede` (replace it, list it in `superseded`) or `reject` (`duplicate`, nothing stored). Works under `dedupe="off"` when the policy is not `warn`. **Same-entity guard:** when the matched memory belongs to a different entity, the policy is not applied (the fact is stored and a `near-duplicate across entities` warning names both entities). A high vector similarity alone never deletes another subject's fact. If the content differs in a number or a negation, the warning calls it a **possible contradiction**; `supersede` additionally warns to verify it was an intended update (`check_contradictions=true` gives an NLI verdict). |
 | `auto_supersede_near_duplicate` | bool | Backwards-compatible alias for `on_near_duplicate="supersede"`. |
 | `metadata_mode` | enum | `merge` (default: keys the new fact does not set are carried over from the replaced memory) or `replace` (the old keys are dropped). |
 | `expires_at` | string? | ISO 8601 TTL: the memory leaves the active set after this timestamp (hidden in reads, no duplicate candidate). The row itself stays until it is `forget`-den or superseded; exports keep it. Wrong format = named argument error. |
@@ -120,12 +120,16 @@ scopes stays readable.
 
 ### `update_memory`
 
-`memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`,
+`memory_id`, `content`, `importance`, `metadata` (`metadata_mode`
+`replace`/`merge`, `clear_metadata_keys`), `entity`, `mem_type`,
 `expires_at`, `clear_expires_at`, `touch`, `restore`, `project`, `dedupe`
 (`exact`/`semantic`/`off`), `fuzzy_threshold`.
 Content changes are re-embedded; a change that would duplicate another active
-memory is refused as `duplicate` (with `duplicate_of`) and nothing is applied
-(`dedupe="off"` bypasses the check). Without `project` the memory is
+memory is refused as `duplicate`, nothing is applied, and the answer names the
+blocking row: `id`/`duplicate_of` are the blocking id, `memory_id` the edited
+one (`dedupe="off"` bypasses the check). `metadata_mode="merge"` keeps stored
+keys the new object does not set; `clear_metadata_keys` removes keys (also
+without a new object). Without `project` the memory is
 looked up in every scope; a memory id is unique per scope, so an id that
 exists in several scopes is refused and the scopes are named (see
 [Scopes](scopes.md)). `expires_at` sets a new TTL and
@@ -136,7 +140,8 @@ content, embedding and `access_count` stay untouched; it can be combined with
 `importance`. `restore=true` is the inverse of `forget(soft=true)`: it clears
 `deleted_at` and the forgotten sentinel of a soft-forgotten row, keeps a real
 `superseded_by`, and is mutually exclusive with every other update field.
-Active or hard-deleted ids answer `not_found`.
+Unknown or hard-deleted ids answer `not_found`; an existing id with nothing to
+restore (active or superseded) answers `conflict`, because the row was found.
 
 ### `update_batch`
 
@@ -176,7 +181,7 @@ mutually exclusive.
 | Tool | Description |
 |------|-------------|
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `memory_ids` (bulk direct lookup, max 200; `missing` and a warning, mutually exclusive with `memory_id`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total` and `relation_context_count` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; an unknown `entity_type` is an argument error that names the labels present; synthetic `<from>_<relation>_<to>` entities are hidden |
 | `list_projects` | Discover every scope; `include_empty` (default true), `include_counts` (default true); each row carries `project`, `scope`, `has_table`, `has_graph` and, with counts, the memory/entity/relation counts (without counts those keys are omitted) |
