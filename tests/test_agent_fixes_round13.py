@@ -161,7 +161,9 @@ def test_export_entity_filter_narrows_the_graph():
 
     exported = export_memories(project="export-graph", entity="BillingService")
     names = {e["name"] for e in exported["data"]["graph"]["entities"]}
-    assert names == {"BillingService"}
+    # The incident edge stays in the backup, so both of its endpoints must be
+    # present; otherwise the exported graph is incomplete.
+    assert names == {"BillingService", "PostgresDB"}
     edges = exported["data"]["graph"]["relations"]
     assert {(e["from_entity"], e["to_entity"]) for e in edges} == {
         ("BillingService", "PostgresDB")}

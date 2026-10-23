@@ -119,7 +119,9 @@ def _export_graph(cur, project: str | None,
 
     `entity` narrows the graph to that node and its incident edges, matching
     the memory filter: exporting only one entity's memories but the whole
-    graph made the backup say more than the caller asked for.
+    graph made the backup say more than the caller asked for. The other
+    endpoints of those edges are included as well, so the exported graph is
+    complete and can be restored.
     """
     scope_name = "global" if only_global else project
     conditions: list[str] = []
@@ -158,6 +160,28 @@ def _export_graph(cur, project: str | None,
          "project": "global" if r[4] == "global" else r[4]}
         for r in cur.fetchall()
     ]
+    if entity:
+        # An entity-filtered export keeps the incident edges - so it must keep
+        # their other endpoints too. Without them the backup held an edge whose
+        # target node was missing, and a restore could not recreate the graph.
+        known = {(e["name"], e["project"]) for e in entities}
+        endpoints = {
+            pair
+            for rel in relations
+            for pair in ((rel["from_entity"], rel["project"]),
+                         (rel["to_entity"], rel["project"]))
+        }
+        for name, scope in sorted(endpoints - known):
+            cur.execute(
+                "SELECT name, type, project FROM entities "
+                "WHERE name = %s AND project = %s",
+                (name, scope),
+            )
+            row = cur.fetchone()
+            if row:
+                entities.append({"name": row[0], "type": row[1],
+                                 "project": row[2]})
+        entities.sort(key=lambda e: (e["project"], e["name"]))
     return {"entities": entities, "relations": relations}
 
 

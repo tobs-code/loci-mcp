@@ -146,7 +146,10 @@ def list_projects(
     include_counts: Annotated[
         bool,
         Field(description="True (default) reports per-scope memory, entity and "
-                          "relation counts.")] = True,
+                          "relation counts. False omits the count keys "
+                          "entirely instead of returning zero placeholders; "
+                          "the active-memory count is still computed "
+                          "internally for include_empty.")] = True,
 ) -> dict[str, Any]:
     """List every project scope (and the shared global one).
 
@@ -189,6 +192,7 @@ def list_projects(
             counts = {"memories": 0, "total_memories": 0,
                       "superseded_memories": 0, "forgotten_memories": 0,
                       "entities": 0, "relations": 0}
+            active_count = 0
             if has_table:
                 if include_counts:
                     cur.execute(
@@ -199,19 +203,21 @@ def list_projects(
                         f"COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) "
                         f"FROM {table}")
                     total, active, superseded, forgotten = cur.fetchone()
+                    active_count = active
                     counts.update({
                         "memories": active, "total_memories": total,
                         "superseded_memories": superseded,
                         "forgotten_memories": forgotten,
                     })
                 else:
-                    # `include_empty=False` still needs to know whether the
-                    # scope holds an active memory, so this one count runs
-                    # even when the full report is off.
+                    # Even without the full report, `include_empty=False` needs
+                    # to know whether the scope holds an active memory. Only
+                    # this one count runs; the count keys are omitted below so
+                    # a row never mixes a real value with zero placeholders.
                     cur.execute(
                         f"SELECT COUNT(*) FILTER (WHERE superseded_by IS NULL "
                         f"AND deleted_at IS NULL) FROM {table}")
-                    counts["memories"] = cur.fetchone()[0]
+                    active_count = cur.fetchone()[0]
                 if include_counts:
                     cur.execute(
                         "SELECT COUNT(*) FROM entities WHERE project = %s",
@@ -224,14 +230,16 @@ def list_projects(
                         (scope, scope))
                     counts["relations"] = cur.fetchone()[0]
             has_graph = scope in graph_scopes
-            if include_empty or counts["memories"] > 0 or has_graph:
-                rows.append({
+            if include_empty or active_count > 0 or has_graph:
+                row = {
                     "project": scope,
                     "scope": "global" if scope == "global" else "project",
                     "has_table": has_table,
                     "has_graph": has_graph,
-                    **counts,
-                })
+                }
+                if include_counts:
+                    row.update(counts)
+                rows.append(row)
         conn.commit()
     except Exception as e:
         conn.rollback()

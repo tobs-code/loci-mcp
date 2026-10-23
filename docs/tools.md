@@ -50,7 +50,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, `on_near_duplicate`, `metadata_mode`, optional contradiction check, `links` for graph edges in the same write, `scope` global/project) |
 | `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `on_near_duplicate`, `auto_supersede_near_duplicate`, `expires_at`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
 | `update_memory` | Update content (re-embedding), importance, metadata, entity, type or TTL (`expires_at`/`clear_expires_at`); `touch=true` refreshes the decay recency without a content change, `restore=true` undoes a soft delete |
-| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
+| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `touch`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete by `memory_id`, `memory_ids` or entity; `entity` also removes the graph node and that scope's memories; `counts` splits memories/entities/relations |
 
 ### `remember`
@@ -100,6 +100,12 @@ contradiction check or an explicit `supersede` of a global id), the fact
 disappears from every scope. The answer carries `cross_scope_superseded` (the
 ids) and a `cross-scope supersede` warning so that this is never silent.
 
+Dedupe only checks the table the fact is written to. If the exact content is
+already active in another scope, the write succeeds but returns
+`cross_scope_duplicates` (ids and scopes) plus a warning: reads hide one of the
+copies, so the fork is visible instead of looking like a lost write.
+`remember_batch` reports the same per fact entry.
+
 ### `remember_batch`
 
 `facts` is a list of objects; only `content` is required, everything else works
@@ -135,8 +141,9 @@ Active or hard-deleted ids answer `not_found`.
 ### `update_batch`
 
 `updates` is a list of objects with the same fields as `update_memory`
-(`memory_id` is required; `restore=true` undoes a soft delete and excludes the
-other fields). Every entry runs in its own savepoint, so an
+(`memory_id` is required; `touch=true` refreshes the decay age and can be
+combined with the other fields; `restore=true` undoes a soft delete and
+excludes the other fields). Every entry runs in its own savepoint, so an
 invalid, unknown, ambiguous or duplicate entry is reported in its result entry and the
 rest of the batch is still applied (`status: "partial"`). The answer carries
 `count` and one result per entry; `ok` is only `false` when nothing could be
@@ -169,8 +176,8 @@ mutually exclusive.
 | `recall` | Hybrid vector + FTS (RRF fusion, project + global); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total` and `relation_context_count` |
-| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; synthetic `<from>_<relation>_<to>` entities are hidden |
-| `list_projects` | Discover every scope; `include_empty` (default true), `include_counts` (default true); each row carries `project`, `scope`, `has_table`, `has_graph` and memory/entity/relation counts |
+| `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; an unknown `entity_type` is an argument error that names the labels present; synthetic `<from>_<relation>_<to>` entities are hidden |
+| `list_projects` | Discover every scope; `include_empty` (default true), `include_counts` (default true); each row carries `project`, `scope`, `has_table`, `has_graph` and, with counts, the memory/entity/relation counts (without counts those keys are omitted) |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, `projects`/`project_stats` for every scope, graph entity count, health; `detail="slim"\|"full"`, `include_global`, `include_empty_projects`; `project="*"` lists every scope; without a project it warns about the other scopes |
 
 ### `recall`
@@ -326,8 +333,8 @@ the graph nodes of the covered scopes, not of the whole database.
 | Tool | Description |
 |------|-------------|
 | `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older; cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 25s) bounds the NLI leg: when it is exhausted the scan stops early, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); other partial NLI failures are named there too |
-| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows |
-| `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content |
+| `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph and keeps the other endpoints of those edges; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows |
+| `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; broken links and chains are listed in `results` (chains carry `chain_to`); `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts object or string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`); IDs, TTL and timestamps are preserved; an id that already exists is always skipped; `dry_run` validates without writing and adds `would_create`; dangling supersede links are cleared with a warning; `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
 | `drop_project` | Remove a project scope completely (memory table, registry entry, graph nodes, mirror rows); `dry_run` previews; the shared scope cannot be dropped |
 | `server_health` | Check Postgres + Inference connectivity; reports `version`, `code_fingerprint` (detects a stale container), `started_at` and the active `toolset` |

@@ -47,6 +47,7 @@ from mcp_server.scopes import (
 )
 from mcp_server.scoring import _content_hash
 from mcp_server.storage import (
+    ACTIVE_ROW_SQL,
     clear_dangling_supersede,
     _check_contradictions,
     _deduplicate,
@@ -274,8 +275,12 @@ def _coerce_metadata(value: Any) -> tuple[dict | None, str | None]:
             return parsed, None
         return None, (f"metadata must be a JSON object, e.g. "
                       f"{{\"env\": \"test\"}} (got {type(parsed).__name__})")
-    return None, ("metadata must be an object, e.g. {\"env\": \"test\"} - "
-                  "a plain string is not accepted")
+    if isinstance(value, str):
+        return None, ("metadata must not be a blank string: pass a JSON object "
+                      "like {\"env\": \"test\"}, or a JSON-encoded object "
+                      "string")
+    return None, (f"metadata must be a JSON object, e.g. "
+                  f"{{\"env\": \"test\"}} (got {type(value).__name__})")
 
 
 def _cross_scope_warning(ids: list[str]) -> str:
@@ -287,6 +292,42 @@ def _cross_scope_warning(ids: list[str]) -> str:
         + ", ".join(ids)
         + " - a global fact is hidden in EVERY scope now, not only in this "
         "project"
+    )
+
+
+def _cross_scope_duplicates(cur, content: str,
+                            store_project: str | None) -> list[dict[str, Any]]:
+    """Active copies of exactly this content in scopes other than the target.
+
+    Dedupe only looks at the table the fact is written to, so the same content
+    stored in a project and in the shared scope was accepted silently. Reads
+    then hide one copy as a cross-scope duplicate, which looks like a lost
+    write. The caller gets this list as a warning (the fact is still stored:
+    a deliberate copy is allowed, it just must not be invisible).
+    """
+    c_hash = _content_hash(content)
+    target = _mem_table(store_project)
+    found: list[dict[str, Any]] = []
+    for table in _all_mem_tables(cur):
+        if table == target:
+            continue
+        cur.execute(
+            f"SELECT id FROM {table} WHERE content_hash = %s "
+            f"AND {ACTIVE_ROW_SQL} LIMIT 1",
+            (c_hash,))
+        row = cur.fetchone()
+        if row:
+            found.append({"id": row[0],
+                          "project": _scope_of_table(cur, table)})
+    return found
+
+
+def _cross_scope_duplicate_warning(found: list[dict[str, Any]]) -> str:
+    detail = ", ".join(f"{d['project']} ({d['id']})" for d in found)
+    return (
+        f"identical content already exists in another scope: {detail}; "
+        f"recall and list_memories hide cross-scope copies by default - pass "
+        f"include_duplicates=true (list_memories) to see every copy"
     )
 
 
@@ -332,6 +373,11 @@ class BatchUpdate(BaseModel):
     clear_expires_at: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Remove the TTL (mutually exclusive with expires_at).")
+    touch: Any = Field(default=None, json_schema_extra={
+        "type": ["boolean", "null"]},
+        description="Refresh the memory without changing its content: sets "
+                    "updated_at to now so the decay age starts over. Can be "
+                    "combined with the other update fields.")
     restore: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Undo a soft delete (mutually exclusive with every other "
@@ -607,6 +653,13 @@ def remember(
             conn.commit()
             return ok(STATUS_DUPLICATE, id=existing_id,
                       warnings=warnings, **payload)
+        # Dedupe only covers the target table. The same content may already be
+        # active in another scope; reads then hide the copy, so the write has
+        # to say that it forked the fact across scopes. (Filled after the
+        # supersede targets are known, so a copy this write replaces is not
+        # reported as a fork.)
+        cross_duplicates: list[dict[str, Any]] = []
+
         # No active duplicate, but the content may match a memory that was
         # superseded earlier. Storing it would silently re-activate an
         # outdated fact, so report the match (without blocking the write).
@@ -650,6 +703,11 @@ def remember(
         except ValueError as e:
             conn.rollback()
             return fail(STATUS_ERROR, str(e))
+
+        cross_duplicates = [
+            dup for dup in _cross_scope_duplicates(cur, content, store_project)
+            if dup["id"] not in superseded
+        ]
 
         # The near-duplicate policy turns the warning into an action. `reject`
         # writes nothing at all - the caller explicitly asked not to fork a
@@ -781,6 +839,8 @@ def remember(
             warnings.append(_near_duplicate_warning(near_dup))
         if cross_scope_superseded:
             warnings.append(_cross_scope_warning(cross_scope_superseded))
+        if cross_duplicates:
+            warnings.append(_cross_scope_duplicate_warning(cross_duplicates))
         if contradictions:
             warnings.append(
                 f"superseded {len(contradictions)} contradicting memory/facts")
@@ -817,6 +877,9 @@ def remember(
         if cross_scope_superseded:
             # Machine-readable: which shared facts this project write hid.
             payload["cross_scope_superseded"] = cross_scope_superseded
+        if cross_duplicates:
+            # Machine-readable: other scopes already hold this exact content.
+            payload["cross_scope_duplicates"] = cross_duplicates
         if check_contradictions:
             contradictions_payload: dict[str, Any] = {
                 "found": bool(contradictions),
@@ -1414,6 +1477,12 @@ def remember_batch(
                         and near_dup["id"] not in superseded:
                     superseded.append(near_dup["id"])
 
+                cross_duplicates = [
+                    dup for dup in _cross_scope_duplicates(
+                        cur, spec["content"], store_project)
+                    if dup["id"] not in superseded
+                ]
+
                 mid = _store_memory(
                     cur, spec["content"], embeddings[i], spec["mem_type"],
                     spec["entity"], spec["importance"], spec["metadata"],
@@ -1499,6 +1568,10 @@ def remember_batch(
                 entry["cross_scope_superseded"] = cross_scope_superseded
                 entry.setdefault("warnings", []).append(
                     _cross_scope_warning(cross_scope_superseded))
+            if cross_duplicates:
+                entry["cross_scope_duplicates"] = cross_duplicates
+                entry.setdefault("warnings", []).append(
+                    _cross_scope_duplicate_warning(cross_duplicates))
             if check_contradictions:
                 entry["contradictions"] = {
                     "found": bool(auto_superseded),
@@ -1532,6 +1605,37 @@ def remember_batch(
     warnings = [f"{len(failed)} fact(s) failed"] if failed else []
     return ok(status, count=len(results), succeeded=succeeded,
               failed=len(failed), results=results, warnings=warnings)
+
+
+def _restore_blocked_reason(cur, memory_id: str,
+                            tables: list[str]) -> str | None:
+    """Why an existing row cannot be restored, or None for an unknown id.
+
+    "not soft-forgotten or does not exist" hid the actual state: an active
+    memory has nothing to restore, and a superseded one stays history (a
+    restore never undoes a supersede). Naming the reason stops the caller from
+    looking for a missing id that is in fact there.
+    """
+    for table in tables:
+        cur.execute(
+            f"SELECT deleted_at, superseded_by FROM {table} WHERE id = %s",
+            (memory_id,))
+        row = cur.fetchone()
+        if not row:
+            continue
+        deleted_at, superseded_by = row
+        if deleted_at is None:
+            if superseded_by is not None \
+                    and superseded_by != SENTINEL_FORGOTTEN:
+                return (f"memory {memory_id} exists but is not soft-forgotten: "
+                        f"it is superseded by {superseded_by}, and a restore "
+                        f"does not undo a supersede (read it with "
+                        f"include_superseded=true)")
+            return (f"memory {memory_id} exists but is not soft-forgotten (it "
+                    f"is active); there is nothing to restore")
+        return (f"memory {memory_id} exists but its deleted_at is not a "
+                f"restorable soft delete")
+    return None
 
 
 def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
@@ -1578,9 +1682,10 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                 break
         conn.commit()
         if not restored:
+            reason = _restore_blocked_reason(cur, memory_id, tables)
             return fail(
                 STATUS_NOT_FOUND,
-                f"NOT FOUND: {memory_id} (not soft-forgotten or does not exist)",
+                reason or f"NOT FOUND: {memory_id}",
                 id=memory_id)
         scope = _scope_of_table(cur, restored_table) if restored_table else None
     except Exception as e:
@@ -1849,9 +1954,9 @@ def update_batch(
         Field(description="Updates to apply. Each entry needs 'memory_id'; "
                           "optional 'content', 'importance', 'metadata', "
                           "'entity', 'mem_type', 'expires_at', "
-                          "'clear_expires_at', 'restore' and 'project'. Invalid "
-                          "entries are reported individually and the rest is "
-                          "still applied.")],
+                          "'clear_expires_at', 'touch', 'restore' and "
+                          "'project'. Invalid entries are reported "
+                          "individually and the rest is still applied.")],
     project: Annotated[
         str | None,
         Field(description="Default project scope for all entries (per-entry "
@@ -1873,7 +1978,9 @@ def update_batch(
 
     Each entry works like one `update_memory` call: `content` changes
     re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` and the
-    TTL (`expires_at`/`clear_expires_at`) are applied as given. `restore=true`
+    TTL (`expires_at`/`clear_expires_at`) are applied as given. `touch=true`
+    refreshes the decay age without changing the content and can be combined
+    with the other fields. `restore=true`
     undoes a soft delete and is mutually exclusive with the other fields.
     An unknown id answers `not_found` in its entry, an id
     that exists in several scopes without a `project` answers `error` with
@@ -1990,13 +2097,15 @@ def update_batch(
                              if entry_expires is not None and error is None
                              else None)
         entry_restore = bool(entry.get("restore"))
-        if error is None and entry_restore and fields:
+        entry_touch = bool(entry.get("touch"))
+        if error is None and entry_restore and (fields or entry_touch):
             error = ("restore=true cannot be combined with other update "
                      "fields")
-        if error is None and not fields and not entry_restore:
+        if error is None and not fields and not entry_restore \
+                and not entry_touch:
             error = ("nothing to update: pass content, importance, metadata, "
-                     "entity, mem_type, expires_at/clear_expires_at or "
-                     "restore=true")
+                     "entity, mem_type, expires_at/clear_expires_at, "
+                     "touch=true or restore=true")
         if error:
             prepared.append((None, error))
         else:
@@ -2072,12 +2181,12 @@ def update_batch(
                             restored_table = table
                             break
                     if not restored:
+                        reason = _restore_blocked_reason(
+                            cur, memory_id, restore_tables)
                         cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                         results.append({
                             "id": memory_id, "status": "not_found",
-                            "error": (f"NOT FOUND: {memory_id} "
-                                      f"(not soft-forgotten or does not "
-                                      f"exist)")})
+                            "error": (reason or f"NOT FOUND: {memory_id}")})
                         continue
                     scope = _scope_of_table(cur, restored_table)
                     cur.execute(f"RELEASE SAVEPOINT {savepoint}")

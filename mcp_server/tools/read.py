@@ -1412,10 +1412,31 @@ def list_entities(
         # filter: a node that the filter hides must not come back as a
         # "memory-only" entity, and it must not be counted twice.
         cur.execute(
-            f"SELECT name, project FROM entities WHERE {' AND '.join(scope_conditions)}",
+            f"SELECT name, project, type FROM entities "
+            f"WHERE {' AND '.join(scope_conditions)}",
             scope_params,
         )
-        graph_nodes = {(r[0], r[1]) for r in cur.fetchall()}
+        node_rows = cur.fetchall()
+        graph_nodes = {(r[0], r[1]) for r in node_rows}
+        graph_labels = {r[2] for r in node_rows if r[2]}
+
+        # A raw AGE label is accepted for backwards compatibility, but a typo
+        # used to answer an empty page silently. Name the valid labels instead.
+        if (entity_type and entity_type not in ("graph", "memory-only")
+                and entity_type not in graph_labels):
+            conn.rollback()
+            if graph_labels:
+                valid = ", ".join(sorted(graph_labels))
+                return fail(
+                    STATUS_ERROR,
+                    f"unknown entity_type {entity_type!r}: use 'graph', "
+                    f"'memory-only' or one of the graph labels in this scope: "
+                    f"{valid}")
+            return fail(
+                STATUS_ERROR,
+                f"unknown entity_type {entity_type!r}: the selected scope has "
+                f"no graph labels; use 'graph' for every graph node or "
+                f"'memory-only' for entities without one")
 
         conditions = list(scope_conditions)
         params = list(scope_params)

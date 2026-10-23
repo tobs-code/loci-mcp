@@ -701,8 +701,9 @@ def verify_integrity(
 
     Also reports self-references (`superseded_by = id`) and supersede chains
     (A replaced by B, B replaced by C), which are legal but often point at an
-    unintended second write. Expired-but-active rows are counted as context,
-    not as an error.
+    unintended second write. Broken links and chains are listed in `results`;
+    `chains` counts them even when `limit` truncates the list. Expired-but-active
+    rows are counted as context, not as an error.
     """
     logger.info("verify_integrity project=%s fix=%s", project, fix)
     try:
@@ -737,6 +738,7 @@ def verify_integrity(
         dangling: list[tuple[str, str, str]] = []
         self_refs: list[tuple[str, str, str]] = []
         links: dict[str, str] = {}
+        link_rows: dict[str, tuple[str, str | None, str]] = {}
         expired_active = 0
         total = 0
         for table in tables:
@@ -754,6 +756,7 @@ def verify_integrity(
             for mid, sup, entity, content in cur.fetchall():
                 total += 1
                 links[mid] = sup
+                link_rows[mid] = (scope, entity, content)
                 if sup == mid:
                     self_refs.append((table, mid, entity))
                 elif sup not in all_ids:
@@ -770,11 +773,27 @@ def verify_integrity(
                     })
 
         # A chain (A -> B -> C) is legal after repeated supersede, but a chain
-        # whose middle link is dangling is not: report the count so a caller
-        # can spot repeated rewrites of one fact.
-        chains = sum(
-            1 for mid, sup in links.items()
-            if sup in links and links.get(sup) != mid)
+        # whose middle link is dangling is not: report the count and list the
+        # rows so a caller can spot repeated rewrites of one fact instead of
+        # only seeing a number.
+        chain_links = [
+            (mid, sup, links[sup]) for mid, sup in links.items()
+            if sup in links and links.get(sup) != mid
+        ]
+        chains = len(chain_links)
+        for mid, sup, chain_to in chain_links:
+            if len(details) >= limit:
+                break
+            scope, entity, content = link_rows[mid]
+            details.append({
+                "project": scope,
+                "id": mid,
+                "superseded_by": sup,
+                "chain_to": chain_to,
+                "entity": entity,
+                "content": content[:200],
+                "problem": "supersede_chain",
+            })
 
         fixed = 0
         if fix and (dangling or self_refs):
@@ -811,6 +830,11 @@ def verify_integrity(
             f"{expired_active} active memory/memories have a passed TTL and "
             f"are hidden from reads (not an error; use include_expired=true "
             f"to inspect them)")
+    issue_count = len(dangling) + len(self_refs) + chains
+    if issue_count > len(details):
+        warnings.append(
+            f"results truncated at limit={limit}: {issue_count} problem "
+            f"row(s) found, {len(details)} listed; raise limit to see more")
     return ok(
         STATUS_OK,
         checked_tables=tables,
