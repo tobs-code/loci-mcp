@@ -8,11 +8,10 @@ from pydantic import Field
 from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
-from mcp_server.graph import _ensure_graph_entity, _relate_edges
+from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import is_expired, parse_expires_at
-from mcp_server.scopes import (
-    _ensure_project_table,
+from mcp_server.scope_catalog import (
     _is_global_scope,
     _mem_table,
     _norm_project,
@@ -20,6 +19,7 @@ from mcp_server.scopes import (
     _project_tables,
     _table_exists,
 )
+from mcp_server.schema_migrator import ensure_project_table
 from mcp_server.scoring import _content_hash, _gen_id, _now
 from mcp_server.search import _extra_conditions
 from mcp_server.storage import _deduplicate, clear_dangling_supersede
@@ -618,7 +618,7 @@ def import_memories(
                 continue
             table = _mem_table(target)
             if target:
-                _ensure_project_table(cur, target)
+                ensure_project_table(cur, target)
 
             mid = rec.get("id") or _gen_id()
             cur.execute(f"SELECT 1 FROM {table} WHERE id = %s", (mid,))
@@ -692,7 +692,7 @@ def import_memories(
         if graph is not None and not isinstance(graph, dict):
             graph = None
         if graph:
-            cur.execute("SET search_path TO ag_catalog, public")
+            graph_store = GraphStore(cur=cur)
 
             def _resolve(value):
                 scope = project if project is not None else _norm_project(value)
@@ -706,8 +706,8 @@ def import_memories(
             for ent in _as_list(graph.get("entities", [])):
                 if not isinstance(ent, dict) or not ent.get("name"):
                     continue
-                if _ensure_graph_entity(
-                    cur, ent["name"], _resolve(ent.get("project")),
+                if graph_store.ensure_entity(
+                    ent["name"], _resolve(ent.get("project")),
                     ent.get("type"),
                 ):
                     graph_entities_created += 1
@@ -726,7 +726,7 @@ def import_memories(
                     "weight": float(rel.get("weight", 1.0)),
                 })
             for scope, edges in grouped.items():
-                restored = _relate_edges(cur, edges, scope)
+                restored = graph_store.relate(edges, scope)
                 graph_relations += len(restored)
                 graph_relations_created += sum(
                     1 for edge in restored if edge.get("status") == "created")

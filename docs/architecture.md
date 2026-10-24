@@ -65,19 +65,27 @@ $$) AS (name agtype, friend_name agtype);
 | `mcp_server/envelope.py` | Uniform response envelope shared by all tools |
 | `mcp_server/projection.py` | Row projection (`fields`) and field validation |
 | `mcp_server/db.py` | Schema, migrations, connection handling |
-| `mcp_server/store.py` | `MemoryStore`: connection, cursor and transaction lifetime |
-| `mcp_server/scopes.py` | Project slugs, scope labels and per-project tables |
+| `mcp_server/store.py` | `MemoryStore`: connection, cursor, savepoint and transaction lifetime plus the write/lookup operations |
+| `mcp_server/store_rows.py` | Entity/graph/relation-context reads of a scope, taking the store |
+| `mcp_server/store_updates.py` | Partial row updates, restore and entity/context forget, taking the store |
+| `mcp_server/store_maintenance.py` | Supersede-link repair, pruning, mirror counts and scope DDL, taking the store |
+| `mcp_server/write_pipeline.py` | The single write order: `WriteIntent` → `WriteOutcome`, used by `remember` and `remember_batch` |
+| `mcp_server/scope_catalog.py` | Scope naming: project slugs, scope labels, table names and registry lookup |
+| `mcp_server/schema_migrator.py` | Project-table DDL and full-text/vector index migration |
 | `mcp_server/scope.py` | `ScopeSelection` / `resolve_scope`: read-scope resolution |
 | `mcp_server/lifecycle.py` | Active/TTL predicates, visibility SQL and row counts |
 | `mcp_server/scoring.py` | Decay, RRF helpers and ID/content hashing |
 | `mcp_server/duplicates.py` | Exact/semantic duplicates, subject guards and cross-scope dedupe |
-| `mcp_server/storage.py` | Store, supersede and access helpers |
+| `mcp_server/browse.py` | The single browse pipeline: visibility, cross-scope dedupe, paging and page counters |
+| `mcp_server/contradiction_scan.py` | Candidate selection, budgeted NLI judging and resolution planning |
+| `mcp_server/storage.py` | Supersede, duplicate and access helpers shared by the adapters |
 | `mcp_server/search.py` | `SearchRequest`, vector + FTS RRF search and graph boost |
-| `mcp_server/graph.py` | Apache AGE relation tools (orchestration only) |
-| `mcp_server/graph_store.py` | Sole owner of Cypher and graph mirror SQL |
+| `mcp_server/graph.py` | MCP adapter for the relation tools (schemas and envelope) over `GraphStore` |
+| `mcp_server/graph_store.py` | `GraphStore`: sole owner of the graph lifecycle (Cypher, mirror rows, relation-context memories, orphan cleanup) |
 | `mcp_server/backup.py` | Export/import of memories and the graph |
 | `mcp_server/tools/` | Write, read, scope and maintenance MCP tools |
-| `mcp_server/inference_client.py` | HTTP client for `/embed`, `/nli`, `/health` |
+| `mcp_server/inference_gateway.py` | One inference interface: `HttpInference` (service adapter) and `FakeInference` (deterministic tests) |
+| `mcp_server/inference_client.py` | HTTP transport for `/embed`, `/rerank`, `/nli`, `/health` |
 | `mcp_server/reembed.py` | Re-embed all memories after a model/prompt change |
 | `tests/` | Integration tests against an isolated `loci_test` database |
 | `inference/Dockerfile` | Inference service with sentence-transformers |
@@ -85,15 +93,34 @@ $$) AS (name agtype, friend_name agtype);
 | `inference/llm.py` | Provider abstraction for Groq, OpenAI, Anthropic, Ollama and OpenAI-compatible APIs |
 | `AGENTS.md` | Full tool documentation for AI agents |
 
+## Seams
+
+Six modules own a decision that used to be repeated by their callers. Each one
+takes its adapter as an argument, so a test can replace Postgres, the graph or
+the inference service without patching an import path.
+
+| Seam | Interface | Callers / adapters |
+|------|-----------|--------------------|
+| `inference_gateway.py` | `embed`, `rerank`, `nli`, `nli_detailed`, `health` | `HttpInference` (service) and `FakeInference` (tests) |
+| `store.py` (+ `store_rows` / `store_updates` / `store_maintenance`) | `MemoryStore`: connection and savepoint lifetime, plus memory-table operations | All persistence; fake store in tests |
+| `write_pipeline.py` | `WriteIntent` → `WriteOutcome` | `remember`, `remember_batch` |
+| `browse.py` | `BrowseRequest` → `BrowsePage`; `paginate`, `dedupe_rows`, `project_rows` | `recall`, `list_memories`, `get_entity`, `list_entities`, `init_context` |
+| `contradiction_scan.py` | `ContradictionScan.scan` / `plan_resolution` | `contradictions_report`, `remember(check_contradictions)` |
+| `graph_store.py` | `GraphStore`: nodes, edges, relation-context memories, orphans | `graph.py` tools, `search.py` boost, `backup.py`, `server.py`, `write_pipeline.py` |
+
+The seams own ordering and policy; the tool modules keep validation, argument
+wording and envelope rendering. None of the seams opens a second connection:
+the caller passes the store (or cursor) and owns the transaction.
+
 ## Request flow
 
 ```
 Agent ──MCP──> FastMCP tool ──> envelope
                     │
-                    ├─ embed()  ──> inference /embed ──> vector
-                    ├─ search   ──> pgvector + FTS ──> RRF fusion ──> projection
-                    ├─ graph    ──> Apache AGE (Cypher)
-                    └─ postgres ──> per-project tables + global table
+                    ├─ write  ──> write_pipeline ──> MemoryStore ──> Postgres
+                    ├─ read   ──> search + browse ──> MemoryStore ──> pgvector + FTS
+                    ├─ graph  ──> GraphStore ──> Apache AGE
+                    └─ any    ──> inference_gateway ──> /embed, /rerank, /nli
 ```
 
 Every tool returns the same envelope, so a caller never has to branch on the
@@ -103,6 +130,9 @@ shape of the answer. See [Tool Reference](tools.md).
 
 Tests run against an isolated `loci_test` database (created and dropped
 automatically) and a local fake inference server, so no LLM key is needed.
+The seams above also have unit tests that inject a fake store, a fake
+inference gateway and a fake clock, so ordering, paging and budget rules are
+exercised without a database or network.
 
 ```bash
 pip install -r requirements-dev.txt

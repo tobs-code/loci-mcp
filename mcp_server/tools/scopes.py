@@ -14,17 +14,23 @@ from typing import Annotated, Any
 from pydantic import Field
 
 from mcp_server.store import MemoryStore
+from mcp_server.store_maintenance import (
+    drop_scope_table,
+    entity_count,
+    graph_scopes as graph_scopes_of,
+    relation_count,
+    relation_scopes as relation_scopes_of,
+)
 from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
-from mcp_server.graph_store import delete_scope_graph
+from mcp_server.graph_store import GraphStore
 from mcp_server.lifecycle import counts as lifecycle_counts
 from mcp_server.storage import clear_dangling_supersede
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _mem_table,
     _norm_project,
     _project_names,
     _project_suffix,
     _project_tables,
-    _scope_key,
     _table_exists,
 )
 
@@ -75,7 +81,6 @@ def drop_project(
         return fail(STATUS_ERROR, "project is required")
     table = _mem_table(name)
     suffix = _project_suffix(name)
-    scope = _scope_key(name)
     db = MemoryStore()
     counts = {"memories": 0, "entities": 0, "relations": 0}
     try:
@@ -89,15 +94,10 @@ def drop_project(
             # two previews comparable instead of looking contradictory.
             counts["active_memories"] = table_counts["active"]
             counts["already_forgotten"] = table_counts["forgotten"]
-        cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s", (scope,))
-        counts["entities"] = cur.fetchone()[0]
-        cur.execute(
-            "SELECT COUNT(*) FROM relations WHERE source_id IN "
-            "(SELECT id FROM entities WHERE project = %s) OR target_id IN "
-            "(SELECT id FROM entities WHERE project = %s)",
-            (scope, scope),
-        )
-        counts["relations"] = cur.fetchone()[0]
+        graph = GraphStore(cur=cur)
+        mirror = graph.scope_counts(project)
+        counts["entities"] = mirror["entities"]
+        counts["relations"] = mirror["relations"]
         if not has_table and not counts["entities"] and not counts["relations"]:
             return fail(STATUS_NOT_FOUND,
                         f"unknown project {name!r}: it has neither a memory "
@@ -110,11 +110,9 @@ def drop_project(
                                f"{counts['entities']} entities, "
                                f"{counts['relations']} relations)"))
         # The graph first: the AGE label and the mirror rows belong together.
-        delete_scope_graph(cur, project)
+        graph.delete_scope(project)
         # Back to the public schema before the DDL.
-        cur.execute("SET search_path TO public")
-        cur.execute(f"DROP TABLE IF EXISTS {table}")
-        cur.execute("DELETE FROM projects WHERE suffix = %s", (suffix,))
+        drop_scope_table(db, table, suffix)
         # A global fact superseded by a fact of this project now points at an
         # id that no longer exists: clear that link so the old fact becomes
         # readable history instead of staying invisible forever.
@@ -165,14 +163,10 @@ def list_projects(
             table: (names.get(table[len("mem_"):], table[len("mem_"):]))
             for table in _project_tables(cur)
         }
-        cur.execute("SELECT DISTINCT project FROM entities")
-        graph_scopes = {row[0] for row in cur.fetchall() if row[0]}
+        graph_scopes = {s for s in graph_scopes_of(db) if s}
         # Relations have no project column of their own: their scope is the
         # scope of the entities they connect.
-        cur.execute(
-            "SELECT DISTINCT e.project FROM relations r "
-            "JOIN entities e ON e.id = r.source_id")
-        graph_scopes |= {row[0] for row in cur.fetchall() if row[0]}
+        graph_scopes |= {s for s in relation_scopes_of(db) if s}
 
         scopes = ["global"] + sorted(
             set(table_scopes.values()) | {s for s in graph_scopes
@@ -198,16 +192,8 @@ def list_projects(
                         "forgotten_memories": table_counts["forgotten"],
                     })
                 if include_counts:
-                    cur.execute(
-                        "SELECT COUNT(*) FROM entities WHERE project = %s",
-                        (scope,))
-                    counts["entities"] = cur.fetchone()[0]
-                    cur.execute(
-                        "SELECT COUNT(*) FROM relations WHERE source_id IN "
-                        "(SELECT id FROM entities WHERE project = %s) OR "
-                        "target_id IN (SELECT id FROM entities WHERE project = %s)",
-                        (scope, scope))
-                    counts["relations"] = cur.fetchone()[0]
+                    counts["entities"] = entity_count(db, scope)
+                    counts["relations"] = relation_count(db, scope)
             has_graph = scope in graph_scopes
             if include_empty or active_count > 0 or has_graph:
                 row = {

@@ -22,7 +22,7 @@ import asyncio
 import mcp_server.tools.maintenance as maintenance
 from mcp_server.app import app
 from mcp_server.db import get_conn
-from mcp_server.scopes import _mem_table
+from mcp_server.scope_catalog import _mem_table
 from mcp_server.server import (
     contradictions_report,
     export_memories,

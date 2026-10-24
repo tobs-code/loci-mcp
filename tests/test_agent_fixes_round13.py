@@ -19,7 +19,7 @@ Covers:
 from datetime import datetime, timedelta, timezone
 
 from mcp_server.db import get_conn
-from mcp_server.scopes import _mem_table
+from mcp_server.scope_catalog import _mem_table
 from mcp_server.server import (
     export_memories,
     forget,

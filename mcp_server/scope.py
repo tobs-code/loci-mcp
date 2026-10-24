@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _all_mem_tables,
     _is_global_scope,
     _norm_project,

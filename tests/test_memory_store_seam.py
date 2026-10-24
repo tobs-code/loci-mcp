@@ -71,3 +71,13 @@ def test_tools_do_not_open_their_own_connections():
             offenders.append(path)
 
     assert offenders == []
+
+
+def test_tools_do_not_execute_sql_directly():
+    """A tool names an operation; the store owns the SQL and the table names."""
+    offenders = []
+    for path in sorted((SOURCE_ROOT / "tools").glob("*.py")):
+        if "cur.execute" in path.read_text(encoding="utf-8"):
+            offenders.append(path.relative_to(SOURCE_ROOT).as_posix())
+
+    assert offenders == []

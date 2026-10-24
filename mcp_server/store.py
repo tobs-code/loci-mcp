@@ -22,13 +22,13 @@ from typing import Any, Iterator
 from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.db import get_conn
 from mcp_server.lifecycle import counts as lifecycle_counts
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _all_mem_tables,
     _mem_table,
     _project_exists,
-    _ensure_project_table,
     _scope_of_table,
 )
+from mcp_server.schema_migrator import ensure_project_table
 from mcp_server.scoring import _content_hash, _gen_id, _now
 
 
@@ -103,6 +103,22 @@ class MemoryStore:
 
     savepoint = attempt
 
+    def open_savepoint(self, name: str) -> None:
+        """Open a savepoint whose lifetime the caller manages manually."""
+        self.cur.execute(f"SAVEPOINT {name}")
+
+    def rollback_to(self, name: str) -> None:
+        """Discard the work of an open savepoint (a per-entry failure)."""
+        self.cur.execute(f"ROLLBACK TO SAVEPOINT {name}")
+
+    def release(self, name: str) -> None:
+        """Keep an open savepoint's work and free the name."""
+        self.cur.execute(f"RELEASE SAVEPOINT {name}")
+
+    def ping(self) -> None:
+        """One round trip; raises when the connection is unusable."""
+        self.cur.execute("SELECT 1")
+
     # -- scope / table -------------------------------------------------------
 
     @staticmethod
@@ -128,7 +144,7 @@ class MemoryStore:
         if not project:
             return False
         created = not _project_exists(self.cur, project)
-        _ensure_project_table(self.cur, project)
+        ensure_project_table(self.cur, project)
         return created
 
     def scope_of_table(self, table: str) -> str:
@@ -165,6 +181,14 @@ class MemoryStore:
                            (memory_id,)):
                 found.append(_scope_of_table(self.cur, table))
         return found
+
+    def nearest(self, *, project: str | None, embedding: list[float] | None,
+                limit: int, **kwargs) -> list:
+        """Nearest active memories; the scan module owns the one definition."""
+        from mcp_server.contradiction_scan import nearest_active
+        return nearest_active(
+            self.cur, project=project, embedding=embedding, limit=limit,
+            **kwargs)
 
     def counts(self, project: str | None = None) -> dict[str, int]:
         return lifecycle_counts(self.cur, _mem_table(project))
@@ -291,3 +315,10 @@ class MemoryStore:
 def open_store() -> MemoryStore:
     """Open a store for code that stages several pages before committing."""
     return MemoryStore()
+
+# Capability modules take this store; re-exported for discoverability.
+from mcp_server import (  # noqa: E402,F401
+    store_maintenance,
+    store_rows,
+    store_updates,
+)

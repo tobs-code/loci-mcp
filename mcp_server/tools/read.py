@@ -5,26 +5,37 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from mcp_server.browse import (
+    BrowseRequest,
+    browse,
+    dedupe_rows,
+    merge_unique_rows,
+    paginate,
+    project_rows,
+    tables_and_scopes,
+)
+from mcp_server.browse import (
+    order_column as browse_order_column,
+)
 from mcp_server.config import (
     DEFAULT_MIN_SIMILARITY,
     MEMORY_TYPE_HELP,
     MEMORY_TYPES,
     SENTINEL_FORGOTTEN,
 )
-from mcp_server.store import MemoryStore
-from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
 from mcp_server.duplicates import (
-    dedupe_across_scopes as _dedup_rows_across_scopes,
     dedupe_similar_rows as dedupe_near_duplicates,
 )
-from mcp_server.graph_store import (
-    connections as graph_connections,
-    find_entity as graph_find_entity,
-)
+from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
+from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
     counts as lifecycle_counts,
+)
+from mcp_server.lifecycle import (
     is_expired as _is_expired,
+)
+from mcp_server.lifecycle import (
     visibility_sql as _visibility_condition,
 )
 from mcp_server.projection import (
@@ -41,7 +52,7 @@ from mcp_server.scope import (
     MODE_PROJECT,
     resolve_scope,
 )
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _all_mem_tables,
     _count_entities,
     _norm_entity,
@@ -56,8 +67,20 @@ from mcp_server.search import (
     _search_memories_graph_boost,
 )
 from mcp_server.storage import (
-    ACTIVE_ROW_SQL,
     _log_access,
+)
+from mcp_server.store import MemoryStore
+from mcp_server.store_maintenance import entity_count, relation_count
+from mcp_server.store_rows import (
+    count_graph_where,
+    entity_present,
+    entity_row_count,
+    graph_entities,
+    graph_nodes as graph_node_rows,
+    graph_projects,
+    memory_only_count,
+    memory_only_names,
+    relation_context_rows,
 )
 from mcp_server.tools.maintenance import _health_check
 
@@ -74,11 +97,6 @@ SLIM_RECALL_FIELDS = (
     "_similarity", "_relevance_score", "_rerank_score", "_final_score",
     "_graph_boost", "_graph_source", "_graph_relation_context",
 )
-
-
-def _escape_like(value: str) -> str:
-    """Escape the wildcards of a LIKE/ILIKE pattern."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _best_dropped_hint(best_dropped: dict[str, Any]) -> str:
@@ -354,11 +372,10 @@ def recall(
             warnings.append(unknown)
 
         # Neue RRF-Funktion nutzen
-        tables = scope.tables(cur, MODE_PROJECT)
+        tables, scopes_searched = tables_and_scopes(cur, scope, MODE_PROJECT)
         # The scopes that were really searched. An agent that finds nothing
         # must be able to see whether other scopes were covered - otherwise
         # "no result" is indistinguishable from "wrong scope".
-        scopes_searched = scope.scopes(cur, tables)
         other_scopes = scope.other_scopes(cur, tables)
 
         stats: dict[str, Any] = {}
@@ -440,8 +457,8 @@ def recall(
                     dropped_by_superseded += 1
             results = kept
 
-        has_more = len(results) > offset + limit
-        results = results[offset:offset + limit]
+        paging = paginate(results, limit, offset)
+        results = paging.window
 
         # Update access counters (decay frequency) only for the rows this
         # page actually returns: skipped matches were not read.
@@ -460,23 +477,13 @@ def recall(
         db.close()
 
     rows = []
-    expired_count = 0
     projection_fields = fields
     if projection_fields is None and detail == "slim":
         projection_fields = list(SLIM_RECALL_FIELDS)
-    for r in results:
-        if not isinstance(r, dict):
-            continue
-        item = project_row(r, projection_fields)
-        if r.get("deleted_at"):
-            item["forgotten"] = True
-            if item.get("superseded_by") == SENTINEL_FORGOTTEN:
-                item["superseded_by"] = None
-        if _is_expired(r.get("expires_at")):
-            expired_count += 1
-            if fields is None or "expired" in fields:
-                item["expired"] = True
-        rows.append(item)
+    projectable = [r for r in results if isinstance(r, dict)]
+    rows, expired_count = project_rows(
+        projectable, fields, projection_fields=projection_fields,
+        all_markers=fields is None)
     if expired_count:
         warnings.append(
             f"{expired_count} result(s) have an expired TTL: they are not "
@@ -565,8 +572,8 @@ def recall(
         "candidates": candidates,
         "dropped_by_similarity": filtered_out,
         "offset": offset,
-        "has_more": has_more,
-        "next_offset": (offset + limit) if has_more else None,
+        "has_more": paging.has_more,
+        "next_offset": paging.next_offset,
         # The scopes that were actually searched: an agent that finds
         # nothing has to know whether other scopes were covered.
         "scopes_searched": scopes_searched,
@@ -874,17 +881,11 @@ def list_memories(
         except ValueError as e:
             return fail(STATUS_ERROR, str(e))
     try:
-        extra_conditions, extra_params = _extra_conditions(updated_after,
-                                                            metadata_filter)
+        _extra_conditions(updated_after, metadata_filter)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
-    order_column = {
-        "updated_at": "updated_at",
-        "created_at": "created_at",
-        "access_count": "access_count",
-        "importance": "importance",
-    }.get(order_by)
-    if not order_column:
+    order_value = browse_order_column(order_by)
+    if not order_value:
         return fail(STATUS_ERROR,
                     "order_by must be one of updated_at, created_at, "
                     "access_count, importance")
@@ -976,194 +977,43 @@ def list_memories(
                 "memory_id performs a direct id lookup: "
                 f"{', '.join(ignored)} ignored")
         return result
+    # Visibility, cross-scope dedupe, ordering and the page counters are the
+    # same pipeline as every other browse-shaped read: browse owns them once.
     db = MemoryStore()
-    warnings: list[str] = []
-    scopes_searched: list[str] = []
     try:
-        cur = db.cur
-        unknown = scope.unknown_warning(cur)
-        if unknown:
-            warnings.append(unknown)
-        tables = scope.tables(cur, MODE_BROWSE)
-        conditions: list[str] = [
-            _visibility_condition(include_deleted, include_superseded,
-                                  include_expired)]
-        params: list[Any] = []
-        if not include_relation_context:
-            # The relation-context sentences live under a synthetic entity and
-            # repeat what the edge already says.
-            conditions.append(
-                "COALESCE(metadata->>'relation_context', 'false') <> 'true'")
-        if memory_id:
-            conditions.append("id = %s")
-            params.append(memory_id)
-        if entity:
-            conditions.append("entity = %s")
-            params.append(entity)
-        if mem_type:
-            conditions.append("mem_type = %s")
-            params.append(mem_type)
-        if contains:
-            conditions.append("content ILIKE %s")
-            params.append(f"%{_escape_like(contains)}%")
-        conditions.extend(extra_conditions)
-        params.extend(extra_params)
-        where = " AND ".join(conditions)
-        scopes_searched = scope.scopes(cur, tables)
-        if not project and not scope.all_projects and len(scopes_searched) > 1:
-            # Every other read tool defaults to the global scope. A silent
-            # all-scope browse made the same call behave differently, so the
-            # wider search is named (no results are hidden, only disclosed).
-            warnings.append(
-                "no project given: browsed every scope ("
-                + ", ".join(scopes_searched)
-                + "); pass project=<name> for one scope or project='*' to "
-                  "make this explicit")
-        # Two phases. First the light columns of every match: dedup and paging
-        # must see the whole set, otherwise `total`, `has_more` and the page
-        # disagree. Only then the full rows of this page are loaded, so a
-        # large scope does not ship every embedding vector.
-        index_rows: list[dict] = []
-        for table in tables:
-            project_names = None if table == "memories" else _project_names(cur)
-            scope = ("global" if table == "memories"
-                     else project_names.get(table[4:], table[4:]))
-            cur.execute(
-                f"SELECT id, content_hash, superseded_by, deleted_at, "
-                f"expires_at, {order_column} AS _order FROM {table} WHERE {where}",
-                params,
-            )
-            for (row_id, c_hash, superseded_by,
-                 deleted_at, expires_at, order_value) in cur.fetchall():
-                index_rows.append({
-                    "id": row_id,
-                    "content_hash": c_hash,
-                    "superseded_by": superseded_by,
-                    "deleted_at": deleted_at,
-                    "expires_at": expires_at,
-                    "_order": order_value,
-                    "_project": scope,
-                    "_table": table,
-                })
+        page = browse(db, BrowseRequest(
+            project=raw_project,
+            include_global=include_global,
+            include_deleted=include_deleted,
+            include_expired=include_expired,
+            include_superseded=include_superseded,
+            include_duplicates=include_duplicates,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            entity=entity,
+            mem_type=mem_type,
+            contains=contains,
+            updated_after=updated_after,
+            metadata_filter=metadata_filter,
+            include_relation_context=include_relation_context,
+            fields=fields,
+        ))
         db.commit()
     except Exception as e:
         db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
         db.close()
-    unique, hidden_duplicates = _dedup_rows_across_scopes(
-        index_rows, include_duplicates)
-    # Scope transparency: with a project the browse also covers global rows.
-    # A flat `total` made that mix invisible, so name the scopes and split the
-    # counts. `total_by_scope` counts every matching row; `listed_by_scope`
-    # counts what remains after the cross-scope duplicate suppression.
-    total_by_scope: dict[str, int] = {}
-    for row in index_rows:
-        scope_name = row.get("_project") or "global"
-        total_by_scope[scope_name] = total_by_scope.get(scope_name, 0) + 1
-    listed_by_scope: dict[str, int] = {}
-    for row in unique:
-        scope_name = row.get("_project") or "global"
-        listed_by_scope[scope_name] = listed_by_scope.get(scope_name, 0) + 1
-    if hidden_duplicates:
-        warnings.append(
-            f"{hidden_duplicates} active memory/memories were hidden because "
-            f"identical content exists in another scope; only one copy is "
-            f"listed. Pass include_duplicates=true to list every copy")
-    unique.sort(key=lambda r: (r.get("_order") is not None,
-                                r.get("_order"),
-                                str(r.get("id") or "")), reverse=True)
-    total = len(unique)
-    window_index = unique[offset:offset + limit]
-    has_more = total > offset + limit
-    # Full rows for the page only, then restore the index order.
-    page: dict[tuple[str, str], dict] = {}
-    if window_index:
-        scope_by_key = {(r["_table"], r["id"]): r["_project"]
-                        for r in window_index}
-        by_table: dict[str, list[str]] = {}
-        for r in window_index:
-            by_table.setdefault(r["_table"], []).append(r["id"])
-        db = MemoryStore()
-        try:
-            cur = db.cur
-            for table, ids in by_table.items():
-                cur.execute(f"SELECT * FROM {table} WHERE id = ANY(%s)", (ids,))
-                columns = [d[0] for d in cur.description]
-                for row in cur.fetchall():
-                    item = dict(zip(columns, row))
-                    item["_project"] = scope_by_key[(table, item["id"])]
-                    page[(table, item["id"])] = item
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            return fail(STATUS_ERROR, str(e))
-        finally:
-            db.close()
-    window = [page[(r["_table"], r["id"])]
-              for r in window_index if (r["_table"], r["id"]) in page]
-    if offset > 0 and total > 0 and not window:
-        warnings.append(
-            f"no results on this page: offset={offset} is beyond the "
-            f"{total} matching memories; lower the offset")
-    projection_fields = fields
-    if include_deleted:
-        # Without this the caller could not tell a forgotten row from an
-        # active one.
-        if projection_fields is None:
-            projection_fields = list(PUBLIC_FIELDS) + ["deleted_at"]
-        elif "deleted_at" not in projection_fields:
-            projection_fields = projection_fields + ["deleted_at"]
-    results = []
-    expired_count = 0
-    for row in window:
-        item = project_row(row, projection_fields)
-        # A machine-readable marker beats reading the '__forgotten__'
-        # sentinel out of superseded_by.
-        if row.get("deleted_at"):
-            item["forgotten"] = True
-            if item.get("superseded_by") == SENTINEL_FORGOTTEN:
-                item["superseded_by"] = None
-        elif fields and "forgotten" in fields:
-            # Requested explicitly: report `false` instead of omitting the
-            # key, so the shape stays stable for the caller.
-            item["forgotten"] = False
-        if _is_expired(row.get("expires_at")):
-            expired_count += 1
-            if projection_fields is None or (fields and "expired" in fields):
-                item["expired"] = True
-        elif fields and "expired" in fields:
-            item["expired"] = False
-        results.append(item)
-    if expired_count:
-        warnings.append(
-            f"{expired_count} result(s) have an expired TTL: they are not "
-            f"active memories anymore")
-    if total == 0:
-        # An empty browse with narrowing filters is ambiguous: the scope may
-        # be empty or the filter may have excluded everything. Naming the
-        # active filters lets the caller retry instead of concluding that no
-        # memory exists.
-        filters = [
-            name for name, value in (
-                ("entity", entity), ("mem_type", mem_type),
-                ("contains", contains), ("updated_after", updated_after),
-                ("metadata_filter", metadata_filter),
-            ) if value
-        ]
-        if filters:
-            warnings.append(
-                f"no memories matched: the filter(s) "
-                f"{', '.join(filters)} narrowed the result to zero; widen or "
-                f"remove them")
-    return ok(STATUS_OK, count=len(results), total=total, offset=offset,
-              has_more=has_more,
-              next_offset=(offset + limit) if has_more else None,
-              duplicates_hidden=hidden_duplicates,
-              scopes_searched=scopes_searched,
-              total_by_scope=total_by_scope,
-              listed_by_scope=listed_by_scope,
-              warnings=warnings, results=results)
+    return ok(STATUS_OK, count=len(page.results), total=page.total,
+              offset=page.offset,
+              has_more=page.has_more,
+              next_offset=page.next_offset,
+              duplicates_hidden=page.duplicates_hidden,
+              scopes_searched=page.scopes_searched,
+              total_by_scope=page.total_by_scope,
+              listed_by_scope=page.listed_by_scope,
+              warnings=page.warnings, results=page.results)
 
 
 def _get_memory(
@@ -1287,77 +1137,6 @@ def _get_memory(
     return ok(STATUS_OK, id=memory_id, project=scope, memory=item)
 
 
-def _relation_context_memories(cur, target: str, tables: list[str],
-                               include_superseded: bool,
-                               include_expired: bool = False) -> list[dict]:
-    """Relation-context sentences attached to the edges of an entity.
-
-    `relate(context=...)` stores the sentence under the synthetic entity
-    `A_REL_B`, so a lookup of `A` or `B` never showed it. The sentence
-    belongs to the edge and the edge belongs to the entity, so it is
-    returned here - with its metadata (`relation_context`, `from`, `to`,
-    `weight`) that tells the agent where it comes from.
-    """
-    rows: list[dict] = []
-    names = _project_names(cur)
-    for table in tables:
-        conditions = [
-            "entity IS NOT NULL",
-            "metadata->>'relation_context' = 'true'",
-            "(metadata->>'from' = %s OR metadata->>'to' = %s)",
-        ]
-        params: list[Any] = [target, target]
-        conditions.append(_visibility_condition(
-            include_superseded=include_superseded,
-            include_expired=include_expired,
-        ))
-        cur.execute(
-            f"SELECT * FROM {table} WHERE {' AND '.join(conditions)}",
-            params,
-        )
-        columns = [d[0] for d in cur.description]
-        for row in cur.fetchall():
-            item = dict(zip(columns, row))
-            item.pop("embedding", None)
-            item["_project"] = ("global" if table == "memories"
-                                 else names.get(table[4:], table[4:]))
-            rows.append(item)
-    return rows
-
-
-def _count_entity_memories(cur, target: str, tables: list[str],
-                           include_superseded: bool,
-                           include_expired: bool = False) -> tuple[int, int]:
-    """Number of rows `get_entity` would list for an entity, and how many
-    active cross-scope copies the dedupe hides.
-
-    The count has to follow the same rule as the listing: an active copy in
-    another scope is hidden, but two identical rows inside one scope stay
-    visible (dedupe="off" deliberately allows them). A plain SQL UNION
-    deduplicated by content hash in *both* cases, so a scope with an
-    intentional duplicate reported fewer rows than the page held.
-    """
-    if not tables:
-        return 0, 0
-    where = ("entity = %s AND " + _visibility_condition(
-        include_superseded=include_superseded,
-        include_expired=include_expired))
-    rows: list[dict] = []
-    for table in tables:
-        cur.execute(
-            f"SELECT id, content_hash, superseded_by, deleted_at "
-            f"FROM {table} WHERE {where}",
-            (target,),
-        )
-        rows.extend({
-            "id": row[0], "content_hash": row[1],
-            "superseded_by": row[2], "deleted_at": row[3],
-            "_table": table,
-        } for row in cur.fetchall())
-    unique, hidden = _dedup_rows_across_scopes(rows)
-    return len(unique), hidden
-
-
 def get_entity(name: Annotated[
         str | None,
         Field(description="Entity to look up. Alias: `entity`.")] = None,
@@ -1457,23 +1236,20 @@ def get_entity(name: Annotated[
     scope_presence: dict[str, str] = {}
     try:
         cur = db.cur
-        tables = scope.tables(cur, MODE_PROJECT) if project else None
+        tables, scopes_searched = (tables_and_scopes(cur, scope, MODE_PROJECT)
+                                   if project else (None, ["global"]))
         used_tables = tables or ["memories"]
-        scopes_searched = scope.scopes(cur, used_tables)
         # An entity name can exist in several scopes. The caller asked for one
         # lookup, so the answer has to say where else the name occurs instead
         # of silently merging a global memory-only entity with this project's
         # graph node.
         for table, scope_name in zip(used_tables, scopes_searched):
-            cur.execute(f"SELECT 1 FROM {table} WHERE entity = %s LIMIT 1",
-                        (target,))
-            if cur.fetchone():
+            if entity_present(db, table, target):
                 scope_presence[scope_name] = "memory"
-        cur.execute("SELECT project FROM entities WHERE name = %s", (target,))
-        for (entity_project,) in cur.fetchall():
+        for entity_project in graph_projects(db, target):
             scope_presence[entity_project or "global"] = "graph"
-        total, hidden_duplicates = _count_entity_memories(
-            cur, target, used_tables, include_superseded, include_expired)
+        total, hidden_duplicates = entity_row_count(
+            db, target, used_tables, include_superseded, include_expired)
         # Fetch enough rows that the cross-scope copies the dedupe removes
         # cannot leave the page short. Adding just the hidden count keeps a
         # big entity from loading every row for a ten-item page.
@@ -1490,37 +1266,25 @@ def get_entity(name: Annotated[
         # An identical active fact in project and global is one row: the page
         # must apply the same rule as the count, otherwise `total`, `count`
         # and the last page disagree (a 12-row page could claim total=11).
-        memories, _hidden_duplicates = _dedup_rows_across_scopes(memories)
+        memories, _hidden_duplicates = dedupe_rows(memories)
         # The context sentence of an edge belongs to both of its endpoints.
         # Its content is deduplicated against the entity rows and against the
         # other scopes' context sentences for the same reason.
-        known_ids = {m.get("id") for m in memories}
-        known_hashes = {m.get("content_hash") for m in memories
-                        if m.get("content_hash")}
         if include_relation_context:
-            context_rows = _relation_context_memories(
-                cur, target, used_tables, include_superseded, include_expired)
+            context_rows = relation_context_rows(
+                db, target, used_tables, include_superseded, include_expired)
         else:
             context_rows = []
-        for row in context_rows:
-            if row.get("id") in known_ids:
-                continue
-            row_hash = row.get("content_hash")
-            if row_hash and row_hash in known_hashes:
-                continue
-            known_ids.add(row.get("id"))
-            if row_hash:
-                known_hashes.add(row_hash)
-            memories.append(row)
-            total += 1
-            relation_context_count += 1
+        memories, added_context = merge_unique_rows(memories, context_rows)
+        total += added_context
+        relation_context_count += added_context
 
-        row = graph_find_entity(cur, project, target)
-        if row:
+        details = GraphStore(cur=cur).entity_details(project, target)
+        if details:
+            row = details["row"]
             entity_data = {"id": row[0], "name": row[1], "type": "graph",
                            "label": row[2], "project": row[3],
-                           "connections": graph_connections(cur, project,
-                                                          target)}
+                           "connections": details["connections"]}
         db.commit()
     except Exception as e:
         db.rollback()
@@ -1553,36 +1317,29 @@ def get_entity(name: Annotated[
     # The rows come from several tables: newest update first makes the
     # detail view deterministic page-over-page.
     memories.sort(key=lambda m: m.get("updated_at") or "", reverse=True)
-    has_more = total > offset + limit
-    window = memories[offset:offset + limit]
-    if offset > 0 and total > 0 and not window:
+    paging = paginate(memories, limit, offset, total=total)
+    window = paging.window
+    if offset > 0 and paging.total > 0 and not window:
         warnings.append(
             f"no results on this page: offset={offset} is beyond the "
-            f"{total} memories of {target!r}; lower the offset")
-    if has_more:
+            f"{paging.total} memories of {target!r}; lower the offset")
+    if paging.has_more:
         warnings.append(
-            f"showing {len(window)} of {total} memories of {target!r}; use "
-            f"offset={offset + limit} to page through the rest"
+            f"showing {len(window)} of {paging.total} memories of {target!r}; "
+            f"use offset={offset + limit} to page through the rest"
         )
-    projected: list[dict] = []
-    expired_count = 0
-    for m in window:
-        item = project_row(m, fields)
-        if _is_expired(m.get("expires_at")):
-            expired_count += 1
-            if fields is None or "expired" in fields:
-                item["expired"] = True
-        projected.append(item)
+    projected, expired_count = project_rows(window, fields,
+                                            mark_forgotten=False)
     if expired_count:
         warnings.append(
             f"{expired_count} memory/memories of {target!r} have an expired "
             f"TTL: they are not active anymore")
     return ok(STATUS_OK, entity=target, details=entity_data,
               memories=projected,
-              total=total, relation_context_count=relation_context_count,
+              total=paging.total, relation_context_count=relation_context_count,
               count=len(window), offset=offset,
-              has_more=has_more,
-              next_offset=(offset + limit) if has_more else None,
+              has_more=paging.has_more,
+              next_offset=paging.next_offset,
               scopes_searched=scopes_searched,
               memories_by_scope=memories_by_scope,
               warnings=warnings)
@@ -1654,7 +1411,7 @@ def list_entities(
         unknown = scope.unknown_warning(cur)
         if unknown:
             warnings.append(unknown)
-        tables = scope.tables(cur, MODE_BROWSE)
+        tables, _ = tables_and_scopes(cur, scope, MODE_BROWSE)
         names = _project_names(cur)
         scope_of = {t: (names.get(t[len("mem_"):], t[len("mem_"):])
                         if t != "memories" else "global") for t in tables}
@@ -1665,12 +1422,7 @@ def list_entities(
         # Every graph node of the selected scopes, independent of the type
         # filter: a node that the filter hides must not come back as a
         # "memory-only" entity, and it must not be counted twice.
-        cur.execute(
-            f"SELECT name, project, type FROM entities "
-            f"WHERE {scope_condition}",
-            scope_params,
-        )
-        node_rows = cur.fetchall()
+        node_rows = graph_node_rows(db, scope_condition, scope_params)
         graph_nodes = {(r[0], r[1]) for r in node_rows}
         graph_labels = {r[2] for r in node_rows if r[2]}
 
@@ -1710,15 +1462,10 @@ def list_entities(
             # the memory-only counts below are the whole total then.
             total = 0
         else:
-            cur.execute(f"SELECT COUNT(*) FROM entities WHERE {where}", params)
-            total = cur.fetchone()[0]
-        cur.execute(
-            f"SELECT id, name, type, project FROM entities "
-            f"WHERE {where} ORDER BY name",
-            params,
-        )
+            total = count_graph_where(db, where, params)
         rows = [{"id": r[0], "name": r[1], "type": "graph", "label": r[2],
-                 "project": r[3], "graph_node": True} for r in cur.fetchall()]
+                 "project": r[3], "graph_node": True}
+                for r in graph_entities(db, where, params)]
         if entity_type == "memory-only":
             # A raw label filter restricted the graph rows above; the
             # "memory-only" kind has no SQL label, so the graph rows are cut
@@ -1731,40 +1478,26 @@ def list_entities(
         # "memory-only". Asking for one kind must not return the other.
         want_memory_only = entity_type in (None, "memory-only")
         for table in tables if want_memory_only else []:
-            scope = scope_of[table]
+            scope_name = scope_of[table]
             # Memory-only entities: a name that occurs in the memories of this
             # scope but has no graph node there. Synthetic relation-context
             # entities (e.g. "A_KNOWS_B") are excluded: they exist only to make
             # the edge context searchable, not as browsable knowledge. An
             # entity that also has a real memory stays visible.
-            context_flag = "COALESCE(metadata->>'relation_context', 'false') <> 'true'"
-            cur.execute(
-                f"SELECT COUNT(*) FROM (SELECT entity FROM {table} "
-                f"WHERE entity IS NOT NULL AND " + ACTIVE_ROW_SQL + " "
-                f"GROUP BY entity HAVING bool_or({context_flag})) e "
-                f"WHERE NOT EXISTS (SELECT 1 FROM entities en "
-                f"WHERE en.name = e.entity AND en.project = %s)",
-                (scope,),
-            )
-            total += cur.fetchone()[0]
-            cur.execute(
-                f"SELECT entity FROM {table} "
-                f"WHERE entity IS NOT NULL AND " + ACTIVE_ROW_SQL + " "
-                f"GROUP BY entity HAVING bool_or({context_flag})"
-            )
-            for (ent,) in cur.fetchall():
-                if (ent, scope) in seen:
+            total += memory_only_count(db, table, scope_name)
+            for ent in memory_only_names(db, table):
+                if (ent, scope_name) in seen:
                     continue
                 # A name that has a graph node in this scope is not a
                 # memory-only entity - even when the type filter hid that
                 # node from the listing above.
-                if (ent, scope) in graph_nodes:
+                if (ent, scope_name) in graph_nodes:
                     continue
-                seen.add((ent, scope))
+                seen.add((ent, scope_name))
                 # Memory-only entity: same row shape as a graph node, so an
                 # agent never has to guess which keys exist.
                 rows.append({"id": None, "name": ent, "type": "memory-only",
-                             "label": None, "project": scope,
+                             "label": None, "project": scope_name,
                              "graph_node": False})
         db.commit()
     except Exception as e:
@@ -1774,15 +1507,15 @@ def list_entities(
         db.close()
     # A stable order is what makes `offset` usable.
     rows.sort(key=lambda r: (str(r.get("name") or ""), str(r.get("project") or "")))
-    window = rows[offset:offset + limit]
-    has_more = total > offset + limit
-    if offset > 0 and total > 0 and not window:
+    paging = paginate(rows, limit, offset, total=total)
+    window = paging.window
+    if offset > 0 and paging.total > 0 and not window:
         warnings.append(
             f"no results on this page: offset={offset} is beyond the "
-            f"{total} matching entities; lower the offset")
-    return ok(STATUS_OK, count=len(window), total=total, offset=offset,
-              has_more=has_more,
-              next_offset=(offset + limit) if has_more else None,
+            f"{paging.total} matching entities; lower the offset")
+    return ok(STATUS_OK, count=len(window), total=paging.total, offset=offset,
+              has_more=paging.has_more,
+              next_offset=paging.next_offset,
               warnings=warnings, results=window)
 
 
@@ -1859,7 +1592,8 @@ def init_context(project: Annotated[
         unknown = scope.unknown_warning(cur)
         if unknown:
             warnings.append(unknown)
-        tables = scope.tables(cur, MODE_BOOTSTRAP)
+        tables, scope_names = tables_and_scopes(
+            cur, scope, MODE_BOOTSTRAP)
         # recent_first: the bootstrap shows what changed last, not what was
         # read most often.
         memories = _search_memories(cur, SearchRequest(
@@ -1871,7 +1605,6 @@ def init_context(project: Annotated[
             tables=tables,
             recent_first=True,
         ))
-        scope_names = scope.scopes(cur, tables)
         # Every scope the bootstrap covers is listed - including the shared
         # one. Without it the caller cannot see that global memories were
         # part of the answer.
@@ -1887,7 +1620,7 @@ def init_context(project: Annotated[
                     f"exist ({', '.join(other_scopes)}) - pass project='*' to "
                     f"bootstrap all of them")
         project_stats: list[dict[str, Any]] = []
-        for table, scope in zip(tables, scope_names):
+        for table, scope_name in zip(tables, scope_names):
             table_counts = lifecycle_counts(cur, table)
             table_total = table_counts["total"]
             table_active = table_counts["active"]
@@ -1897,20 +1630,12 @@ def init_context(project: Annotated[
             active += table_active
             superseded += table_superseded
             forgotten += table_forgotten
-            cur.execute(
-                "SELECT COUNT(*) FROM entities WHERE project = %s", (scope,))
-            entities = cur.fetchone()[0]
-            cur.execute(
-                "SELECT COUNT(*) FROM relations WHERE source_id IN "
-                "(SELECT id FROM entities WHERE project = %s) OR target_id IN "
-                "(SELECT id FROM entities WHERE project = %s)",
-                (scope, scope),
-            )
-            relations = cur.fetchone()[0]
+            entities = entity_count(db, scope_name)
+            relations = relation_count(db, scope_name)
             if include_empty_projects or table_active:
                 project_stats.append({
-                    "project": scope,
-                    "scope": "global" if scope == "global" else "project",
+                    "project": scope_name,
+                    "scope": "global" if scope_name == "global" else "project",
                     "memories": table_active,
                     "total_memories": table_total,
                     "superseded_memories": table_superseded,
@@ -1931,7 +1656,7 @@ def init_context(project: Annotated[
     # The key promises recency: sort the selected memories by their last
     # update instead of by score.
     memories.sort(key=lambda m: m.get("updated_at") or _EPOCH, reverse=True)
-    memories = memories[:limit]
+    memories = paginate(memories, limit, 0).window
     if detail == "slim":
         memories = [project_bootstrap(m) for m in memories]
     else:

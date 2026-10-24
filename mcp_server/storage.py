@@ -9,7 +9,7 @@ from mcp_server.config import (
 from mcp_server.duplicates import find_duplicate, find_near_duplicate
 from mcp_server.inference_gateway import nli
 from mcp_server.lifecycle import ACTIVE_ROW_SQL
-from mcp_server.scopes import _mem_table, _retrieval_tables
+from mcp_server.scope_catalog import _mem_table, _retrieval_tables
 from mcp_server.scoring import _gen_id, _now, _content_hash
 
 
@@ -21,7 +21,7 @@ def clear_dangling_supersede(cur, tables: list[str] | None = None) -> int:
     nothing supersedes it any more. Called after hard deletes and imports so a
     dangling link can never make a memory permanently unreachable.
     """
-    from mcp_server.scopes import _all_mem_tables  # avoid import cycle
+    from mcp_server.scope_catalog import _all_mem_tables  # avoid import cycle
 
     targets = tables if tables is not None else _all_mem_tables(cur)
     all_ids: set[str] = set()
@@ -326,43 +326,21 @@ def _check_contradictions(cur, content: str, entity: str | None,
     comparison to `mem_type = 'fact'` hid most real conflicts, because the
     conflicting memory is often a decision, a pattern or a convention.
     """
+    from mcp_server.contradiction_scan import nearest_active
+
     candidates: list[tuple[str, str, str | None]] = []
     seen: set[str] = set()
     new_hash = _content_hash(content)
-    remaining = max_candidates
 
-    def _fetch(sql_where: str, params: list) -> None:
-        nonlocal remaining
+    def _fetch(where: str, params: list) -> None:
+        remaining = max_candidates - len(candidates)
         if remaining <= 0:
             return
-        for table in _retrieval_tables(cur, project):
-            if remaining <= 0:
-                break
-            if embedding_vec is not None:
-                cur.execute(
-                    f"SELECT id, content, entity FROM {table} "
-                    f"WHERE {sql_where} AND content_hash <> %s "
-                    f"AND embedding IS NOT NULL "
-                    f"AND {ACTIVE_ROW_SQL} "
-                    f"ORDER BY embedding <=> %s::vector ASC LIMIT %s",
-                    params + [new_hash, embedding_vec, remaining],
-                )
-            else:
-                cur.execute(
-                    f"SELECT id, content, entity FROM {table} "
-                    f"WHERE {sql_where} AND content_hash <> %s "
-                    f"AND {ACTIVE_ROW_SQL} "
-                    f"ORDER BY created_at DESC LIMIT %s",
-                    params + [new_hash, remaining],
-                )
-            for row in cur.fetchall():
-                if row[0] in seen:
-                    continue
-                seen.add(row[0])
-                candidates.append((row[0], row[1], row[2]))
-                remaining -= 1
-            if remaining <= 0:
-                break
+        for row in nearest_active(
+                cur, project=project, embedding=embedding_vec, limit=remaining,
+                content_hash=new_hash, where=where, where_params=params,
+                seen=seen):
+            candidates.append((row.id, row.content, row.entity))
 
     # 1. The entity's own memories first - conflicts inside one entity are
     #    the ones an agent notices, so they must get the candidate seats.
@@ -374,7 +352,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
     if entity:
         _fetch("entity IS DISTINCT FROM %s", [entity])
     else:
-        _fetch("TRUE", [])
+        _fetch("", [])
 
     candidates = candidates[:max_candidates]
     if not candidates:

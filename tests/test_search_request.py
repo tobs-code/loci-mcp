@@ -37,10 +37,10 @@ def test_graph_boost_failure_keeps_query_hits(monkeypatch):
     hub = "SearchRequestHub"
     remember("SearchRequest deploy runbook fact", project=project, entity=hub)
 
-    def _boom(cur, *args, **kwargs):
-        cur.execute("SELECT 1 / 0")
+    def _boom(graph, *args, **kwargs):
+        graph.cur.execute("SELECT 1 / 0")
 
-    monkeypatch.setattr("mcp_server.search.boost_neighbors", _boom)
+    monkeypatch.setattr("mcp_server.search.GraphStore.boost", _boom)
 
     result = recall("SearchRequest deploy runbook fact", project=project,
                     entity=hub, graph_boost=True)

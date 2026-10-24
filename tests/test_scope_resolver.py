@@ -10,7 +10,7 @@ from mcp_server.scope import (
     MODE_PROJECT,
     resolve_scope,
 )
-from mcp_server.scopes import _mem_table
+from mcp_server.scope_catalog import _mem_table
 from mcp_server.server import remember
 
 

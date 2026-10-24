@@ -20,9 +20,9 @@ from mcp_server.config import (
 )
 from mcp_server.store import MemoryStore
 from mcp_server.duplicates import is_cross_scope_duplicate
-from mcp_server.graph_store import boost_neighbors, label_node_exists
+from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import rerank
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _ag_str,
     _all_mem_tables,
     _project_names,
@@ -1093,8 +1093,7 @@ def _search_memories_graph_boost(
         seen_nodes: set[str] = set()
         seen_relation_context: set[str] = set()
         for label in labels:
-            for name, weight, rtype, source in boost_neighbors(
-                    cur, label, entity):
+            for name, weight, rtype, source in GraphStore(cur=cur).boost(label, entity):
                 node = _ag_str(name)
                 weight_value = float(str(weight))
                 relation = _ag_str(rtype)
@@ -1176,7 +1175,7 @@ def _search_memories_graph_boost(
             # has no node at all: only the latter is a meaningless expansion.
             node_exists = False
             for label in labels:
-                if label_node_exists(cur, label, entity):
+                if GraphStore(cur=cur).label_exists(label, entity):
                     node_exists = True
                     break
             if not node_exists and warnings is not None:

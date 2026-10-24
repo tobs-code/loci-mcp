@@ -29,7 +29,7 @@ from mcp_server.config import (
     NEAR_DUPLICATE_THRESHOLD,
 )
 from mcp_server.lifecycle import ACTIVE_ROW_SQL, is_active
-from mcp_server.scopes import _mem_table
+from mcp_server.scope_catalog import _mem_table
 from mcp_server.scoring import _content_hash
 
 

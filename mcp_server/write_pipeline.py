@@ -31,10 +31,10 @@ from mcp_server.duplicates import (
     same_topic as _shares_subject,
 )
 from mcp_server.envelope import STATUS_DUPLICATE, STATUS_STORED
-from mcp_server.graph import _relate_edges, _validate_weight
+from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed, nli_configured
 from mcp_server.lifecycle import parse_expires_at
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _all_mem_tables,
     _mem_table,
     _safe_ident,
@@ -464,7 +464,7 @@ def _validate_links(links: Any, default_entity: str | None) -> list[str]:
                 errors.append(f"links[{i}]: {e}")
         weight = link.get("weight", 1.0)
         try:
-            _validate_weight(weight)
+            GraphStore.validate_weight(weight)
         except (TypeError, ValueError) as e:
             errors.append(f"links[{i}]: weight: {e}")
         context = link.get("context")
@@ -474,7 +474,7 @@ def _validate_links(links: Any, default_entity: str | None) -> list[str]:
 
 
 def _prepare_links(links: list[dict], default_entity: str | None) -> list[dict]:
-    """Normalize `links` items into `_relate_edges` edge dicts."""
+    """Normalize `links` items into GraphStore edge dicts."""
     edges: list[dict] = []
     for link in links:
         edges.append({
@@ -483,7 +483,7 @@ def _prepare_links(links: list[dict], default_entity: str | None) -> list[dict]:
             "to_entity": link.get("to_entity").strip()
             if isinstance(link.get("to_entity"), str) else "",
             "relation_type": link.get("relation_type"),
-            "weight": _validate_weight(link.get("weight", 1.0)),
+            "weight": GraphStore.validate_weight(link.get("weight", 1.0)),
             "context": link.get("context"),
         })
     return edges
@@ -510,10 +510,10 @@ def _apply_remember_links(
     edges_added = False
     try:
         cur.execute("SAVEPOINT remember_links")
-        cur.execute("SET search_path TO ag_catalog, public")
+        graph = GraphStore(cur=cur)
         edges_added = True
         for edge in _prepare_links(links, default_entity):
-            for lr in _relate_edges(cur, [edge], store_project):
+            for lr in graph.relate([edge], store_project):
                 entry = dict(lr)
                 if lr.get("self_loop"):
                     warnings.append(

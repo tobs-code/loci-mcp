@@ -1,10 +1,8 @@
-import json
 import logging
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from pydantic import Field
 
-from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.store import MemoryStore
 from mcp_server.envelope import (
     STATUS_DELETED,
@@ -14,32 +12,15 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
-from mcp_server.graph_store import (
-    delete_edge as _delete_edge,
-    drop_orphan_nodes as _drop_orphan_nodes,
-    edge_context as _edge_context,
-    edge_weight as _edge_weight,
-    ensure_entity as _ensure_graph_entity,
-    entity_exists as _entity_exists,
-    entity_ids as _entity_ids,
-    entity_row as _entity_row,
-    paths as _graph_paths,
-    traverse as _traverse,
-    upsert_edge as _upsert_edge,
-)
-from mcp_server.inference_gateway import embed
-from mcp_server.scopes import (
-    _ensure_project_table,
-    _mem_table,
+from mcp_server.graph_store import GraphStore
+from mcp_server.scope_catalog import (
     _norm_entity,
     _norm_project,
     _retrieval_tables,
     _safe_ident,
     _scope_key,
-    _scope_label,
     _table_exists,
 )
-from mcp_server.storage import _store_memory, _supersede
 
 logger = logging.getLogger(__name__)
 
@@ -57,63 +38,24 @@ class RelationEdge(TypedDict):
                     "project.")]]
 
 
-def _forget_relation_context(
-    cur,
-    project: str | None,
-    from_entity: str,
-    to_entity: str,
-    relation_type: str,
-) -> int:
-    """Hide the active context memory attached to a deleted edge."""
-    table = _mem_table(project)
-    if not _table_exists(cur, table):
-        return 0
-    cur.execute(
-        f"UPDATE {table} SET superseded_by = %s, deleted_at = NOW() "
-        "WHERE deleted_at IS NULL "
-        "AND metadata->>'relation_context' = 'true' "
-        "AND metadata->>'from' = %s "
-        "AND metadata->>'to' = %s "
-        "AND metadata->>'relation_type' = %s",
-        (SENTINEL_FORGOTTEN, from_entity, to_entity, relation_type),
-    )
-    return cur.rowcount
-
-
-def _validate_weight(value: Any) -> float:
-    """Edge weights are strengths in [0, 1].
-
-    They feed directly into the retrieval boost (0.3 * weight), so an
-    unbounded weight would let a single edge dominate every score.
-    """
-    try:
-        weight = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("weight must be a number between 0.0 and 1.0")
-    if not 0.0 <= weight <= 1.0:
-        raise ValueError("weight must be between 0.0 and 1.0")
-    return weight
-
-
-def _entity_not_found_hint(cur, entity_name: str, project: str | None) -> str:
+def _entity_not_found_hint(graph: GraphStore, entity_name: str,
+                           project: str | None) -> str:
     """Explain why an entity was not found in the searched graph.
 
     Agents cannot see the scope of the graph they searched, so the message
     names the scope that was used and points to the likely cause.
     """
     scope = _scope_key(project)
-    cur.execute("SELECT DISTINCT project FROM entities WHERE name = %s",
-                (entity_name,))
-    other_scopes = [r[0] for r in cur.fetchall()]
+    other_scopes = graph.scopes_with_entity(entity_name)
     memory_only = False
-    for table in _retrieval_tables(cur, project):
-        if not _table_exists(cur, table):
+    for table in _retrieval_tables(graph.cur, project):
+        if not _table_exists(graph.cur, table):
             continue
-        cur.execute(
+        graph.cur.execute(
             f"SELECT 1 FROM {table} WHERE entity = %s "
             "AND superseded_by IS NULL AND deleted_at IS NULL LIMIT 1",
             (entity_name,))
-        if cur.fetchone():
+        if graph.cur.fetchone():
             memory_only = True
             break
     if memory_only:
@@ -130,139 +72,6 @@ def _entity_not_found_hint(cur, entity_name: str, project: str | None) -> str:
                 f"project=<name> if the entity lives in a project)")
     return (f"entity not found in the {scope} graph: {entity_name} "
             f"(the entity may live in another project; pass that project)")
-
-
-def _sync_context_weight(cur, project: str | None, from_entity: str,
-                         to_entity: str, relation_type: str,
-                         weight: float) -> None:
-    """Keep the weight in a relation context memory in sync with its edge.
-
-    `relate(context=...)` stores the edge weight in the metadata of the
-    context sentence. When the edge is re-weighted later, the sentence must
-    follow - otherwise it reports a strength the graph no longer has.
-    """
-    table = _mem_table(project)
-    if not _table_exists(cur, table):
-        return
-    cur.execute(
-        f"UPDATE {table} SET metadata = jsonb_set(metadata, '{{weight}}', %s::jsonb) "
-        "WHERE deleted_at IS NULL AND superseded_by IS NULL "
-        "AND metadata->>'relation_context' = 'true' "
-        "AND metadata->>'from' = %s "
-        "AND metadata->>'to' = %s "
-        "AND metadata->>'relation_type' = %s",
-        (json.dumps(weight), from_entity, to_entity, relation_type),
-    )
-
-
-def _relate_edges(cur, edges: list[dict], project: str | None) -> list[dict]:
-    """Create/update directed AGE edges and the SQL mirror rows.
-
-    Caller must set search_path to ag_catalog, public and handle the
-    transaction. Uses MERGE, so it is idempotent and keeps both directions
-    of the same relation type independent.
-    """
-    prepared: list[dict] = []
-    for edge in edges:
-        frm = _norm_entity(edge.get("from_entity"))
-        to = _norm_entity(edge.get("to_entity"))
-        rtype = edge.get("relation_type")
-        if not frm or not to:
-            raise ValueError("each edge needs 'from_entity' and 'to_entity'")
-        _safe_ident(rtype or "", "relation_type")
-        raw_weight = edge.get("weight")
-        prepared.append({
-            "from_entity": frm,
-            "to_entity": to,
-            "relation_type": rtype,
-            # None means "preserve what the edge already has"; validation is
-            # skipped until the existing weight has been read.
-            "weight": (None if raw_weight is None
-                       else _validate_weight(raw_weight)),
-            "context": edge.get("context"),
-        })
-
-    entities: list[str] = []
-    seen: set[str] = set()
-    for e in prepared:
-        for ent in (e["from_entity"], e["to_entity"]):
-            if ent not in seen:
-                seen.add(ent)
-                entities.append(ent)
-
-    for ent in entities:
-        _ensure_graph_entity(cur, ent, project)
-
-    results: list[dict] = []
-    for e in prepared:
-        rtype = e["relation_type"]
-        existing_weight = _edge_weight(
-            cur, project, e["from_entity"], e["to_entity"], rtype)
-        existed = existing_weight is not None
-        if e["weight"] is None:
-            # No weight passed: keep the stored strength (default 1.0 only
-            # for a brand-new edge). Otherwise an idempotent `relate` call -
-            # e.g. adding a context sentence later - silently reset a
-            # deliberately weak edge to 1.0.
-            weight = existing_weight if existed else 1.0
-        else:
-            weight = e["weight"]
-        e["weight"] = weight
-        _upsert_edge(cur, project, e["from_entity"], e["to_entity"], rtype,
-                     weight)
-        # The context sentence of an edge carries the edge weight in its
-        # metadata. A later weight change would leave the old value behind
-        # and contradict the graph, so the two are kept in sync.
-        _sync_context_weight(cur, project, e["from_entity"], e["to_entity"],
-                             rtype, weight)
-        results.append({
-            "from_entity": e["from_entity"],
-            "to_entity": e["to_entity"],
-            "relation_type": rtype,
-            "weight": weight,
-            "status": "updated" if existed else "created",
-            "context_memory": None,
-            "context_reused": False,
-            "self_loop": e["from_entity"] == e["to_entity"],
-        })
-
-    context_edges = [(e, r) for e, r in zip(prepared, results) if e["context"]]
-    if context_edges:
-        embeddings = embed([e["context"] for e, _ in context_edges])
-        ctx_table = _mem_table(project)
-        for (e, r), emb in zip(context_edges, embeddings):
-            ctx_entity = f"{e['from_entity']}_{e['relation_type']}_{e['to_entity']}"
-            cur.execute(
-                f"SELECT id, content FROM {ctx_table} WHERE entity = %s "
-                f"AND superseded_by IS NULL AND deleted_at IS NULL LIMIT 1",
-                (ctx_entity,),
-            )
-            row = cur.fetchone()
-            if row and row[1] == e["context"]:
-                # Re-relating the same edge with the same sentence is a no-op
-                # for the context memory. Storing a new copy and superseding
-                # the old one changed the id on every call, so an idempotent
-                # `relate` still produced a new memory version each time.
-                mem_id = row[0]
-                cur.execute(
-                    f"UPDATE {ctx_table} SET updated_at = NOW() "
-                    f"WHERE id = %s", (mem_id,))
-                r["context_reused"] = True
-            else:
-                mem_id = _store_memory(
-                    cur, e["context"], emb, "context", ctx_entity, 0.8,
-                    {"relation_context": True,
-                     "relation_type": e["relation_type"],
-                     "from": e["from_entity"],
-                     "to": e["to_entity"], "weight": e["weight"]},
-                    project, None,
-                )
-                if row:
-                    _supersede(cur, project, mem_id, row[0])
-                r["context_reused"] = False
-            r["context_memory"] = mem_id
-
-    return results
 
 
 def relate(
@@ -308,15 +117,7 @@ def relate(
 
     db = MemoryStore()
     try:
-        cur = db.cur
-        if project:
-            # Every project that gets a graph node also gets its memory table
-            # and its registry entry. Without that the scope existed only in
-            # the graph: invisible in `init_context(project='*')` and not removable with
-            # `drop_project`, which left its nodes behind as orphans.
-            _ensure_project_table(cur, project)
-        cur.execute("SET search_path TO ag_catalog, public")
-        results = _relate_edges(cur, [{
+        results = GraphStore(db).relate([{
             "from_entity": from_entity,
             "to_entity": to_entity,
             "relation_type": relation_type,
@@ -387,20 +188,13 @@ def relate_batch(
                     "each edge needs 'from_entity' and 'to_entity'")
             _safe_ident(edge.get("relation_type") or "", "relation_type")
             if edge.get("weight") is not None:
-                _validate_weight(edge.get("weight"))
+                GraphStore.validate_weight(edge.get("weight"))
             _norm_project(edge.get("project", project))
         except (TypeError, ValueError) as e:
             return fail(STATUS_ERROR, f"edge {i}: {e}")
     db = MemoryStore()
     try:
-        cur = db.cur
-        # Every project that gets a graph node also gets its memory table and
-        # its registry entry, so the scope is visible in `init_context(project='*')` and
-        # removable with `drop_project`.
-        for p in {_norm_project(e.get("project", project)) for e in edges}:
-            if p:
-                _ensure_project_table(cur, p)
-        cur.execute("SET search_path TO ag_catalog, public")
+        graph = GraphStore(db)
         # Edges may target different scopes; keep the caller's order.
         indexed: dict[Any, list[tuple[int, dict]]] = {}
         for i, edge in enumerate(edges):
@@ -409,7 +203,7 @@ def relate_batch(
         results: list[Any] = [None] * len(edges)
         for scope, pairs in indexed.items():
             try:
-                batch = _relate_edges(cur, [edge for _, edge in pairs], scope)
+                batch = graph.relate([edge for _, edge in pairs], scope)
             except Exception as e:
                 positions = [pos for pos, _ in pairs]
                 raise ValueError(
@@ -477,19 +271,10 @@ def unrelate(
         return fail(STATUS_ERROR, str(e))
 
     db = MemoryStore()
-    context_removed = 0
-    orphans_removed: list[str] = []
     try:
-        cur = db.cur
-        deleted = _delete_edge(
-            cur, project, from_entity, to_entity, relation_type)
-        if deleted:
-            if not keep_context:
-                context_removed = _forget_relation_context(
-                    cur, project, from_entity, to_entity, relation_type,
-                )
-            orphans_removed = _drop_orphan_nodes(
-                cur, project, [from_entity, to_entity])
+        result = GraphStore(db).unrelate(
+            from_entity, to_entity, relation_type, project,
+            keep_context=keep_context)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -497,14 +282,14 @@ def unrelate(
     finally:
         db.close()
 
-    if not deleted:
+    if not result["deleted"]:
         return fail(STATUS_NOT_FOUND,
                     f"no {relation_type} edge from {from_entity} to {to_entity}")
     return ok(STATUS_DELETED, from_entity=from_entity, to_entity=to_entity,
               relation_type=relation_type,
-              context_memories_removed=context_removed,
+              context_memories_removed=result["context_memories_removed"],
               context_kept=keep_context,
-              orphan_nodes_removed=orphans_removed)
+              orphan_nodes_removed=result["orphans_removed"])
 
 
 def find_connections(
@@ -573,24 +358,16 @@ def find_connections(
             return fail(STATUS_ERROR, str(e))
     db = MemoryStore()
     try:
-        cur = db.cur
-        if not _entity_exists(cur, project, entity_name):
+        graph = GraphStore(db)
+        page = graph.connections(entity_name, direction, project,
+                                 relation_type, limit, offset)
+        if not page["found"]:
             db.rollback()
             return fail(STATUS_NOT_FOUND,
-                        _entity_not_found_hint(cur, entity_name, project),
+                        _entity_not_found_hint(graph, entity_name, project),
                         entity=entity_name, scope=_scope_key(project))
-        total, results = _traverse(
-            cur, project, entity_name, direction, relation_type, limit, offset)
-        # An edge optionally carries a sentence explaining *why* the two
-        # entities are connected. Traversal that returns only the label makes
-        # the agent guess; the sentence is already stored as a relation-context
-        # memory, so attach it to the edge it belongs to.
-        for result in results:
-            sentence = _edge_context(
-                cur, project, result["from_entity"], result["to_entity"],
-                result["relation"])
-            if sentence:
-                result["context"] = sentence
+        total = page["total"]
+        results = page["results"]
         db.commit()
     except Exception as e:
         db.rollback()
@@ -652,40 +429,13 @@ def list_relations(
     if offset < 0:
         return fail(STATUS_ERROR, "offset must be >= 0")
 
-    conditions: list[str] = []
-    params: list[Any] = []
-    if not all_scopes:
-        conditions.append("e1.project = %s")
-        params.append(_scope_key(project))
-    if entity:
-        conditions.append("(e1.name = %s OR e2.name = %s)")
-        params.extend([entity, entity])
-    if relation_type:
-        conditions.append("r.relation_type = %s")
-        params.append(relation_type)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    from_sql = (f"FROM relations r JOIN entities e1 ON e1.id = r.source_id "
-                f"JOIN entities e2 ON e2.id = r.target_id {where}")
-
     db = MemoryStore()
     try:
-        cur = db.cur
-        cur.execute(f"SELECT count(*) {from_sql}", params)
-        total = int(cur.fetchone()[0] or 0)
-        cur.execute(
-            f"SELECT e1.name, e2.name, r.relation_type, r.weight, e1.project "
-            f"{from_sql} "
-            f"ORDER BY coalesce(r.weight, 1.0) DESC, e1.name, e2.name, "
-            f"r.relation_type OFFSET %s LIMIT %s",
-            params + [offset, limit],
-        )
-        results = [{
-            "from_entity": row[0],
-            "to_entity": row[1],
-            "relation_type": row[2],
-            "weight": float(row[3] or 1.0),
-            "project": "global" if row[4] == "global" else row[4],
-        } for row in cur.fetchall()]
+        page = GraphStore(db).relation_page(
+            entity=entity, relation_type=relation_type, project=project,
+            limit=limit, offset=offset)
+        total = page["total"]
+        results = page["results"]
         db.commit()
     except Exception as e:
         db.rollback()
@@ -749,74 +499,28 @@ def find_paths(from_entity: Annotated[
             f"max_hops={max_hops} was clamped to 10: longer paths are not "
             "searched")
         max_hops = 10
-    label = _scope_label(project)
     db = MemoryStore()
     try:
-        cur = db.cur
-        scope = _scope_key(project)
-        known_entities = set(_entity_ids(cur, project))
-        missing = [name for name in (from_entity, to_entity)
-                   if name not in known_entities]
-        if missing:
+        graph = GraphStore(db)
+        found = graph.paths(from_entity, to_entity, project, max_hops)
+        if found["missing"]:
+            missing = found["missing"][0]
             db.rollback()
             return fail(STATUS_NOT_FOUND,
-                        _entity_not_found_hint(cur, missing[0], project),
-                        entity=missing[0], scope=scope)
+                        _entity_not_found_hint(graph, missing, project),
+                        entity=missing, scope=found["scope"])
         if from_entity == to_entity:
-            row = _entity_row(cur, project, from_entity)
             db.rollback()
-            return ok(STATUS_OK, count=1, warnings=warnings, results=[{
-                "nodes": [{"id": row[0] if row else None, "name": from_entity,
-                           "label": label}],
-                "relations": [], "hops": 0}])
-        rows = _graph_paths(cur, project, from_entity, to_entity, max_hops)
+            return ok(STATUS_OK, count=1, warnings=warnings,
+                      results=found["results"])
+        paths = found["results"]
+        scope = found["scope"]
         db.commit()
     except Exception as e:
         db.rollback()
         return fail(STATUS_ERROR, str(e))
     finally:
         db.close()
-    paths = []
-    seen_paths: set[tuple] = set()
-    db = MemoryStore()
-    entity_ids: dict[str, int] = {}
-    try:
-        cur = db.cur
-        entity_ids = _entity_ids(cur, project)
-    finally:
-        db.close()
-    for r in rows:
-        nodes_str = str(r[0]).replace("::vertex", "").replace("::edge", "")
-        rels_str = str(r[1]).replace("::vertex", "").replace("::edge", "")
-        try:
-            parsed = json.loads(nodes_str)
-            parsed_rels = json.loads(rels_str)
-        except json.JSONDecodeError:
-            continue
-        names = [n.get("properties", {}).get("name", "?") for n in parsed]
-        ids = [n.get("id") for n in parsed]
-        if len(names) != len(set(names)):
-            continue
-        signature = tuple(ids)
-        if signature in seen_paths:
-            continue
-        seen_paths.add(signature)
-        nodes = [{"id": entity_ids.get(names[i]), "name": names[i],
-                  "label": parsed[i].get("label")}
-                 for i in range(len(names))]
-        relations = []
-        for rel in parsed_rels:
-            props = rel.get("properties", {})
-            start = rel.get("start_id", rel.get("start"))
-            end = rel.get("end_id", rel.get("end"))
-            relations.append({
-                "type": rel.get("label"),
-                "from": names[ids.index(start)] if start in ids else start,
-                "to": names[ids.index(end)] if end in ids else end,
-                "weight": props.get("weight", 1.0),
-            })
-        paths.append({"nodes": nodes, "relations": relations,
-                      "hops": len(nodes) - 1})
     if paths:
         shortest_hops = min(path["hops"] for path in paths)
         paths = [path for path in paths if path["hops"] == shortest_hops]

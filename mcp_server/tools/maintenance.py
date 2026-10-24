@@ -1,16 +1,36 @@
 import json
 import logging
 import os
-import re
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
-from mcp_server.config import RERANK_ENABLED, RERANK_MODEL, SENTINEL_FORGOTTEN
+from mcp_server.config import (
+    RERANK_ENABLED,
+    RERANK_MODEL,
+    SENTINEL_FORGOTTEN,
+    _env_float,
+    _env_int,
+)
+from mcp_server.contradiction_scan import (
+    ContradictionScan,
+    ScanLoadError,
+    ScanRequest,
+    apply_resolution,
+)
 from mcp_server.store import MemoryStore
-from mcp_server.duplicates import shared_content_word as _shares_subject
+from mcp_server import store_maintenance
+from mcp_server.store_maintenance import (
+    clear_supersede,
+    expired_active_count,
+    mirror_counts,
+    prune_rows,
+    supersede_links,
+)
+from mcp_server.duplicates import (  # noqa: F401 - re-exported for tests
+    shared_content_word as _shares_subject,
+)
 from mcp_server.envelope import (
     STATUS_ERROR,
     STATUS_NOT_FOUND,
@@ -19,88 +39,20 @@ from mcp_server.envelope import (
     ok,
 )
 from mcp_server.inference_gateway import health_details, nli_detailed
-from mcp_server.lifecycle import ACTIVE_ROW_SQL, counts as lifecycle_counts
-from mcp_server.scopes import (
+from mcp_server.lifecycle import counts as lifecycle_counts
+from mcp_server.scope_catalog import (
     _all_mem_tables,
     _mem_table,
     _norm_project,
     _project_names,
     _project_suffix,
-    _retrieval_tables,
     _scope_of_table,
     _table_exists,
 )
-from mcp_server.search import SearchRequest, _search_memories
 from mcp_server.storage import clear_dangling_supersede
 from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
-
-# `partial_error` of the /nli endpoint:
-# "NLI unavailable for <failed> of <total> document(s): <reason>"
-_NLI_PARTIAL_RE = re.compile(
-    r"NLI unavailable for (?P<failed>\d+) of (?P<total>\d+) document\(s\): "
-    r"(?P<reason>.*)", re.DOTALL)
-
-
-def _aggregate_nli_partials(partials: list[str]) -> str | None:
-    """Fold per-call partial-error messages into one summary line.
-
-    Each /nli call reports its own failures ("1 of 16", "1 of 15", ...), so a
-    scope-wide scan can collect several nearly identical warnings. The
-    aggregated line keeps the failures per distinct reason countable; messages
-    that do not match the endpoint format are kept verbatim (deduplicated).
-    """
-    failed_by_reason: dict[str, int] = {}
-    total_docs = 0
-    for partial in partials:
-        match = _NLI_PARTIAL_RE.fullmatch(partial)
-        if not match:
-            return None
-        reason = match.group("reason").strip()
-        failed = int(match.group("failed"))
-        total_docs += int(match.group("total"))
-        failed_by_reason[reason] = failed_by_reason.get(reason, 0) + failed
-    total_failed = sum(failed_by_reason.values())
-    parts = [f"{count} document(s): {reason}"
-             for reason, count in failed_by_reason.items()]
-    return (f"NLI unavailable for {total_failed} of {total_docs} "
-            f"document(s) in total: " + " | ".join(parts))
-
-
-def _append_partial_warning(warnings: list[str], partials: list[str]) -> None:
-    """Append one aggregated (or, as fallback, the raw deduped) warnings."""
-    if not partials:
-        return
-    summary = _aggregate_nli_partials(partials)
-    if summary is not None:
-        warnings.append(
-            f"scan partially incomplete: {summary}; the gaps are not a "
-            f"clean contradiction scan")
-    else:
-        warnings.extend(
-            f"scan partially incomplete: {p}"
-            for p in dict.fromkeys(partials))
-
-
-def _partial_reason(partial: str | None) -> str | None:
-    """The reason inside a /nli partial_error, without the counts."""
-    if not partial:
-        return None
-    match = _NLI_PARTIAL_RE.fullmatch(partial)
-    return match.group("reason").strip() if match else partial
-
-
-def _entities_differ(a: str | None, b: str | None) -> bool:
-    """True when two memories are tagged with different entities.
-
-    Both untagged counts as the same subject; one tagged and one untagged
-    counts as different, because a recency-based resolution between them is
-    as unsafe as between two differently tagged memories.
-    """
-    if a is None or b is None:
-        return a is not b
-    return a.strip().lower() != b.strip().lower()
 
 
 # A scope-wide scan performs one NLI call per candidate fact; without a
@@ -111,22 +63,6 @@ def _entities_differ(a: str | None, b: str | None) -> bool:
 DEFAULT_SCAN_BUDGET_SECONDS = 40.0
 DEFAULT_NEIGHBORS_PER_FACT = 6
 DEFAULT_NLI_WORKERS = 6
-
-
-def _env_float(name: str, default: float, low: float, high: float) -> float:
-    try:
-        value = float(os.environ.get(name, ""))
-    except (TypeError, ValueError):
-        return default
-    return max(low, min(value, high))
-
-
-def _env_int(name: str, default: int, low: int, high: int) -> int:
-    try:
-        value = int(os.environ.get(name, ""))
-    except (TypeError, ValueError):
-        return default
-    return max(low, min(value, high))
 
 
 def _scan_budget_seconds(budget_seconds: float | None) -> float:
@@ -239,512 +175,69 @@ def contradictions_report(entity: Annotated[
         return ok(STATUS_OK, count=0, results=[], warnings=[
             "contradiction check skipped: NLI provider is not configured"
         ], nli_configured=False)
+
     db = MemoryStore()
-    candidates: dict[str, tuple[dict, list[tuple[str, str]]]] = {}
+    scan = ContradictionScan(nli_detailed)
     try:
-        cur = db.cur
-        # Only active memories are seeds: already superseded pairs are resolved
-        # and must not be reported again. Every type is a candidate - a
-        # decision that contradicts a pattern is a conflict too.
-        facts = _search_memories(cur, SearchRequest(
-            query_embedding=None,
-            query_text=None,
-            entity=entity,
-            limit=200,
+        report = scan.scan(ScanRequest(
+            db=db,
             project=project,
-            include_embedding=True,
-            include_superseded=False,
+            entity=entity,
+            limit=limit,
+            budget_seconds=_scan_budget_seconds(budget_seconds),
+            neighbors_per_fact=_neighbors_per_fact(),
+            workers=_nli_workers(),
         ))
-        if entity is None and len(facts) < 2:
-            # Only a scope-wide scan can bail early: with an entity a single
-            # seed still competes against untagged neighbours of the scope,
-            # and a tagged/untagged conflict must stay visible.
-            db.commit()
-            return ok(STATUS_OK, count=0, results=[], warnings=[
-                "nothing to compare: the scope has "
-                f"{len(facts)} active memory/memories - a contradiction needs "
-                f"at least two"
-            ])
-
-        tables = _retrieval_tables(cur, project)
-        if entity is not None and len(facts) < 2:
-            # The seeds alone are not comparable, but the scope may still hold
-            # untagged neighbours: only bail when the scope has no other row
-            # to compare against at all.
-            scope_active = 0
-            for table in tables:
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {table} "
-                    "WHERE embedding IS NOT NULL AND " + ACTIVE_ROW_SQL)
-                scope_active += cur.fetchone()[0]
-            if scope_active < 2:
-                db.commit()
-                return ok(STATUS_OK, count=0, results=[], warnings=[
-                    f"nothing to compare: the scope has "
-                    f"{scope_active} active memory/memories - a contradiction "
-                    f"needs at least two"
-                ])
-
-        neighbors_per_fact = _neighbors_per_fact()
-        # fact id -> list of (neighbour id, neighbour content)
-        checked: set[tuple[str, str]] = set()
-        fact_ids = {f["id"] for f in facts}
-        # The self-join only sees the entity when one was given: a
-        # scope-wide scan must be able to report pairs across entities.
-        # With an entity, untagged neighbours stay in the candidate pool:
-        # a fact stored without an entity can conflict with the entity's
-        # facts, and an entity-scoped scan that hid such a pair would make
-        # the report look clean while the conflict is still active.
-        if entity:
-            entity_sql = "AND (entity = %s OR entity IS NULL)"
-            entity_params: list[Any] = [entity]
-        else:
-            entity_sql = ""
-            entity_params = []
-
-        for f in facts:
-            if not f.get("embedding"):
-                continue
-            if len(candidates) >= limit:
-                break
-            found: list[tuple[str, str]] = []
-            for table in tables:
-                # Identical content is not a contradiction, but the same fact
-                # may live in the project and in the global scope.
-                if f.get("content_hash"):
-                    filter_sql = "AND content_hash <> %s"
-                    filter_params: list[Any] = [f["content_hash"]]
-                else:
-                    filter_sql = "AND content <> %s"
-                    filter_params = [f["content"]]
-                cur.execute(
-                    "SELECT id, content, entity, "
-                    f"(embedding <=> %s::vector) AS distance FROM {table} "
-                    f"WHERE id != %s {entity_sql} "
-                    f"{filter_sql} "
-                    "AND embedding IS NOT NULL "
-                    "AND " + ACTIVE_ROW_SQL + " "
-                    "ORDER BY distance ASC LIMIT %s",
-                    [f["embedding"], f["id"]] + entity_params + filter_params
-                    + [neighbors_per_fact],
-                )
-                for nid, ncontent, nentity, ndistance in cur.fetchall():
-                    # Seeds are the entity's memories; an untagged neighbour
-                    # is not in `fact_ids` but is a valid counterpart.
-                    if nid not in fact_ids and nentity is not None:
-                        continue
-                    pair = tuple(sorted([f["id"], nid]))
-                    if pair not in checked:
-                        checked.add(pair)
-                        found.append((nid, ncontent, nentity,
-                                      float(ndistance)))
-            if found:
-                # Judge the most similar pairs first: a budget cut must hit
-                # the least suspicious groups, not the near-identical ones
-                # that are most likely to be a real contradiction.
-                found.sort(key=lambda item: item[3])
-                candidates[f["id"]] = (f, found)
-
-        db.commit()
-    except Exception:
+    except ScanLoadError:
         logger.exception("contradictions_report scan failed")
         db.rollback()
-        return fail(STATUS_ERROR, "query failed")
-    finally:
         db.close()
+        return fail(STATUS_ERROR, "query failed")
 
-    contradictions: list[dict] = []
-    warnings: list[str] = []
-    # Machine-readable account of the pairs NLI did NOT judge: one entry per
-    # fact whose call failed (all its neighbours) and one per fact whose call
-    # failed only for some documents (partial answer). The aggregated warning
-    # above stays the human-readable summary.
-    nli_failures: list[dict] = []
-    nli_failed: str | None = None
-    checked_pairs = 0
-    skipped_fact_ids: set[str] = set()
-    try:
-        candidate_list = list(candidates.values())
-        candidate_list.sort(key=lambda item: item[1][0][3])
-        budget = _scan_budget_seconds(budget_seconds)
-        deadline = time.monotonic() + budget
-        # Cap one HTTP request below the whole budget: a single slow provider
-        # reply must not consume it all, so the pool can still judge other
-        # facts before the deadline.
-        request_cap = max(1.0, min(15.0, budget))
-
-        def _score_fact(item: tuple[dict, list[tuple[str, str]]]):
-            fact, neighbours = item
-            # One LLM call per fact instead of one per pair. The entity
-            # labels let the NLI model judge whether both facts describe the
-            # same subject - a differing port of two different services is
-            # not a contradiction.
-            return nli_detailed(
-                fact["content"], [n[1] for n in neighbours],
-                query_entity=fact.get("entity"),
-                document_entities=[n[2] for n in neighbours],
-                timeout=request_cap,
-                deadline=deadline,
-            )
-
-        # NLI is a network round trip per fact. A small bounded pool overlaps
-        # the calls, but only within `budget`: the results are consumed in
-        # candidate order and the scan stops as soon as the deadline passes.
-        scores_by_fact: dict[str, tuple[list[float], str | None, list[int]]] = {}
-        nli_errors: list[tuple[str, str]] = []
-        nli_error_facts: dict[str, list[str]] = {}
-        partials: list[str] = []
-        if candidate_list:
-            workers = min(_nli_workers(), len(candidate_list))
-            in_flight: dict[Any, tuple[dict, list[tuple[str, str]]]] = {}
-            next_index = 0
-
-            def _submit_until_full(pool: ThreadPoolExecutor) -> None:
-                nonlocal next_index
-                while (len(in_flight) < workers
-                       and next_index < len(candidate_list)
-                       and time.monotonic() < deadline):
-                    item = candidate_list[next_index]
-                    next_index += 1
-                    in_flight[pool.submit(_score_fact, item)] = item
-
-            pool = ThreadPoolExecutor(max_workers=workers)
-            try:
-                _submit_until_full(pool)
-                while in_flight:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    done, _ = wait(
-                        list(in_flight), timeout=remaining,
-                        return_when=FIRST_COMPLETED)
-                    if not done:
-                        break
-                    for future in done:
-                        item = in_flight.pop(future)
-                        try:
-                            scores_by_fact[item[0]["id"]] = future.result()
-                        except TimeoutError:
-                            skipped_fact_ids.add(item[0]["id"])
-                        except Exception as e:  # noqa: BLE001 - reported below
-                            nli_errors.append((item[0]["id"], str(e)))
-                            nli_error_facts[item[0]["id"]] = [
-                                n[0] for n in item[1]]
-                    _submit_until_full(pool)
-
-                # Deadline reached: do not wait for the requests still in
-                # flight (one may hold the socket for up to `request_cap`).
-                # They are abandoned and recorded instead of silently
-                # disappearing; the response returns inside the budget.
-                for future, item in list(in_flight.items()):
-                    future.cancel()
-                    skipped_fact_ids.add(item[0]["id"])
-                in_flight.clear()
-                for item in candidate_list[next_index:]:
-                    skipped_fact_ids.add(item[0]["id"])
-            finally:
-                pool.shutdown(wait=False, cancel_futures=True)
-
-            if skipped_fact_ids:
-                logger.warning(
-                    "contradictions_report stopped after %.1fs: %d of %d "
-                    "candidate group(s) were not judged",
-                    budget, len(skipped_fact_ids), len(candidate_list))
-
-        # One targeted second pass. The provider occasionally fails a single
-        # document inside an otherwise successful batch (truncated JSON,
-        # transient 5xx); retrying only those documents recovers most of them
-        # instead of reporting a permanently "partial" scan. It stays inside
-        # the same deadline.
-        for fact, neighbours in candidate_list:
-            if fact["id"] in skipped_fact_ids:
-                continue
-            if time.monotonic() >= deadline:
-                if fact["id"] not in scores_by_fact:
-                    skipped_fact_ids.add(fact["id"])
-                continue
-            scored = scores_by_fact.get(fact["id"])
-            if scored is None:
-                indices = list(range(len(neighbours)))
-            else:
-                _scores, _partial, indices = scored
-            if not indices:
-                continue
-            try:
-                retry_scores, retry_partial, retry_failed = nli_detailed(
-                    fact["content"], [neighbours[i][1] for i in indices],
-                    query_entity=fact.get("entity"),
-                    document_entities=[neighbours[i][2] for i in indices],
-                    timeout=request_cap,
-                    deadline=deadline,
-                )
-            except TimeoutError:
-                if fact["id"] not in scores_by_fact:
-                    skipped_fact_ids.add(fact["id"])
-                continue
-            except Exception as e:  # noqa: BLE001 - first-pass error wins
-                logger.warning("contradictions_report NLI retry failed: %s", e)
-                continue
-            if scored is None:
-                merged = [0.0] * len(neighbours)
-            else:
-                merged = list(scored[0])
-            for position, index in enumerate(indices):
-                merged[index] = retry_scores[position]
-            still_failed = [indices[position]
-                            for position in retry_failed
-                            if 0 <= position < len(indices)]
-            scores_by_fact[fact["id"]] = (merged, retry_partial, still_failed)
-        # A fact that the retry healed is not a failure anymore.
-        nli_errors = [(fact_id, error) for fact_id, error in nli_errors
-                      if fact_id not in scores_by_fact
-                      and fact_id not in skipped_fact_ids]
-        if nli_errors:
-            nli_failed = f"NLI unavailable: {nli_errors[0][1]}"
-            warnings.append(
-                f"scan incomplete: {nli_failed} - the result is not a clean "
-                f"contradiction scan; retry later")
-            logger.warning("contradictions_report NLI failed: %s",
-                           nli_errors[0][1])
-            for fact_id, error in nli_errors:
-                nli_failures.append({
-                    "fact_id": fact_id,
-                    "neighbor_ids": nli_error_facts.get(fact_id, []),
-                    "reason": error})
-        if skipped_fact_ids:
-            warnings.append(
-                f"scan incomplete: the NLI time budget of {budget:.1f}s was "
-                f"exhausted before {len(skipped_fact_ids)} of "
-                f"{len(candidate_list)} candidate fact group(s) could be "
-                f"judged; the unchecked pairs are listed in `nli_failures` "
-                f"(reason 'skipped: NLI time budget exhausted'). Narrow the "
-                f"scan with entity=..., lower limit or raise budget_seconds "
-                f"to check more")
-
-        for f, neighbours in candidate_list:
-            scored = scores_by_fact.get(f["id"])
-            if scored is None:
-                # This fact's NLI call failed or was skipped: its pairs were
-                # not judged. Reported independently of `limit`, so a
-                # truncated contradiction list never hides an unchecked pair.
-                if f["id"] in skipped_fact_ids:
-                    nli_failures.append({
-                        "fact_id": f["id"],
-                        "neighbor_ids": [n[0] for n in neighbours],
-                        "reason": "skipped: NLI time budget exhausted"})
-                continue
-            checked_pairs += len(neighbours) - len(scored[2])
-
-        for f, neighbours in candidate_list:
-            if len(contradictions) >= limit:
-                break
-            scored = scores_by_fact.get(f["id"])
-            if scored is None:
-                continue
-            scores, partial, failed_indices = scored
-            if partial:
-                # Collected here, aggregated into ONE warning after the
-                # loop: a scope-wide check makes one /nli call per fact, and
-                # three identical partial lines are harder to read than a
-                # qualifying summary.
-                partials.append(partial)
-            if failed_indices:
-                nli_failures.append({
-                    "fact_id": f["id"],
-                    "neighbor_ids": [neighbours[i][0] for i in failed_indices
-                                     if 0 <= i < len(neighbours)],
-                    "reason": _partial_reason(partial) or "NLI unavailable"})
-            for (nid, ncontent, nentity, _distance), score in zip(
-                    neighbours, scores):
-                if len(contradictions) >= limit:
-                    break
-                if score > 0.7:
-                    contradictions.append({
-                        "a": {"id": f["id"], "content": f["content"],
-                              "entity": f.get("entity")},
-                        "b": {"id": nid, "content": ncontent,
-                              "entity": nentity},
-                        # Same entity (or both untagged) -> a recency-based
-                        # resolution is meaningful. Different entities ->
-                        # two different subjects, resolve="newest" must not
-                        # pick a winner (see the resolve block below).
-                        "cross_entity": _entities_differ(
-                            f.get("entity"), nentity),
-                        "confidence": round(score, 3),
-                    })
-        _append_partial_warning(warnings, partials)
-    except Exception as e:
-        # An NLI outage must not crash the tool outside the envelope: the
-        # pairs seen so far stay in the result, the rest is skipped loudly.
-        nli_failed = f"NLI unavailable: {e}"
-        warnings.append(
-            f"scan incomplete: {nli_failed} - the result is not a clean "
-            f"contradiction scan; retry later")
-        logger.warning("contradictions_report NLI failed: %s", e)
-
-    contradictions = contradictions[:limit]
-
-    # An empty result must say *why* it is empty: nothing to compare, no
-    # similar pair, or no contradiction among the pairs that were checked.
-    if not contradictions and not warnings:
-        scope_desc = (f"active memories of {entity!r}"
-                      if entity else "active memories of the scope")
-        if not candidates:
-            warnings.append(
-                f"no candidate pairs: no two {scope_desc} "
-                f"are similar enough to be worth comparing")
-        else:
-            warnings.append(
-                f"no contradictions found: {checked_pairs} similar pair(s) of "
-                f"{scope_desc} were checked with NLI")
-
+    contradictions = report.pairs
+    warnings = list(report.warnings)
     resolved = 0
     would_resolve = 0
-    if resolve == "newest" and contradictions:
-        resolvable: list[dict] = []
-        skipped_cross = 0
-        skipped_subject = 0
-        skipped_weak = 0
-        for pair in contradictions:
-            if pair.get("cross_entity"):
-                skipped_cross += 1
-                continue
-            if pair.get("confidence", 0.0) < resolve_min_confidence:
-                skipped_weak += 1
-                continue
-            if not _shares_subject(pair["a"]["content"],
-                                   pair["b"]["content"]):
-                # A noisy NLI hit between unrelated statements must never
-                # invalidate a good memory (a version fact was once
-                # superseded as a "contradiction" of a deploy note).
-                skipped_subject += 1
-                continue
-            resolvable.append(pair)
-        if skipped_cross:
-            warnings.append(
-                f"resolve skipped for {skipped_cross} cross-entity pair(s): "
-                f"the two facts belong to different entities, so recency does "
-                f"not decide which one survives - inspect them manually or "
-                f"re-run with an entity filter")
-        if skipped_subject:
-            warnings.append(
-                f"resolve skipped for {skipped_subject} pair(s) without a "
-                f"shared content word: the NLI score alone is not enough "
-                f"evidence that both facts describe the same thing; inspect "
-                f"them manually")
-        if skipped_weak:
-            warnings.append(
-                f"resolve skipped for {skipped_weak} pair(s) below "
-                f"resolve_min_confidence={resolve_min_confidence}: they are "
-                f"reported but not acted on")
-        if resolvable:
-            db = MemoryStore()
-            try:
-                cur = db.cur
-                tables = _retrieval_tables(cur, project)
-                # Decide every pair before the first write. The UPDATE bumps
-                # `updated_at` of the superseded row, so re-reading timestamps
-                # between pairs would flip its recency and make the same dry
-                # run and real run disagree.
-                plan: list[tuple[dict, str, str]] = []
-                for pair in resolvable:
-                    a_id, b_id = pair["a"]["id"], pair["b"]["id"]
-                    timestamps = {}
-                    for mem_id in (a_id, b_id):
-                        for table in tables:
-                            cur.execute(
-                                f"SELECT created_at, updated_at FROM {table} "
-                                "WHERE id = %s",
-                                (mem_id,),
-                            )
-                            row = cur.fetchone()
-                            if row:
-                                # "Newest" is the time the fact was created,
-                                # not the last time it was touched: a decay
-                                # refresh must not decide which side of a
-                                # contradiction survives.
-                                timestamps[mem_id] = row[0] or row[1]
-                                break
-                    a_ts = timestamps.get(a_id)
-                    b_ts = timestamps.get(b_id)
-                    keep_a = a_ts is not None and (b_ts is None or a_ts >= b_ts)
-                    older, newer = (b_id, a_id) if keep_a else (a_id, b_id)
-                    plan.append((pair, older, newer))
-
-                # A memory can appear as the older side of several pairs (one
-                # fact conflicts with two neighbours). The real UPDATE then
-                # changes the first resolution only; the dry run has to count
-                # the same way instead of promising more fixes than a real
-                # call performs.
-                invalidated: set[str] = set()
-                for pair, older, newer in plan:
-                    if older in invalidated:
-                        pair["resolution"] = {
-                            "superseded": older, "kept": newer,
-                            **({"dry_run": True} if dry_run else {}),
-                            "skipped": "already superseded by an earlier "
-                                       "pair in this run",
-                        }
-                        continue
-                    if dry_run:
-                        # Report the decision without writing it: the caller
-                        # sees exactly what a real run would invalidate.
-                        would_resolve += 1
-                        invalidated.add(older)
-                        pair["resolution"] = {
-                            "superseded": older, "kept": newer,
-                            "dry_run": True,
-                        }
-                        continue
-                    changed = 0
-                    for table in tables:
-                        cur.execute(
-                            f"UPDATE {table} SET superseded_by = %s, "
-                            "updated_at = NOW() WHERE id = %s "
-                            f"AND superseded_by IS NULL AND deleted_at IS NULL",
-                            (newer, older),
-                        )
-                        changed += cur.rowcount
-                    if changed:
-                        resolved += 1
-                        invalidated.add(older)
-                        pair["resolution"] = {"superseded": older, "kept": newer}
-                    else:
-                        pair["resolution"] = {
-                            "superseded": older, "kept": newer,
-                            "skipped": "already superseded by an earlier "
-                                       "pair in this run",
-                        }
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                logger.exception("contradictions_report resolve failed")
-                warnings.append(f"resolve failed: {e}")
-            finally:
-                db.close()
+    plan = scan.plan_resolution(
+        report, resolve=resolve, min_confidence=resolve_min_confidence,
+        dry_run=dry_run)
+    warnings.extend(plan.warnings)
+    if plan.decisions:
+        try:
+            resolved, would_resolve = apply_resolution(plan, db, project)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.exception("contradictions_report resolve failed")
+            warnings.append(f"resolve failed: {e}")
+        finally:
+            db.close()
+    else:
+        db.commit()
+        db.close()
 
     result: dict[str, Any] = {"count": len(contradictions),
                               "results": contradictions,
                               "resolved": resolved,
-                              "checked_pairs": checked_pairs,
-                              "budget_exhausted": bool(skipped_fact_ids),
+                              "checked_pairs": report.scanned,
+                              "budget_exhausted": report.budget_exhausted,
                               "elapsed_seconds": round(
                                   time.monotonic() - started_at, 2),
                               "warnings": warnings}
     if resolve == "newest" and dry_run:
         result["would_resolve"] = would_resolve
         result["dry_run"] = True
-    if nli_failures:
+    if report.failures:
         # Which pairs were NOT judged, per fact. A stale inference container
         # that does not send `failed_indices` leaves this empty; the
         # aggregated warning still names the incomplete scan then.
         # The per-neighbour list is intentionally complete (an agent may need
         # to retry exactly those ids), but the compact summary lets a caller
         # see the scale without reading every entry.
-        result["nli_failures"] = nli_failures
-        result["nli_failures_count"] = len(nli_failures)
+        result["nli_failures"] = report.failures
+        result["nli_failures_count"] = len(report.failures)
         summary: dict[str, int] = {}
-        for failure in nli_failures:
+        for failure in report.failures:
             reason = str(failure.get("reason") or "unknown")
             summary[reason] = summary.get(reason, 0) + 1
         result["nli_failure_summary"] = summary
@@ -812,10 +305,7 @@ def verify_integrity(
             # only the selected one. The scan returns the full state; the
             # fix branch re-runs it so the report describes the state AFTER
             # the fix, not a stale pre-fix picture.
-            all_ids: set[str] = set()
-            for table in all_tables:
-                cur.execute(f"SELECT id FROM {table}")
-                all_ids |= {row[0] for row in cur.fetchall()}
+            all_ids = store_maintenance.all_ids(db, all_tables)
 
             details: list[dict[str, Any]] = []
             dangling: list[tuple[str, str, str]] = []
@@ -827,11 +317,7 @@ def verify_integrity(
                 scope = ("global" if table == "memories"
                          else names.get(table[len("mem_"):],
                                         table[len("mem_"):]))
-                cur.execute(
-                    f"SELECT id, superseded_by, entity, content FROM {table} "
-                    f"WHERE superseded_by IS NOT NULL "
-                    "AND superseded_by <> %s", (SENTINEL_FORGOTTEN,))
-                for mid, sup, entity, content in cur.fetchall():
+                for mid, sup, entity, content in supersede_links(db, table):
                     total += 1
                     links[mid] = sup
                     link_rows[mid] = (scope, entity, content)
@@ -879,20 +365,14 @@ def verify_integrity(
         details, dangling, self_refs, links, link_rows, total = _scan()
         expired_active = 0
         for table in tables:
-            cur.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE superseded_by IS NULL "
-                f"AND deleted_at IS NULL AND expires_at IS NOT NULL "
-                f"AND expires_at <= NOW()")
-            expired_active += cur.fetchone()[0]
+            expired_active += expired_active_count(db, table)
         chains = _chain_details(links, link_rows, details)
 
         fixed = 0
         if fix and (dangling or self_refs):
             bad = [(table, mid) for table, mid, _ in dangling + self_refs]
             for table, mid in bad:
-                cur.execute(
-                    f"UPDATE {table} SET superseded_by = NULL WHERE id = %s",
-                    (mid,))
+                clear_supersede(db, table, mid)
                 fixed += 1
             db.commit()
             # Re-scan after the fix: the response keys
@@ -1037,14 +517,8 @@ def prune_memories(
         for table in tables:
             if not _table_exists(cur, table):
                 continue
-            if dry_run:
-                cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}",
-                            tuple(params))
-                removed = cur.fetchone()[0]
-            else:
-                cur.execute(f"DELETE FROM {table} WHERE {where}",
-                            tuple(params))
-                removed = cur.rowcount
+            removed = prune_rows(db, table, where, tuple(params),
+                                 dry_run=dry_run)
             if removed:
                 scope = _scope_of_table(cur, table)
                 counts[scope] = counts.get(scope, 0) + removed
@@ -1086,8 +560,7 @@ def server_health() -> dict[str, Any]:
     pg_ok = False
     try:
         db = MemoryStore()
-        cur = db.cur
-        cur.execute("SELECT 1")
+        db.ping()
         pg_ok = True
         db.commit()
         db.close()
@@ -1136,14 +609,8 @@ def stats_resource() -> str:
             active += table_counts["active"]
             superseded += table_counts["superseded"]
             forgotten += table_counts["forgotten"]
-        cur.execute("""
-            SELECT
-                (SELECT COUNT(*) FROM entities),
-                (SELECT COUNT(*) FROM relations)
-        """)
-        row = cur.fetchone()
+        entities, relations = mirror_counts(db)
         db.commit()
-        entities, relations = row if row else (0, 0)
     except Exception:
         return json.dumps({"error": "unavailable"})
     finally:

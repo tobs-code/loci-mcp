@@ -13,11 +13,8 @@ from mcp_server.graph import (
     relate_batch,
     unrelate,
 )
-from mcp_server.graph_store import (
-    delete_duplicate_edge,
-    duplicate_edge_groups,
-)
-from mcp_server.scopes import _migrate_fts_indexes
+from mcp_server.graph_store import GraphStore
+from mcp_server.schema_migrator import migrate_fts_indexes
 from mcp_server.tools.maintenance import (
     contradictions_report,
     prune_memories,
@@ -125,7 +122,7 @@ def main() -> None:
 
     # Full-text indexes must use the configured dictionary; rebuild stale ones.
     try:
-        rebuilt = _migrate_fts_indexes()
+        rebuilt = migrate_fts_indexes()
         if rebuilt:
             logger.info("Rebuilt %s full-text index(es) for the current dictionary",
                         rebuilt)
@@ -163,11 +160,12 @@ def main() -> None:
     try:
         conn = get_conn()
         cur = conn.cursor()
-        dup_rows = duplicate_edge_groups(cur)
+        graph = GraphStore(cur=cur)
+        dup_rows = graph.duplicate_groups()
         for src, tgt, rel_type, cnt in dup_rows:
             for _ in range(int(str(cnt)) - 1):
-                delete_duplicate_edge(
-                    cur, str(src).strip('"'), str(tgt).strip('"'),
+                graph.delete_duplicate(
+                    str(src).strip('"'), str(tgt).strip('"'),
                     str(rel_type).strip('"'))
         conn.commit()
         conn.close()

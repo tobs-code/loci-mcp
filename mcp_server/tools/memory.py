@@ -31,11 +31,7 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
-from mcp_server.graph_store import (
-    delete_entity_everywhere,
-    delete_node,
-    delete_scope_nodes,
-)
+from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
     is_expired as _is_past,
@@ -43,13 +39,12 @@ from mcp_server.lifecycle import (
 from mcp_server.lifecycle import (
     parse_expires_at,
 )
-from mcp_server.scopes import (
+from mcp_server.scope_catalog import (
     _all_mem_tables,
     _mem_table,
     _memory_scopes,
     _norm_entity,
     _norm_project,
-    _scope_key,
     _scope_of_table,
     _table_exists,
 )
@@ -60,6 +55,17 @@ from mcp_server.storage import (
     clear_dangling_supersede,
 )
 from mcp_server.store import MemoryStore
+from mcp_server.store_updates import (
+    active_table as active_table_for,
+    apply_fields,
+    count_entity_rows_incl_context,
+    forget_entity_rows,
+    forget_relation_context_rows,
+    lifecycle_row,
+    restore_rows,
+    stored_entity,
+    stored_metadata,
+)
 from mcp_server.write_pipeline import (
     WriteIntent,
     _coerce_metadata,
@@ -168,7 +174,7 @@ def _sanitize_batch_fact(value: Any) -> Any:
 BatchFactInput = Annotated[BatchFact, BeforeValidator(_sanitize_batch_fact)]
 
 
-def _hidden_state_reason(cur, memory_id: str,
+def _hidden_state_reason(db: MemoryStore, memory_id: str,
                          tables: list[str]) -> str | None:
     """Why an existing row cannot be updated or touched.
 
@@ -176,30 +182,28 @@ def _hidden_state_reason(cur, memory_id: str,
     forgotten or expired - the caller then keeps looking for the wrong
     problem. This returns the actionable reason, or None for an unknown id.
     """
-    for table in tables:
-        cur.execute(
-            f"SELECT superseded_by, deleted_at, expires_at FROM {table} "
-            "WHERE id = %s", (memory_id,))
-        row = cur.fetchone()
-        if not row:
-            continue
-        superseded_by, deleted_at, expires_at = row
-        reasons: list[str] = []
-        if deleted_at is not None:
-            reasons.append(
-                "soft-forgotten (pass restore=true to update_memory to bring "
-                "it back)")
-        if (superseded_by is not None
-                and superseded_by != SENTINEL_FORGOTTEN):
-            reasons.append(
-                f"superseded by {superseded_by} (history only; read it with "
-                f"include_superseded=true)")
-        if _is_past(expires_at):
-            reasons.append(
-                "expired (TTL passed; set clear_expires_at=true or a future "
-                "expires_at)")
-        return "; ".join(reasons) if reasons else None
-    return None
+    found = lifecycle_row(db, memory_id, tables)
+    if found is None:
+        return None
+    _, row = found
+    superseded_by = row.get("superseded_by")
+    deleted_at = row.get("deleted_at")
+    expires_at = row.get("expires_at")
+    reasons: list[str] = []
+    if deleted_at is not None:
+        reasons.append(
+            "soft-forgotten (pass restore=true to update_memory to bring "
+            "it back)")
+    if (superseded_by is not None
+            and superseded_by != SENTINEL_FORGOTTEN):
+        reasons.append(
+            f"superseded by {superseded_by} (history only; read it with "
+            f"include_superseded=true)")
+    if _is_past(expires_at):
+        reasons.append(
+            "expired (TTL passed; set clear_expires_at=true or a future "
+            "expires_at)")
+    return "; ".join(reasons) if reasons else None
 
 
 class BatchUpdate(BaseModel):
@@ -1037,7 +1041,7 @@ def remember_batch(
     return ok(status, count=len(results), succeeded=succeeded,
               failed=len(failed), results=results, warnings=warnings)
 
-def _restore_blocked_reason(cur, memory_id: str,
+def _restore_blocked_reason(db: MemoryStore, memory_id: str,
                             tables: list[str]) -> tuple[str, str] | None:
     """Status and reason for an existing row that cannot be restored.
 
@@ -1046,32 +1050,29 @@ def _restore_blocked_reason(cur, memory_id: str,
     `not_found`. A superseded history row is a conflict too - a restore never
     undoes a supersede.
     """
-    for table in tables:
-        cur.execute(
-            f"SELECT deleted_at, superseded_by FROM {table} WHERE id = %s",
-            (memory_id,))
-        row = cur.fetchone()
-        if not row:
-            continue
-        deleted_at, superseded_by = row
-        if deleted_at is None:
-            if superseded_by is not None \
-                    and superseded_by != SENTINEL_FORGOTTEN:
-                return (
-                    STATUS_CONFLICT,
-                    f"memory {memory_id} exists but is not soft-forgotten: "
-                    f"it is superseded by {superseded_by}, and a restore "
-                    f"does not undo a supersede (read it with "
-                    f"include_superseded=true)")
+    found = lifecycle_row(db, memory_id, tables)
+    if found is None:
+        return None
+    _, row = found
+    deleted_at = row.get("deleted_at")
+    superseded_by = row.get("superseded_by")
+    if deleted_at is None:
+        if superseded_by is not None \
+                and superseded_by != SENTINEL_FORGOTTEN:
             return (
                 STATUS_CONFLICT,
-                f"memory {memory_id} exists but is not soft-forgotten (it "
-                f"is active); there is nothing to restore")
+                f"memory {memory_id} exists but is not soft-forgotten: "
+                f"it is superseded by {superseded_by}, and a restore "
+                f"does not undo a supersede (read it with "
+                f"include_superseded=true)")
         return (
             STATUS_CONFLICT,
-            f"memory {memory_id} exists but its deleted_at is not a "
-            f"restorable soft delete")
-    return None
+            f"memory {memory_id} exists but is not soft-forgotten (it "
+            f"is active); there is nothing to restore")
+    return (
+        STATUS_CONFLICT,
+        f"memory {memory_id} exists but its deleted_at is not a "
+        f"restorable soft delete")
 
 
 def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
@@ -1113,7 +1114,7 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                 break
         db.commit()
         if not restored:
-            blocked = _restore_blocked_reason(cur, memory_id, tables)
+            blocked = _restore_blocked_reason(db, memory_id, tables)
             if blocked:
                 status, reason = blocked
                 return fail(status, reason, id=memory_id)
@@ -1335,19 +1336,10 @@ def update_memory(
         # Locate the memory BEFORE the "nothing to update" check: an unknown
         # id must answer NOT FOUND even when no field was passed, otherwise
         # the validation message suggests the id was seen and is valid.
-        active_table = None
-        active_sql = ("id = %s AND superseded_by IS NULL "
-                      "AND deleted_at IS NULL")
-        if not revive_expired:
-            active_sql += " AND (expires_at IS NULL OR expires_at > NOW())"
-        for table in tables:
-            cur.execute(f"SELECT 1 FROM {table} WHERE {active_sql}",
-                        (memory_id,))
-            if cur.fetchone():
-                active_table = table
-                break
+        active_table = active_table_for(
+            db, memory_id, tables, revive_expired=revive_expired)
         if active_table is None:
-            reason = _hidden_state_reason(cur, memory_id, tables)
+            reason = _hidden_state_reason(db, memory_id, tables)
             db.rollback()
             if reason:
                 return fail(
@@ -1359,19 +1351,7 @@ def update_memory(
             # Metadata merge and key removal need the stored object. This is
             # the only field that is computed from the existing row; the
             # caller's new keys win, missing ones survive in 'merge' mode.
-            cur.execute(
-                f"SELECT metadata FROM {active_table} WHERE id = %s",
-                (memory_id,))
-            row = cur.fetchone()
-            current: dict[str, Any] = {}
-            if row and row[0] is not None:
-                try:
-                    raw = (row[0] if isinstance(row[0], dict)
-                           else json.loads(row[0]))
-                except (TypeError, ValueError):
-                    raw = {}
-                if isinstance(raw, dict):
-                    current = raw
+            current = stored_metadata(db, active_table, memory_id)
             if metadata_mode == "merge" or metadata_value is None:
                 # Key removal without a new object edits the stored object;
                 # starting from {} would silently wipe every other key.
@@ -1399,10 +1379,7 @@ def update_memory(
         # near-duplicate warning needs the entity the updated row will have.
         near_entity = entity
         if near_entity is None:
-            cur.execute(f"SELECT entity FROM {active_table} WHERE id = %s",
-                        (memory_id,))
-            row = cur.fetchone()
-            near_entity = row[0] if row else None
+            near_entity = stored_entity(db, active_table, memory_id)
         near_dup = None
         if content is not None and dedupe != "off":
             # An edit must not fork a fact either: `remember` already refuses
@@ -1433,12 +1410,7 @@ def update_memory(
         near_conflict = bool(
             near_dup
             and _content_conflict(content or "", near_dup.get("content") or ""))
-        cur.execute(
-            f"UPDATE {active_table} SET {', '.join(sets)} "
-            "WHERE id = %s AND superseded_by IS NULL AND deleted_at IS NULL",
-            params + [memory_id],
-        )
-        if not cur.rowcount:
+        if not apply_fields(db, active_table, memory_id, sets, params):
             db.rollback()
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
                         id=memory_id)
@@ -1670,13 +1642,13 @@ def update_batch(
             memory_id = spec["memory_id"]
             entry_project = spec["project"]
             savepoint = f"update_{i}"
-            cur.execute(f"SAVEPOINT {savepoint}")
+            db.open_savepoint(savepoint)
             try:
                 if spec.get("restore"):
                     if entry_project:
                         restore_tables = [_mem_table(entry_project)]
                         if not _table_exists(cur, restore_tables[0]):
-                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            db.rollback_to(savepoint)
                             results.append({
                                 "id": memory_id, "status": "not_found",
                                 "error": f"NOT FOUND: {memory_id}"})
@@ -1684,7 +1656,7 @@ def update_batch(
                     else:
                         scopes = _memory_scopes(cur, memory_id)
                         if len(scopes) > 1:
-                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            db.rollback_to(savepoint)
                             results.append({
                                 "id": memory_id, "status": "error",
                                 "error": (f"ambiguous memory id {memory_id}: "
@@ -1694,23 +1666,12 @@ def update_batch(
                                 "scopes": scopes})
                             continue
                         restore_tables = _all_mem_tables(cur)
-                    restored = 0
-                    restored_table = None
-                    for table in restore_tables:
-                        cur.execute(
-                            f"UPDATE {table} SET deleted_at = NULL, "
-                            f"superseded_by = NULLIF(superseded_by, %s), "
-                            f"updated_at = NOW() WHERE id = %s "
-                            f"AND deleted_at IS NOT NULL",
-                            (SENTINEL_FORGOTTEN, memory_id))
-                        if cur.rowcount:
-                            restored = cur.rowcount
-                            restored_table = table
-                            break
+                    restored_table, restored = restore_rows(
+                        db, memory_id, restore_tables)
                     if not restored:
                         blocked = _restore_blocked_reason(
-                            cur, memory_id, restore_tables)
-                        cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            db, memory_id, restore_tables)
+                        db.rollback_to(savepoint)
                         results.append({
                             "id": memory_id,
                             "status": blocked[0] if blocked else "not_found",
@@ -1718,7 +1679,7 @@ def update_batch(
                                       else f"NOT FOUND: {memory_id}")})
                         continue
                     scope = _scope_of_table(cur, restored_table)
-                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    db.release(savepoint)
                     results.append({"id": memory_id,
                                     "status": STATUS_RESTORED,
                                     "project": scope})
@@ -1747,7 +1708,7 @@ def update_batch(
                 else:
                     scopes = _memory_scopes(cur, memory_id)
                     if len(scopes) > 1:
-                        cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        db.rollback_to(savepoint)
                         results.append({
                             "id": memory_id, "status": "error",
                             "error": (f"ambiguous memory id {memory_id}: it "
@@ -1763,21 +1724,11 @@ def update_batch(
                     "expires_at" in entry_fields
                     and (entry_fields["expires_at"] is None
                          or not _is_past(entry_fields["expires_at"])))
-                active_table = None
-                active_sql = ("id = %s AND superseded_by IS NULL "
-                              "AND deleted_at IS NULL")
-                if not revive_expired:
-                    active_sql += (" AND (expires_at IS NULL "
-                                   "OR expires_at > NOW())")
-                for table in tables:
-                    cur.execute(f"SELECT 1 FROM {table} WHERE {active_sql}",
-                                (memory_id,))
-                    if cur.fetchone():
-                        active_table = table
-                        break
+                active_table = active_table_for(
+                    db, memory_id, tables, revive_expired=revive_expired)
                 if active_table is None:
-                    reason = _hidden_state_reason(cur, memory_id, tables)
-                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    reason = _hidden_state_reason(db, memory_id, tables)
+                    db.rollback_to(savepoint)
                     error = (f"memory {memory_id} exists but cannot be "
                              f"updated: {reason}" if reason
                              else f"NOT FOUND: {memory_id}")
@@ -1789,19 +1740,7 @@ def update_batch(
                 scope = _scope_of_table(cur, active_table)
                 if spec["metadata_mode"] == "merge" \
                         or spec["clear_metadata_keys"]:
-                    cur.execute(
-                        f"SELECT metadata FROM {active_table} WHERE id = %s",
-                        (memory_id,))
-                    row = cur.fetchone()
-                    current: dict[str, Any] = {}
-                    if row and row[0] is not None:
-                        try:
-                            raw = (row[0] if isinstance(row[0], dict)
-                                   else json.loads(row[0]))
-                        except (TypeError, ValueError):
-                            raw = {}
-                        if isinstance(raw, dict):
-                            current = raw
+                    current = stored_metadata(db, active_table, memory_id)
                     new_meta = spec["fields"].get("metadata")
                     if spec["metadata_mode"] == "merge" or new_meta is None:
                         merged = dict(current)
@@ -1814,11 +1753,7 @@ def update_batch(
                     params.append(json.dumps(merged))
                 near_entity = spec["fields"].get("entity")
                 if near_entity is None:
-                    cur.execute(
-                        f"SELECT entity FROM {active_table} WHERE id = %s",
-                        (memory_id,))
-                    row = cur.fetchone()
-                    near_entity = row[0] if row else None
+                    near_entity = stored_entity(db, active_table, memory_id)
                 near_dup = None
                 if ("content" in spec["fields"]
                         and spec.get("dedupe") != "off"):
@@ -1833,7 +1768,7 @@ def update_batch(
                         detail = ("exact content hash" if dup_mode == "exact"
                                   else f"semantic match (similarity "
                                        f"{dup_similarity})")
-                        cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        db.release(savepoint)
                         results.append({
                             "id": dup_id, "memory_id": memory_id,
                             "status": "duplicate",
@@ -1854,19 +1789,15 @@ def update_batch(
                     and _content_conflict(
                         spec["fields"].get("content") or "",
                         near_dup.get("content") or ""))
-                cur.execute(
-                    f"UPDATE {active_table} SET {', '.join(sets)} "
-                    "WHERE id = %s AND superseded_by IS NULL "
-                    "AND deleted_at IS NULL",
-                    params + [memory_id])
-                if not cur.rowcount:
-                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                if not apply_fields(db, active_table, memory_id, sets,
+                                    params):
+                    db.rollback_to(savepoint)
                     results.append({"id": memory_id, "status": "not_found",
                                     "error": f"NOT FOUND: {memory_id}"})
                     continue
-                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                db.release(savepoint)
             except Exception as exc:
-                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                db.rollback_to(savepoint)
                 results.append({"id": memory_id, "status": "error",
                                 "error": str(exc)})
                 continue
@@ -2037,7 +1968,7 @@ def forget(
             if not soft and not dry_run:
                 clear_dangling_supersede(cur)
         if entity_name:
-            scope = _scope_key(project)
+            graph = GraphStore(cur=cur)
             if purge_all:
                 # A whole scope goes: its memories, its graph nodes and the
                 # entity/relation mirror rows of that scope.
@@ -2052,18 +1983,11 @@ def forget(
                     counts["memories"] += removed
                     counts["active_memories"] = table_counts["active"]
                     counts["already_forgotten"] = table_counts["forgotten"]
-                cur.execute("SELECT COUNT(*) FROM entities WHERE project = %s",
-                            (scope,))
-                counts["entities"] = cur.fetchone()[0]
-                cur.execute(
-                    "SELECT COUNT(*) FROM relations WHERE source_id IN "
-                    "(SELECT id FROM entities WHERE project = %s) OR target_id IN "
-                    "(SELECT id FROM entities WHERE project = %s)",
-                    (scope, scope),
-                )
-                counts["relations"] = cur.fetchone()[0]
+                mirror = graph.scope_counts(project)
+                counts["entities"] = mirror["entities"]
+                counts["relations"] = mirror["relations"]
                 if not dry_run:
-                    delete_scope_nodes(cur, project)
+                    graph.delete_scope_nodes(project)
                 if dry_run:
                     db.rollback()
                 else:
@@ -2091,35 +2015,12 @@ def forget(
             # project the entity is removed from *every* scope, so the preview
             # has to count every scope as well. Otherwise `dry_run` reports
             # "NOT FOUND" for a graph node that the real call deletes.
-            scope_clause = " AND project = %s" if project else ""
-            scope_args: tuple[Any, ...] = ((entity_name, scope) if project
-                                            else (entity_name,))
-            cur.execute(
-                f"SELECT id, project FROM entities WHERE name = %s{scope_clause}",
-                scope_args,
-            )
-            entity_rows = cur.fetchall()
-            entity_ids = [r[0] for r in entity_rows]
-            counts["entities"] = len(entity_ids)
-            affected_scopes: list[str] = []
-            for row in entity_rows:
-                scope_hit = row[1] or "global"
-                if scope_hit not in affected_scopes:
-                    affected_scopes.append(scope_hit)
-            if entity_ids:
-                cur.execute(
-                    "SELECT COUNT(*) FROM relations "
-                    "WHERE source_id = ANY(%s) OR target_id = ANY(%s)",
-                    (entity_ids, entity_ids),
-                )
-                relation_count = cur.fetchone()
-                counts["relations"] = relation_count[0] if relation_count else 0
-            if project:
-                if not dry_run:
-                    delete_node(cur, project, entity_name)
-            else:
-                if not dry_run:
-                    delete_entity_everywhere(cur, entity_name)
+            preview = graph.entity_delete_preview(entity_name, project)
+            counts["entities"] = preview["entities"]
+            counts["relations"] = preview["relations"]
+            affected_scopes = preview["scopes"]
+            if not dry_run:
+                graph.delete_entity(entity_name, project)
 
             # Only the selected scope's memories: forgetting an entity in one
             # project must not wipe the global facts of the same entity.
@@ -2129,50 +2030,10 @@ def forget(
                 if not _table_exists(cur, tbl):
                     continue
                 memories_before = counts["memories"]
-                if dry_run:
-                    # A soft forget hides the active rows, a hard delete also
-                    # takes the superseded and forgotten ones: the preview
-                    # counts exactly what the real call removes.
-                    where = (" AND deleted_at IS NULL" if soft else "")
-                    cur.execute(f"SELECT COUNT(*) FROM {tbl} "
-                                f"WHERE entity = %s{where}",
-                                (entity_name,))
-                    counts["memories"] += cur.fetchone()[0]
-                elif soft:
-                    cur.execute(f"UPDATE {tbl} SET "
-                                f"superseded_by = COALESCE(superseded_by, %s), "
-                                f"deleted_at = NOW() "
-                                f"WHERE entity = %s AND deleted_at IS NULL",
-                                (SENTINEL_FORGOTTEN, entity_name))
-                    counts["memories"] += cur.rowcount
-                else:
-                    cur.execute(f"DELETE FROM {tbl} WHERE entity = %s", (entity_name,))
-                    counts["memories"] += cur.rowcount
-                relation_context_filter = (
-                    "metadata->>'relation_context' = 'true' "
-                    "AND (metadata->>'from' = %s OR metadata->>'to' = %s)"
-                )
-                if dry_run:
-                    where = (" AND deleted_at IS NULL" if soft else "")
-                    cur.execute(f"SELECT COUNT(*) FROM {tbl} "
-                                f"WHERE {relation_context_filter}{where}",
-                                (entity_name, entity_name))
-                    counts["memories"] += cur.fetchone()[0]
-
-                elif soft:
-                    cur.execute(
-                        f"UPDATE {tbl} SET superseded_by = COALESCE(superseded_by, %s), "
-                        f"deleted_at = NOW() "
-                        f"WHERE deleted_at IS NULL AND {relation_context_filter}",
-                        (SENTINEL_FORGOTTEN, entity_name, entity_name),
-                    )
-                    counts["memories"] += cur.rowcount
-                else:
-                    cur.execute(
-                        f"DELETE FROM {tbl} WHERE {relation_context_filter}",
-                        (entity_name, entity_name),
-                    )
-                    counts["memories"] += cur.rowcount
+                counts["memories"] += forget_entity_rows(
+                    db, tbl, entity_name, soft=soft, dry_run=dry_run)
+                counts["memories"] += forget_relation_context_rows(
+                    db, tbl, entity_name, soft=soft, dry_run=dry_run)
                 if counts["memories"] != memories_before:
                     # Only scopes that actually lost (or would lose) rows are
                     # affected. Reporting every searched scope made a plain
@@ -2191,12 +2052,8 @@ def forget(
                     for tbl in dict.fromkeys(tables):
                         if not _table_exists(cur, tbl):
                             continue
-                        cur.execute(
-                            f"SELECT COUNT(*) FROM {tbl} WHERE entity = %s "
-                            f"OR (metadata->>'relation_context' = 'true' AND "
-                            f"(metadata->>'from' = %s OR metadata->>'to' = %s))",
-                            (entity_name, entity_name, entity_name))
-                        hidden += cur.fetchone()[0]
+                        hidden += count_entity_rows_incl_context(
+                            db, tbl, entity_name)
                 if hidden:
                     db.rollback()
                     return ok(
