@@ -124,11 +124,20 @@ against the two-approvals fact scores **0.325**: the 0.40 floor silently
 dropped the correct answer. Callers that want the old strictness can pass
 `min_similarity=0.4` explicitly.
 
+`min_relevance` (0..1, optional) is the floor on the **combined**
+`_relevance_score` (vector similarity + full-text rank + scope boost). It
+trims an online agent's result window server-side: instead of fetching 10 hits
+hoping to keep the top 3, pass `min_relevance=0.6` and get only the hits that
+actually answer the query. It has its own `dropped_by_relevance` counter and
+empty-result reason; graph-only hits carry no relevance score and are never
+dropped by it.
+
 `recall` reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed) and
 `dropped_by_coverage` (the number of full-text hits the coverage filter
-removed). `dropped_by_decay` and `dropped_by_superseded` are reported
-whenever the `min_decay_score` / `only_superseded` filter removed hits — also
+removed). `dropped_by_relevance`, `dropped_by_decay` and
+`dropped_by_superseded` are reported whenever the `min_relevance` /
+`min_decay_score` / `only_superseded` filter removed hits — also
 when other hits survived, so a non-empty result is never quietly short. When
 the result is empty, the warning names **every** filter that removed
 something, so the caller does not have to guess which one was responsible.

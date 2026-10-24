@@ -2029,7 +2029,9 @@ def forget(
 
     A `memory_id` is unique per scope, not globally: if the same id exists in
     several scopes (an import copies the id), the call is refused and the
-    scopes are named - pass `project` to say which one to remove.
+    scopes are named - pass `project` to say which one to remove. An explicit
+    `project` (including "global") restricts the removal to that one table:
+    copies of the id that live in other scopes are never touched.
 
     `memory_ids` accepts a list of ids to remove in one call. Bulk operations
     are more efficient than multiple single calls. Each id is validated
@@ -2075,9 +2077,16 @@ def forget(
     bulk_results: list[dict] = []
     try:
         cur = db.cur
+        # An explicit scope (a project name, or the reserved "global" that
+        # _norm_project maps to None) must narrow the lookup to that one
+        # table. A plain `if not project` test widened project="global" to
+        # every scope and removed copies in unrelated projects.
+        limited_tables = None
+        if explicit_scope:
+            limited_tables = [_mem_table(project)]
         if memory_ids:
             # Bulk forget: process multiple memory ids in one call
-            tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
+            tables = limited_tables or _all_mem_tables(cur)
             if project and not _table_exists(cur, tables[0]):
                 return fail(STATUS_NOT_FOUND, "NOT FOUND: project table does not exist")
             
@@ -2117,11 +2126,11 @@ def forget(
                       message=f"{'Would remove' if dry_run else ('Soft-forgotten' if soft else 'Deleted')} "
                               f"{counts['memories']} memory/memories from {len(memory_ids)} id(s)")
         if memory_id:
-            tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
+            tables = limited_tables or _all_mem_tables(cur)
             if project and not _table_exists(cur, tables[0]):
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
             scopes = db.scopes_of(memory_id)
-            if not project and len(scopes) > 1:
+            if not explicit_scope and len(scopes) > 1:
                 # The same id can live in several scopes (an import copies
                 # the id). Removing it from all of them at once would
                 # delete more than the caller asked for.

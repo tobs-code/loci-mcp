@@ -75,7 +75,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `contradiction_mode` | enum | `supersede` (default: replace the contradicted memory) or `warn` (report the pair in `contradictions.kept` and change nothing). |
 | `contradiction_min_confidence` | number | Minimum NLI confidence (0.0-1.0, default 0.70) for an automatic supersede. Lower-scored pairs stay active and are reported. |
 | `max_contradiction_supersedes` | int | Maximum number of memories one write may invalidate (default 1). Further confirmed pairs stay active, are listed in `contradictions.kept` and named in a warning, so a single write cannot wipe several facts unconfirmed. |
-| `links` | list? | Graph edges to create in the same write: `[{to_entity, relation_type, weight?, context?, from_entity?}]`; `from_entity` defaults to `entity`. Malformed links are an argument error before the write; a failing edge rolls back to a savepoint, warns (`links failed: ...`) and keeps the fact. Each edge is reported in `links` (`status: created`/`updated`/`duplicate`). |
+| `links` | list? | Graph edges to create in the same write: `[{to_entity, relation_type, weight?, context?, from_entity?}]`; `from_entity` defaults to `entity`; unknown fields inside an edge object are refused. Malformed links are an argument error before the write; a failing edge rolls back to a savepoint, warns (`links failed: ...`) and keeps the fact. Each edge is reported in `links` (`status: created`/`updated`/`duplicate`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
 | `on_near_duplicate` | enum | Action for a reworded copy of an active memory (near-duplicate, similarity >= 0.75): `warn` (default, store and warn), `supersede` (replace it, list it in `superseded`) or `reject` (`duplicate`, nothing stored). Works under `dedupe="off"` when the policy is not `warn`. **Same-entity guard:** when the matched memory belongs to a different entity, the policy is not applied (the fact is stored and a `near-duplicate across entities` warning names both entities). A high vector similarity alone never deletes another subject's fact. If the content differs in a number or a negation, the warning calls it a **possible contradiction**; `supersede` additionally warns to verify it was an intended update (`check_contradictions=true` gives an NLI verdict). When the write already carried `supersede`/`supersede_content` and the fact still did not replace that near-dup match, the warning appends a reconciliation note naming the directive, so a caller never assumes its instruction did not exist. |
 | `auto_supersede_near_duplicate` | bool | Backwards-compatible alias for `on_near_duplicate="supersede"`. |
@@ -194,7 +194,10 @@ mutually exclusive.
   the single-id form refuses an ambiguous id unless `project` selects one
   scope. With `dry_run=true` the entries say `would_soft_forget` /
   `would_delete` instead of the real outcome, so a preview cannot be mistaken
-  for a completed delete.
+  for a completed delete. An explicit `project` — including the reserved
+  `"global"` — bounds the removal to that one table: copies of the id in other
+  scopes are neither removed nor counted, and the single-id form is no longer
+  ambiguous.
 - `entity="*"` plus `project` empties a whole scope; `project` is required for
   that, so a stray call cannot wipe the database. The shared scope is
   addressed with `project="global"`.
@@ -214,10 +217,10 @@ mutually exclusive.
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
-| `recall_batch` | Run 1-25 independent searches in one call; `queries`, shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `fields`, `detail`; each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `min_relevance`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
+| `recall_batch` | Run 1-25 independent searches in one call; `queries`, shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `fields`, `detail`; each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `memory_ids` (bulk direct lookup, max 200; `missing` and a warning, mutually exclusive with `memory_id`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
-| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total` and `relation_context_count` |
+| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total` and `relation_context_count`; an unknown project is named in `warnings` like `recall` |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; an unknown `entity_type` is an argument error that names the labels present; synthetic `<from>_<relation>_<to>` entities are hidden |
 | `list_projects` | Discover every scope; `include_empty` (default true), `include_counts` (default true); each row carries `project`, `scope`, `has_table`, `has_graph` and, with counts, the memory/entity/relation counts (without counts those keys are omitted) |
 | `init_context` | Session bootstrap: recent memories (slim, near-duplicates removed, each with its `project`), counters, `projects`/`project_stats` for every scope, graph entity count, health; `detail="slim"\|"full"`, `include_global`, `include_empty_projects`; `project="*"` lists every scope; without a project it warns about the other scopes |
@@ -233,6 +236,7 @@ The search tool. `query` is required and non-empty.
 | `limit` | int | Maximum number of results (default 10). |
 | `hybrid` | bool | True (default) fuses vector and full-text results (RRF). False uses a single retriever. |
 | `min_similarity` | number? | Drop vector hits below this cosine similarity (0..1, default 0.30, just above the model's 0.288 noise floor). `null` disables the filter. |
+| `min_relevance` | number? | Drop query hits below this combined `_relevance_score` (0..1, the blend of vector similarity and full-text rank). Graph-only hits carry no relevance score and are never dropped. `null` (default) applies no floor. |
 | `include_decay` | bool | Blend recency/access into the score (max 30% of it). |
 | `min_decay_score` | number? | Keep only memories with at least this normalized decay score (0..1). |
 | `include_superseded` | bool | Also return superseded memories (history). |
@@ -260,14 +264,16 @@ The answer reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
 `dropped_by_coverage` (the number of full-text hits that covered too little of
 the query), plus `fulltext_only` when a hit came only from the full-text leg.
-`dropped_by_decay` and `dropped_by_superseded` are reported whenever the
-`min_decay_score` / `only_superseded` filter removed hits — also when other
+`dropped_by_relevance`, `dropped_by_decay` and `dropped_by_superseded` are
+reported whenever the `min_relevance` / `min_decay_score` / `only_superseded`
+filter removed hits — also when other
 hits survived, so a non-empty result is never quietly short.
 `scopes_searched` names the scopes the query actually covered. See
 [Retrieval](retrieval.md) for the score fields.
 
 An empty result names every filter that removed something (`min_similarity`,
-`min_decay_score`, `only_superseded`, the coverage floor) - not just the first
+`min_relevance`, `min_decay_score`, `only_superseded`, the coverage floor) -
+not just the first
 one, so the caller does not debug the wrong filter. The strongest rejected
 vector hit is additionally reported as `best_dropped_by_similarity`
 (`id`, `similarity`, `scope`, `content_preview`) and named in the warning, so
@@ -290,7 +296,7 @@ Run up to 25 independent `recall` searches in one call. A multi-intent turn
 ("how do we deploy and where are the logs?") otherwise forces the agent either
 to concatenate both intents into one diluted embedding or to make several
 round trips. The shared options (`project`, `include_global`, `limit`,
-`offset`, `hybrid`, `min_similarity`, decay/history/TTL flags,
+`offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags,
 `graph_boost`/`entity`, `mem_type`, `fields`, `detail`) apply to every query;
 `results` contains one entry per query with its own `query`, `count`,
 `results`, filter counters, `warnings` and `scopes_searched`. An empty list is

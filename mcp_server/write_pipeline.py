@@ -484,6 +484,9 @@ def _get_field(link: dict, key: str) -> Any:
     return link.get(key)
 
 
+LINK_FIELDS = ("from_entity", "to_entity", "relation_type", "weight", "context")
+
+
 def _validate_links(links: Any, default_entity: str | None) -> list[str]:
     """Validate `remember(links=[...])` before anything is stored.
 
@@ -502,6 +505,15 @@ def _validate_links(links: Any, default_entity: str | None) -> list[str]:
         if not isinstance(link, dict):
             errors.append(f"links[{i}] must be an object")
             continue
+        unknown = sorted(set(link.keys()) - set(LINK_FIELDS))
+        if unknown:
+            # An unknown field would be silently ignored by _prepare_links,
+            # so the edge would differ from what the caller asked for
+            # without any sign.
+            errors.append(
+                f"links[{i}]: unknown field(s) "
+                f"{', '.join(repr(k) for k in unknown)}; accepted fields "
+                f"are: {', '.join(sorted(LINK_FIELDS))}")
         to_entity = _norm_str(_get_field(link, "to_entity"))
         from_entity = _norm_str(_get_field(link, "from_entity"))
         if not to_entity:

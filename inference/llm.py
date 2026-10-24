@@ -278,6 +278,18 @@ def _bare_label_object(text: str) -> dict | None:
     return None
 
 
+def _relaxed_json_loads(text: str):
+    """json.loads that also tolerates trailing commas and control chars.
+
+    Both are harmless in LLM replies: a trailing comma before `}` or `]` is
+    a formatting slip, and raw newlines inside a JSON string (deepseek's
+    invalid literal break was the same class of failure) must not lose an
+    otherwise complete judgment. Anything structural still raises.
+    """
+    cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+    return json.loads(cleaned, strict=False)
+
+
 def parse_nli_json(raw: str | None) -> dict | None:
     if not raw:
         return None
@@ -286,14 +298,14 @@ def parse_nli_json(raw: str | None) -> dict | None:
         text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
     try:
-        parsed = json.loads(text)
+        parsed = _relaxed_json_loads(text)
     except json.JSONDecodeError:
         parsed = None
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
             try:
-                parsed = json.loads(text[start:end + 1])
+                parsed = _relaxed_json_loads(text[start:end + 1])
             except json.JSONDecodeError:
                 parsed = None
     if isinstance(parsed, dict):

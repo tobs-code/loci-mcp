@@ -218,6 +218,14 @@ def recall(
                           "dropped by this filter: an exact keyword match "
                           "survives even when the embedding model scores it "
                           "low. Use null to disable the filter.")] = DEFAULT_MIN_SIMILARITY,
+    min_relevance: Annotated[
+        float | None,
+        Field(description="Drop query hits below this combined "
+                          "`_relevance_score` (0.0-1.0), the blend of vector "
+                          "similarity and full-text rank. Graph-boost-only "
+                          "hits carry no relevance score and are never "
+                          "dropped by this filter. Null (default) keeps every "
+                          "hit that passed the similarity floor.")] = None,
     fields: Annotated[
         list[str] | None,
         Field(description="Only return these columns, e.g. ['id', 'content']. "
@@ -341,6 +349,8 @@ def recall(
         return fail(STATUS_ERROR, "query must not be empty")
     if min_similarity is not None and not 0.0 <= min_similarity <= 1.0:
         return fail(STATUS_ERROR, "min_similarity must be between 0.0 and 1.0")
+    if min_relevance is not None and not 0.0 <= min_relevance <= 1.0:
+        return fail(STATUS_ERROR, "min_relevance must be between 0.0 and 1.0")
     fields_error = validate_fields(fields)
     if fields_error:
         return fail(STATUS_ERROR, fields_error)
@@ -455,6 +465,25 @@ def recall(
                     dropped_by_decay += 1
             results = kept
 
+        dropped_by_relevance = 0
+        if min_relevance is not None:
+            kept = []
+            for r in results:
+                if not isinstance(r, dict) or "error" in r:
+                    kept.append(r)
+                    continue
+                relevance = r.get("_relevance_score")
+                if relevance is None:
+                    # Graph-boost-only hits carry no relevance score: the
+                    # filter cannot judge them and must not drop them.
+                    kept.append(r)
+                    continue
+                if relevance >= min_relevance - 1e-6:
+                    kept.append(r)
+                else:
+                    dropped_by_relevance += 1
+            results = kept
+
         dropped_by_superseded = 0
         if only_superseded:
             kept = []
@@ -529,6 +558,10 @@ def recall(
             reasons.append(
                 f"{dropped_by_decay} hit(s) were below "
                 f"min_decay_score={min_decay_score}")
+        if dropped_by_relevance:
+            reasons.append(
+                f"{dropped_by_relevance} hit(s) were below "
+                f"min_relevance={min_relevance}")
         if dropped_by_superseded:
             reasons.append(
                 f"{dropped_by_superseded} hit(s) were not superseded "
@@ -627,6 +660,8 @@ def recall(
     # from a non-empty result instead of silently getting fewer hits.
     if dropped_by_decay:
         payload["dropped_by_decay"] = dropped_by_decay
+    if dropped_by_relevance:
+        payload["dropped_by_relevance"] = dropped_by_relevance
     if dropped_by_superseded:
         payload["dropped_by_superseded"] = dropped_by_superseded
     if stats.get("fulltext_only"):
@@ -698,6 +733,13 @@ def recall_batch(
         float | None,
         Field(description="Vector similarity floor per query (default 0.30); "
                           "None disables it.")] = DEFAULT_MIN_SIMILARITY,
+    min_relevance: Annotated[
+        float | None,
+        Field(description="Drop hits below this combined `_relevance_score` "
+                          "(0.0-1.0), the blend of vector similarity and "
+                          "full-text rank. Graph-boost-only hits are never "
+                          "dropped by this filter. Null (default) applies no "
+                          "relevance floor.")] = None,
     include_decay: Annotated[
         bool,
         Field(description="Blend recency/access into the score.")] = False,
@@ -781,7 +823,8 @@ def recall_batch(
             include_decay=include_decay, include_superseded=include_superseded,
             include_deleted=include_deleted, include_expired=include_expired,
             graph_boost=graph_boost, include_global=include_global,
-            min_similarity=min_similarity, fields=fields, detail=detail,
+            min_similarity=min_similarity, min_relevance=min_relevance,
+            fields=fields, detail=detail,
             include_relation_context=include_relation_context)
         entry = {"index": index, "query": query, **call}
         if not call.get("ok"):
@@ -1323,6 +1366,9 @@ def get_entity(name: Annotated[
         cur = db.cur
         tables, scopes_searched = (tables_and_scopes(cur, scope, MODE_PROJECT)
                                    if project else (None, ["global"]))
+        # A scope that does not exist must not look like an empty scope:
+        # the lookup silently falls back to the global table.
+        unknown_scope = scope.unknown_warning(cur)
         used_tables = tables or ["memories"]
         # An entity name can exist in several scopes. The caller asked for one
         # lookup, so the answer has to say where else the name occurs instead
@@ -1407,6 +1453,9 @@ def get_entity(name: Annotated[
             "connections": [],
         }
     if entity_data is None and not memories:
+        # The fallback warning matters before the miss is explained: the
+        # caller must know the named scope never existed.
+        miss_warnings = [unknown_scope] if unknown_scope else []
         if found_elsewhere:
             return fail(
                 STATUS_NOT_FOUND,
@@ -1416,14 +1465,14 @@ def get_entity(name: Annotated[
                 f"with project=<name> for one of them)",
                 entity=target,
                 scopes_with_entity=found_elsewhere,
-                warnings=[
+                warnings=miss_warnings + [
                     f"entity {target!r} exists in the scope(s) "
                     f"{', '.join(sorted(found_elsewhere))} - repeat the call "
                     f"with project=<name> for one of them"
                 ],
             )
         return fail(STATUS_NOT_FOUND, f"entity not found: {target}",
-                    entity=target)
+                    entity=target, warnings=miss_warnings)
     if len(scope_presence) > 1:
         entity_data["scopes_with_entity"] = scope_presence
         detail_scope = entity_data.get("project") or "global"
@@ -1456,6 +1505,8 @@ def get_entity(name: Annotated[
         warnings.append(
             f"{expired_count} memory/memories of {target!r} have an expired "
             f"TTL: they are not active anymore")
+    if unknown_scope:
+        warnings.append(unknown_scope)
     return ok(STATUS_OK, entity=target, details=entity_data,
               memories=projected,
               total=paging.total, relation_context_count=relation_context_count,
