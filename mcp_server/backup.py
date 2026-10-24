@@ -12,11 +12,13 @@ from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import is_expired, parse_expires_at
 from mcp_server.scope_catalog import (
+    _all_mem_tables,
     _is_global_scope,
     _mem_table,
     _norm_project,
     _project_names,
     _project_tables,
+    _scope_of_table,
     _table_exists,
 )
 from mcp_server.schema_migrator import ensure_project_table
@@ -574,6 +576,10 @@ def import_memories(
     skipped_duplicate_content = 0
     skipped_empty_content = 0
     self_reference_repairs = 0
+    # `superseded_by` targets of successfully imported records, in order
+    # (link_table, record_id, target_id). The post-pass below decides for
+    # each link whether it is in-scope, cross-scope or dangling.
+    pending_links: list[tuple[str, str, str]] = []
     errors: list[str] = list(parse_errors)
     graph_entities = 0
     graph_entities_created = 0
@@ -711,6 +717,8 @@ def import_memories(
                 )
                 imported += 1
                 cur.execute("RELEASE SAVEPOINT import_record")
+                if superseded_by:
+                    pending_links.append((table, mid, superseded_by))
             except Exception as exc:
                 cur.execute("ROLLBACK TO SAVEPOINT import_record")
                 cur.execute("RELEASE SAVEPOINT import_record")
@@ -794,6 +802,42 @@ def import_memories(
                 graph_relations_created += sum(
                     1 for edge in restored if edge.get("status") == "created")
 
+        # A partial restore can leave a `superseded_by` link whose target was
+        # not imported into the link's own scope. Link validity is global: a
+        # legimitate cross-scope supersede (a project write that replaced a
+        # shared fact) keeps the target in another table, so such a link is
+        # NOT dangling and `clear_dangling_supersede` correctly keeps it -
+        # but the caller has to know that the target lives outside the
+        # restored scope, otherwise the kept link reads as a silent no-op.
+        # Read-only: also reported for a dry run. `cross_scope_links` keeps
+        # entries whose target lives in ANOTHER table (kept: valid cross-scope
+        # supersede); `lost_links` keeps entries whose target exists nowhere
+        # (cleared by the repair below; in a dry run only reported).
+        cross_scope_links: list[tuple[str, str, str, str]] = []
+        lost_links: list[tuple[str, str, str]] = []
+        if pending_links:
+            tables_list = _all_mem_tables(cur)
+            for link_table, mid, target in pending_links:
+                cur.execute(f"SELECT 1 FROM {link_table} WHERE id = %s",
+                            (target,))
+                if cur.fetchone():
+                    continue
+                home_table = None
+                for other in tables_list:
+                    if other == link_table:
+                        continue
+                    cur.execute(f"SELECT 1 FROM {other} WHERE id = %s",
+                                (target,))
+                    if cur.fetchone():
+                        home_table = other
+                        break
+                if home_table is None:
+                    lost_links.append((link_table, mid, target))
+                else:
+                    cross_scope_links.append(
+                        (link_table, mid, target,
+                         _scope_of_table(cur, home_table)))
+
         repaired_links = 0
         if dry_run:
             db.rollback()
@@ -819,6 +863,8 @@ def import_memories(
         result["would_create"] = imported
     elif repaired_links:
         result["repaired_superseded_links"] = repaired_links
+    if cross_scope_links:
+        result["cross_scope_supersede_links"] = len(cross_scope_links)
     if self_reference_repairs and not dry_run:
         result["repaired_self_references"] = self_reference_repairs
     if graph is not None:
@@ -881,6 +927,29 @@ def import_memories(
             f"{self_reference_repairs} record(s) carried a self-referencing "
             f"or internal `superseded_by` value; it was cleared so those "
             f"rows stay readable as history instead of being hidden")
+    if cross_scope_links:
+        # A kept link is not a failure - but a caller that restored one scope
+        # can only distinguish "target exists elsewhere" from "target lost"
+        # when the import names it.
+        mid, target, home = (cross_scope_links[0][1],
+                             cross_scope_links[0][2],
+                             cross_scope_links[0][3])
+        warnings.append(
+            f"{len(cross_scope_links)} imported record(s) keep a supersede "
+            f"link whose target lives in another scope (e.g. record "
+            f"{mid!r} keeps superseded_by {target!r}, which lives in scope "
+            f"{home!r}); cross-scope supersedes are valid, so the link "
+            "stays - if that scope is never restored, the rows remain "
+            "history-hidden and drop_project of the missing scope clears "
+            "the link")
+    if lost_links:
+        mid, target = lost_links[0][1], lost_links[0][2]
+        if dry_run:
+            warnings.append(
+                f"{len(lost_links)} record(s) carry a supersede link to a "
+                f"memory that is not stored anywhere (e.g. record "
+                f"{mid!r} -> {target!r}); the real import would clear that "
+                "link so those rows stay readable as history")
     if skipped_parts:
         warnings.append("import skipped: " + "; ".join(skipped_parts))
     return ok(STATUS_OK, warnings=warnings, **result)

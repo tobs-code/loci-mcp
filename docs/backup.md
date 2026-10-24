@@ -56,6 +56,14 @@ Records keep their `id`, TTL (`expires_at`), timestamps and `superseded_by`, so
 a re-import is idempotent and restores the exact state. A `superseded_by` link
 whose target is missing from the backup is cleared with a warning (otherwise the
 row would stay unreadable forever; `verify_integrity` reports the same case).
+A kept link whose target lives in ANOTHER scope (a valid cross-scope supersede
+that was not part of this import) is reported as `cross_scope_supersede_links`
+plus a warning naming record and scope: the link stays, but the restored rows
+are history-hidden inside this scope until that scope is imported too
+(`drop_project` of the missing scope clears the link then). A `dry_run` lists
+the links it found and warns when the real import would clear one (a target
+that exists nowhere), so a preview never looks cleaner than the import it
+describes.
 Project tables are recreated on
 demand, entities and relations are upserted with MERGE. `graph_entities` and
 `graph_relations` count the processed records; `graph_entities_created` and

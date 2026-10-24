@@ -223,6 +223,7 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
             metadata=meta,
             created_scope=created_scope,
             duplicate_detail=detail,
+            duplicate_of=existing_id,
             duplicate_supersede_warnings=extra_warnings,
             link_warnings=link_warnings,
             cross_scope_warning=cross_warning,

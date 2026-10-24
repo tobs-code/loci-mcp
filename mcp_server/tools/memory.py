@@ -619,6 +619,10 @@ def remember(
                 "similarity": outcome.similarity,
                 "scope": outcome.scope,
                 "project": outcome.project,
+                # The row that blocked the write. For an exact/near duplicate
+                # `id` already IS that row, but the explicit key keeps the
+                # batch entries and the single call symmetric.
+                "duplicate_of": outcome.duplicate_of,
             }
             if outcome.superseded:
                 payload["superseded"] = outcome.superseded
@@ -677,12 +681,16 @@ def remember(
             kept_ids = ", ".join(
                 c["existing_id"] for c in kept_contradictions[:5])
             mode = (outcome.contradictions or {}).get("mode", "supersede")
+            # Executable first: an agent copy-pastes supersede='<id>' into the
+            # next remember call; the report path stays as the alternative.
             warnings.append(
                 f"{len(kept_contradictions)} possible contradiction(s) were "
                 f"kept active (contradiction_mode={mode}): {kept_ids}"
                 + (" ..." if len(kept_contradictions) > 5 else "")
-                + "; verify them and resolve explicitly with "
-                  "contradictions_report(resolve='newest') or supersede=<id>")
+                + f"; verify them and resolve explicitly: supersede="
+                  f"'{kept_contradictions[0]['existing_id']}' (one supersede "
+                  "argument per kept id, or let contradictions_report"
+                  "(resolve='newest') decide same-entity pairs)")
         if not contradictions and not kept_contradictions \
                 and outcome.nli_unavailable:
             warnings.append("contradiction check skipped: NLI provider is not configured")
@@ -1229,9 +1237,10 @@ def remember_batch(
                 if kept:
                     entry["warnings"].append(
                         f"{len(kept)} possible contradiction(s) were kept "
-                        f"active; verify them and resolve explicitly with "
-                        f"contradictions_report(resolve='newest') or "
-                        f"supersede=<id>")
+                        f"active: verify them and resolve explicitly: "
+                        f"supersede='{kept[0]['existing_id']}' (one supersede "
+                        "argument per kept id, or let contradictions_report"
+                        "(resolve='newest') decide same-entity pairs)")
                 unjudged = entry["contradictions"].get("unjudged") or []
                 if unjudged:
                     unreason = (unjudged[0].get("reason")
