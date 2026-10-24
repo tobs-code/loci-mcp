@@ -181,6 +181,12 @@ RERANK_TRIGGER_SCORE = _env_float("RERANK_TRIGGER_SCORE", 0.85, 0.0, 1.0)
 RERANK_TRIGGER_MARGIN = _env_float("RERANK_TRIGGER_MARGIN", 0.10, 0.0, 1.0)
 RERANK_ALWAYS = _env_bool("RERANK_ALWAYS", False)
 RERANK_MAX_LENGTH = _env_int("RERANK_MAX_LENGTH", 256, 64, 512)
+# The cross-encoder logits are not calibrated probabilities: a clearly
+# relevant pair scores around -0.3 and an unrelated one around -5. A small
+# positive bias maps that observed "neutral" region to ~0.73, while strong
+# negatives stay low. It only caps confidence; it never raises a first-stage
+# relevance.
+RERANK_LOGIT_BIAS = _env_float("RERANK_LOGIT_BIAS", 1.0, -5.0, 5.0)
 
 
 # HTTP transports expose every tool, including the destructive maintenance

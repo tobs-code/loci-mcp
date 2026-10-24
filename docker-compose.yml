@@ -31,6 +31,7 @@ services:
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       LLM_PROVIDER: ${LLM_PROVIDER:-groq}
       LLM_MODEL: ${LLM_MODEL:-}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
@@ -78,6 +79,7 @@ services:
       RERANK_TRIGGER_SCORE: ${RERANK_TRIGGER_SCORE:-0.85}
       RERANK_TRIGGER_MARGIN: ${RERANK_TRIGGER_MARGIN:-0.10}
       RERANK_ALWAYS: ${RERANK_ALWAYS:-false}
+      RERANK_LOGIT_BIAS: ${RERANK_LOGIT_BIAS:-1.0}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost', 8766), timeout=5); s.close()\""]
       interval: 10s

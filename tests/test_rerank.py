@@ -21,19 +21,19 @@ def _rows():
     ]
 
 
-def test_rerank_reorders_ambiguous_block(monkeypatch):
+def test_rerank_demotes_a_rejected_decoy(monkeypatch):
     monkeypatch.setattr(search, "RERANK_ENABLED", True)
     monkeypatch.setattr(search, "RERANK_ALWAYS", True)
     monkeypatch.setattr(search, "rerank",
-                        lambda query, docs: [0.0, 5.0, 1.0])
+                        lambda query, docs: [-3.5, -0.3, 1.0])
 
     rows = _rows()
     stats = {}
     search._rerank_rows(rows, "how do we deploy?", stats, False)
 
     assert [row["id"] for row in rows] == ["answer", "tail", "decoy"]
-    assert rows[0]["_rerank_score"] > rows[1]["_rerank_score"]
-    assert rows[0]["_relevance_score"] > rows[1]["_relevance_score"]
+    assert rows[0]["_relevance_score"] == 0.40
+    assert rows[2]["_relevance_score"] < 0.1
     assert stats["reranked"] == 3
 
 
@@ -74,19 +74,46 @@ def test_rerank_failure_keeps_the_first_stage_ranking(monkeypatch):
 def test_rerank_rescoring_keeps_the_project_scope_boost(monkeypatch):
     monkeypatch.setattr(search, "RERANK_ENABLED", True)
     monkeypatch.setattr(search, "RERANK_ALWAYS", True)
-    monkeypatch.setattr(search, "rerank", lambda query, docs: [0.0, 1.0])
+    monkeypatch.setattr(search, "rerank", lambda query, docs: [1.0, 0.0])
 
     rows = [
         {"id": "global", "content": "one", "_project": "global",
          "_relevance_score": 0.40},
         {"id": "project", "content": "two", "_project": "api",
-         "_relevance_score": 0.40},
+         "_relevance_score": 0.4025, "_scope_boost": 0.0025},
     ]
     search._rerank_rows(rows, "query", {}, False)
 
     assert rows[0]["id"] == "project"
-    assert rows[0]["_scope_boost"] > 0
-    assert rows[0]["_relevance_score"] > rows[0]["_rerank_score"]
+    assert rows[0]["_scope_boost"] == 0.0025
+    assert rows[0]["_relevance_score"] == 0.4025
+
+
+def test_rerank_caps_without_replacing_first_stage_relevance(monkeypatch):
+    """A reranker logit is a relative signal, not a calibrated probability.
+
+    The model scores a clearly relevant pair around -0.3 (sigmoid 0.43) and
+    an unrelated one around -5 (sigmoid 0.007). Replacing the first-stage
+    relevance with those values made every answer look unreliable. The
+    reranker may only lower it; it must not erase the bi-encoder's evidence.
+    """
+    monkeypatch.setattr(search, "RERANK_ENABLED", True)
+    monkeypatch.setattr(search, "RERANK_ALWAYS", True)
+    monkeypatch.setattr(search, "rerank", lambda query, docs: [-0.28, -2.55])
+
+    rows = [
+        {"id": "relevant", "content": "Deploy with ArgoCD",
+         "_relevance_score": 0.52, "_rrf_score": 0.03},
+        {"id": "noise", "content": "Kubernetes runs EKS",
+         "_relevance_score": 0.31, "_rrf_score": 0.02},
+    ]
+    search._rerank_rows(rows, "deployment tooling", {}, False)
+
+    by_id = {row["id"]: row for row in rows}
+    assert [row["id"] for row in rows] == ["relevant", "noise"]
+    assert by_id["relevant"]["_relevance_score"] == 0.52
+    assert by_id["relevant"]["_rerank_score"] == 0.4305
+    assert by_id["noise"]["_relevance_score"] < 0.2
 
 
 def test_rerank_sigmoid_is_applied_exactly_once():

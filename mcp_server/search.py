@@ -13,6 +13,7 @@ from mcp_server.config import (
     PROJECT_SCOPE_BOOST,
     RERANK_ALWAYS,
     RERANK_ENABLED,
+    RERANK_LOGIT_BIAS,
     RERANK_TOP_K,
     RERANK_TRIGGER_MARGIN,
     RERANK_TRIGGER_SCORE,
@@ -439,9 +440,13 @@ def _rerank_rows(
 
     The raw logits are not probabilities, so `_rerank_score` is the sigmoid
     of each logit: a per-pair confidence that does not change when another
-    candidate joins or leaves the block. `_similarity`, `_rrf_score` and
-    `_rrf_norm` stay the first-stage values; `_relevance_score` is replaced
-    for the reranked rows and the first-stage order is kept for the tail.
+    candidate joins or leaves the block. The sigmoid is not calibrated as an
+    absolute relevance (a clearly relevant pair often scores around 0.4), so
+    it is used to *cap* the first-stage relevance rather than replace it:
+    `_relevance_score = min(first_stage_relevance, sigmoid(logit + bias))`.
+    A strong reranker rejection lowers confidence; a merely modest positive
+    logit never promotes a weak first-stage hit. `_similarity`, `_rrf_score`
+    and `_rrf_norm` stay the first-stage values.
     """
     if not RERANK_ENABLED or not query_text or not rows:
         return rows
@@ -482,28 +487,27 @@ def _rerank_rows(
         return rows
 
     probabilities = _sigmoid_scores(logits)
-    for row, probability in zip(candidates, probabilities):
+    caps = _sigmoid_scores([logit + RERANK_LOGIT_BIAS for logit in logits])
+    for row, probability, cap in zip(candidates, probabilities, caps):
         row["_rerank_score"] = round(probability, 4)
-        relevance = probability
-        # The reranker replaces the first-stage relevance, so the guarantees
-        # the first stage made have to be re-applied here: an exact literal
-        # hit keeps its floor, a project row keeps its scope boost and an
-        # intentionally included history row stays penalised.
+        base_relevance = float(row.get("_relevance_score") or 0.0)
+        # The reranker can only lower the first-stage relevance: its absolute
+        # logits are not calibrated, but a very negative logit is a strong
+        # "not relevant" signal. Exact literal hits keep their floor.
+        relevance = min(base_relevance, cap)
         if row.get("_exact_match") == "content":
             relevance = max(relevance, 0.95)
         elif row.get("_exact_match") == "substring":
             relevance = max(relevance, 0.85)
-        if row.get("_project") not in (None, "global"):
-            boost = round(PROJECT_SCOPE_BOOST * (1.0 - relevance), 4)
-            row["_scope_boost"] = boost
-            relevance += boost
         row["_relevance_score"] = round(relevance, 4)
-        _apply_history_penalty(row)
 
     candidate_ids = {id(row) for row in candidates}
+    # Order by the capped relevance: a reranker may demote a candidate but a
+    # high logit must not promote a weak first-stage hit above a stronger one.
     reranked_head = sorted(
         candidates,
         key=lambda row: (-row.get("_relevance_score", 0.0),
+                         -row.get("_rerank_score", 0.0),
                          -row.get("_rrf_score", 0.0)))
     rows[:] = reranked_head + [row for row in rows
                                if id(row) not in candidate_ids]
@@ -584,6 +588,7 @@ def _search_memories_rrf(
     # (is_full_content_match, id, table)
     exact_candidates: list[tuple[bool, str, str]] = []
     dropped_by_similarity = 0
+    dropped_by_expired = 0
     dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
     entity_conditions, entity_params = _entity_conditions(
@@ -604,11 +609,6 @@ def _search_memories_rrf(
     for table in tables:
         conditions = ["TRUE"]
         params: list[Any] = []
-        conditions.append(visibility_condition(
-            include_deleted=include_deleted,
-            include_superseded=include_superseded,
-            include_expired=include_expired,
-        ))
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
@@ -616,6 +616,28 @@ def _search_memories_rrf(
         params.extend(entity_params)
         conditions.extend(extra_conditions)
         params.extend(extra_params)
+        # Expired rows are excluded by the visibility predicate. Count them
+        # separately so an empty answer can say "the fact exists but its TTL
+        # passed" instead of "nothing matches".
+        if not include_expired:
+            expired_where = " AND ".join(conditions + [
+                visibility_condition(
+                    include_deleted=include_deleted,
+                    include_superseded=include_superseded,
+                    include_expired=True,
+                ),
+                "expires_at IS NOT NULL AND expires_at <= NOW()",
+            ])
+            cur.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {expired_where}",
+                params,
+            )
+            dropped_by_expired += int(cur.fetchone()[0])
+        conditions.append(visibility_condition(
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+        ))
         where = " AND ".join(conditions)
 
         # 1. Vector Search (Top 50 per table)
@@ -751,6 +773,7 @@ def _search_memories_rrf(
                 _decorate_best_dropped(cur, best_dropped)
             stats.update({"candidates": 0,
                           "dropped_by_similarity": dropped_by_similarity,
+                          "dropped_by_expired": dropped_by_expired,
                           "dropped_by_coverage": dropped_by_coverage,
                           "dropped_by_cross_scope_duplicate":
                               dropped_by_cross_scope_duplicate,
@@ -848,6 +871,7 @@ def _search_memories_rrf(
         stats.update({
             "candidates": len(fused_scores),
             "dropped_by_similarity": dropped_by_similarity,
+            "dropped_by_expired": dropped_by_expired,
             "dropped_by_coverage": dropped_by_coverage,
             "dropped_by_cross_scope_duplicate":
                 dropped_by_cross_scope_duplicate,
@@ -939,6 +963,7 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
     rows: list[dict] = []
     seen_active_hashes: dict[str, str] = {}
     dropped_by_similarity = 0
+    dropped_by_expired = 0
     dropped_by_coverage = 0
     dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
@@ -986,6 +1011,21 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
         params.extend(entity_params)
         conditions.extend(extra_conditions)
         params.extend(extra_params)
+
+        if not include_expired:
+            expired_where = " AND ".join(conditions + [
+                visibility_condition(
+                    include_deleted=include_deleted,
+                    include_superseded=include_superseded,
+                    include_expired=True,
+                ),
+                "expires_at IS NOT NULL AND expires_at <= NOW()",
+            ])
+            cur.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {expired_where}",
+                params,
+            )
+            dropped_by_expired += int(cur.fetchone()[0])
 
         conditions.append(visibility_condition(
             include_deleted=include_deleted,
@@ -1081,6 +1121,7 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
         stats.update({
             "candidates": len(rows),
             "dropped_by_similarity": dropped_by_similarity,
+            "dropped_by_expired": dropped_by_expired,
             "dropped_by_coverage": dropped_by_coverage,
             "dropped_by_cross_scope_duplicate":
                 dropped_by_cross_scope_duplicate,

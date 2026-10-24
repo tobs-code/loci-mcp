@@ -19,6 +19,12 @@ ACTIVE_ROW_SQL = (
     "AND (expires_at IS NULL OR expires_at > NOW())"
 )
 
+# Relation-context sentences explain a graph edge; they are not facts about
+# the world and must never compete with a real memory in a contradiction scan.
+NOT_RELATION_CONTEXT_SQL = (
+    "COALESCE(metadata->>'relation_context', 'false') <> 'true'"
+)
+
 
 def active_sql(alias: str | None = None) -> str:
     """The active-row predicate, optionally qualified with a table alias."""

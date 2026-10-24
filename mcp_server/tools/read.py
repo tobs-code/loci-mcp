@@ -537,6 +537,7 @@ def recall(
     # path (a decay-filtered hit was reported as "below min_similarity").
     filtered_out = stats.get("dropped_by_similarity", 0)
     dropped_by_coverage = stats.get("dropped_by_coverage", 0)
+    dropped_by_expired = stats.get("dropped_by_expired", 0)
     dropped_by_cross_scope = stats.get("dropped_by_cross_scope_duplicate", 0)
     candidates = stats.get("candidates", 0)
     best_dropped = stats.get("best_dropped_by_similarity")
@@ -559,6 +560,10 @@ def recall(
                 f"{dropped_by_coverage} full-text hit(s) covered too little of "
                 f"the query (below {stats.get('min_coverage')} of the query "
                 f"words) to be relevant")
+        if dropped_by_expired:
+            reasons.append(
+                f"{dropped_by_expired} memory/memories were hidden because "
+                f"their TTL expired (pass include_expired=true to see them)")
         if dropped_by_decay:
             reasons.append(
                 f"{dropped_by_decay} hit(s) were below "
@@ -660,6 +665,8 @@ def recall(
         payload["best_dropped_by_similarity"] = dict(best_dropped)
     if dropped_by_coverage:
         payload["dropped_by_coverage"] = dropped_by_coverage
+    if dropped_by_expired:
+        payload["dropped_by_expired"] = dropped_by_expired
     # Filter counters are reported even when hits survive: an agent must be
     # able to see that the decay or superseded filter removed candidates
     # from a non-empty result instead of silently getting fewer hits.

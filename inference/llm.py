@@ -108,6 +108,7 @@ class LLMConfig:
     api_key: str
     base_url: str
     style: str
+    reasoning_effort: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -170,17 +171,34 @@ def load_config(env=None) -> LLMConfig:
     if provider == "ollama" and base_url:
         base_url = _normalize_ollama_url(base_url)
 
+    reasoning_effort = (env.get("LLM_REASONING_EFFORT") or "").strip().lower()
+    if reasoning_effort in ("none", "off", "disabled"):
+        reasoning_effort = ""
+    if reasoning_effort and reasoning_effort not in ("low", "medium", "high"):
+        logger.warning(
+            "Unknown LLM_REASONING_EFFORT %r, ignoring it", reasoning_effort)
+        reasoning_effort = ""
+    if not reasoning_effort and (
+            provider == "groq" or "gpt-oss" in model.lower()):
+        # gpt-oss spends its token budget on hidden reasoning. With the plain
+        # JSON fallback the content comes back empty (`finish_reason=length`),
+        # so the NLI call fails even though the provider returned 200. A low
+        # reasoning budget leaves room for the answer.
+        reasoning_effort = "low"
+
     return LLMConfig(
         provider=provider,
         model=model,
         api_key=api_key,
         base_url=base_url,
         style=defaults["style"],
+        reasoning_effort=reasoning_effort or None,
     )
 
 
 def build_chat_request(config: LLMConfig, system: str, user: str,
-                       response_format: dict | None = None):
+                       response_format: dict | None = None,
+                       max_tokens: int = 300):
     base = config.base_url.rstrip("/")
     if config.style == "anthropic":
         url = f"{base}/messages"
@@ -191,7 +209,7 @@ def build_chat_request(config: LLMConfig, system: str, user: str,
         }
         body = {
             "model": config.model,
-            "max_tokens": 300,
+            "max_tokens": max_tokens,
             "temperature": 0.0,
             "system": system,
             "messages": [{"role": "user", "content": user}],
@@ -209,8 +227,10 @@ def build_chat_request(config: LLMConfig, system: str, user: str,
             {"role": "user", "content": user},
         ],
         "temperature": 0.0,
-        "max_tokens": 300,
+        "max_tokens": max_tokens,
     }
+    if config.reasoning_effort:
+        body["reasoning_effort"] = config.reasoning_effort
     if response_format is not None:
         body["response_format"] = response_format
     return url, headers, body
@@ -377,20 +397,30 @@ def classify(config: LLMConfig, query: str, document: str,
     user = nli_user_message(query, document, query_entity, document_entity)
 
     if config.style == "anthropic":
-        attempts = [None]
+        attempts = [(None, 300)]
+    elif config.reasoning_effort:
+        # A reasoning model ignores `json_object` on Groq (the provider
+        # rejects it) and the plain request needs room for the answer after
+        # the hidden reasoning. Go straight from strict schema to plain JSON.
+        attempts = [
+            ({"type": "json_schema", "json_schema": {
+                "name": "nli", "strict": True, "schema": NLI_SCHEMA,
+            }}, 300),
+            (None, 1500),
+        ]
     else:
         attempts = [
-            {"type": "json_schema", "json_schema": {
+            ({"type": "json_schema", "json_schema": {
                 "name": "nli", "strict": True, "schema": NLI_SCHEMA,
-            }},
-            {"type": "json_object"},
-            None,
+            }}, 300),
+            ({"type": "json_object"}, 300),
+            (None, 300),
         ]
 
     last_error = None
-    for response_format in attempts:
+    for response_format, max_tokens in attempts:
         url, headers, body = build_chat_request(
-            config, system, user, response_format,
+            config, system, user, response_format, max_tokens=max_tokens,
         )
         # The response format is deterministic, the provider answer is not:
         # an occasional non-JSON reply (rate-limit page, truncated decode)

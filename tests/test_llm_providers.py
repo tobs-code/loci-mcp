@@ -1,6 +1,7 @@
 import pytest
 
 from inference.llm import (
+    NLI_SCHEMA,
     build_chat_request,
     classify,
     load_config,
@@ -195,6 +196,72 @@ def test_parse_nli_json_handles_fences_and_surrounding_text():
     assert parse_nli_json(embedded) == {"label": "contradiction", "score": 0.8}
     assert parse_nli_json("not json") is None
     assert parse_nli_json("") is None
+
+
+def test_groq_gpt_oss_uses_low_reasoning_effort():
+    config = load_config({
+        "LLM_PROVIDER": "groq",
+        "GROQ_API_KEY": "g",
+    })
+
+    assert config.model == "openai/gpt-oss-20b"
+    assert config.reasoning_effort == "low"
+
+
+def test_openai_does_not_get_a_reasoning_effort():
+    config = load_config({
+        "LLM_PROVIDER": "openai",
+        "OPENAI_API_KEY": "sk-test",
+    })
+
+    assert config.reasoning_effort is None
+    _, _, body = build_chat_request(config, "system", "user")
+    assert "reasoning_effort" not in body
+
+
+def test_build_request_for_groq_sets_reasoning_effort():
+    config = load_config({
+        "LLM_PROVIDER": "groq",
+        "GROQ_API_KEY": "g",
+    })
+
+    _, _, body = build_chat_request(config, "system", "user")
+
+    assert body["reasoning_effort"] == "low"
+    assert body["max_tokens"] == 300
+
+
+def test_groq_skips_json_object_and_gives_plain_json_more_room(monkeypatch):
+    """gpt-oss emits empty content when hidden reasoning uses the budget.
+
+    Groq rejects `json_object` for this model and the plain fallback needs
+    more than 300 tokens so the answer survives after the reasoning. The
+    format that used to burn three attempts is skipped, and the plain request
+    gets a larger budget.
+    """
+    attempts = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        attempts.append((json.get("response_format"),
+                         json.get("max_tokens"),
+                         json.get("reasoning_effort")))
+        if json.get("response_format") is not None:
+            return FakeResponse(status_code=400, text="unsupported format")
+        return FakeResponse(payload=_chat_payload(score=0.7))
+
+    monkeypatch.setattr("inference.llm.requests.post", fake_post)
+    config = load_config({"LLM_PROVIDER": "groq", "GROQ_API_KEY": "g"})
+
+    assert classify(config, "A", "B") == 0.7
+    assert [attempt[0] for attempt in attempts] == [
+        {"type": "json_schema", "json_schema": {
+            "name": "nli", "strict": True, "schema": NLI_SCHEMA,
+        }},
+        None,
+    ]
+    assert attempts[0][1] == 300
+    assert attempts[1][1] == 1500
+    assert all(attempt[2] == "low" for attempt in attempts)
 
 
 def test_classify_returns_the_contradiction_score(monkeypatch):

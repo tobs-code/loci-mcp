@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 from mcp_server.duplicates import shared_content_word as _shares_subject
-from mcp_server.lifecycle import ACTIVE_ROW_SQL
+from mcp_server.lifecycle import ACTIVE_ROW_SQL, NOT_RELATION_CONTEXT_SQL
 from mcp_server.scope_catalog import _retrieval_tables
 
 if TYPE_CHECKING:
@@ -216,6 +216,10 @@ def nearest_active(
             conditions.append(where)
             params.extend(where_params)
         conditions.append(ACTIVE_ROW_SQL)
+        # An edge sentence describes a relation, not a fact. Judging it
+        # against a stored fact produces false contradictions and can even
+        # supersede the edge's own context memory.
+        conditions.append(NOT_RELATION_CONTEXT_SQL)
 
         cur.execute(
             f"SELECT {select} FROM {table} "
@@ -876,6 +880,7 @@ class ContradictionScan:
                 project=request.project,
                 include_embedding=True,
                 include_superseded=False,
+                exclude_relation_context=True,
             ))
             if request.entity is None and len(facts) < 2:
                 # Only a scope-wide scan can bail early: with an entity a
@@ -895,7 +900,8 @@ class ContradictionScan:
                 for table in tables:
                     db.cur.execute(
                         f"SELECT COUNT(*) FROM {table} "
-                        "WHERE embedding IS NOT NULL AND " + ACTIVE_ROW_SQL)
+                        "WHERE embedding IS NOT NULL AND " + ACTIVE_ROW_SQL
+                        + " AND " + NOT_RELATION_CONTEXT_SQL)
                     scope_active += db.cur.fetchone()[0]
                 if scope_active < 2:
                     return LoadedCandidates(warning=(

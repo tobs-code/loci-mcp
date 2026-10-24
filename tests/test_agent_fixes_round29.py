@@ -104,15 +104,18 @@ def test_clear_dangling_keeps_valid_cross_scope_link():
         conn.close()
 
 
-def test_rerank_reapplies_history_penalty_and_exact_floor(monkeypatch):
+def test_rerank_keeps_history_penalty_and_exact_floor(monkeypatch):
     monkeypatch.setattr(search, "RERANK_ENABLED", True)
     monkeypatch.setattr(search, "RERANK_ALWAYS", True)
     monkeypatch.setattr(
         search, "rerank", lambda query, documents: [3.0, 0.0, 1.0])
 
+    # The first stage already applied the history penalty and the exact-match
+    # floor. Reranking must not undo either.
     history = {
         "id": "old", "content": "old wording", "superseded_by": "new",
-        "_relevance_score": 0.5, "_rrf_score": 1.0, "_project": "global",
+        "_relevance_score": 0.25, "_rrf_score": 1.0, "_project": "global",
+        "_history_penalty": 0.5,
     }
     current = {
         "id": "new", "content": "new wording", "superseded_by": None,
@@ -120,14 +123,14 @@ def test_rerank_reapplies_history_penalty_and_exact_floor(monkeypatch):
     }
     exact = {
         "id": "exact", "content": "ZEBRAFISH_TOKEN", "superseded_by": None,
-        "_relevance_score": 0.5, "_rrf_score": 0.8, "_project": "global",
+        "_relevance_score": 0.95, "_rrf_score": 0.8, "_project": "global",
         "_exact_match": "content",
     }
     stats = {}
     rows = search._rerank_rows([history, current, exact], "q", stats, False)
 
     assert history["_history_penalty"] == 0.5
-    assert history["_relevance_score"] == pytest.approx(0.4763, abs=0.0005)
+    assert history["_relevance_score"] == 0.25
     assert exact["_relevance_score"] >= 0.95
     assert stats["reranked"] == 3
     assert rows[0] is exact

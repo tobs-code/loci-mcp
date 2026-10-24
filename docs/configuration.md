@@ -24,8 +24,10 @@
 | `RERANK_TRIGGER_SCORE` | `0.85` | A best relevance at or above this value is trusted without reranking |
 | `RERANK_TRIGGER_MARGIN` | `0.10` | A lead over the runner-up at or above this value is trusted without reranking |
 | `RERANK_ALWAYS` | `false` | Rerank every query instead of only ambiguous ones |
+| `RERANK_LOGIT_BIAS` | `1.0` | Offset before the sigmoid cap; the raw reranker logits are not calibrated (-5..5) |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model (empty = provider default) |
+| `LLM_REASONING_EFFORT` | `low` for Groq/gpt-oss | Reasoning budget (`low`/`medium`/`high`; `none` disables). gpt-oss otherwise spends the token budget on hidden reasoning and returns empty content |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
 | `LLM_BASE_URL` | provider default | Base URL for OpenAI-compatible or Ollama endpoints |
 | `GROQ_API_KEY` | – | Groq key (backwards compatible) |

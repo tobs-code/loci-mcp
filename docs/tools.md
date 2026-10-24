@@ -255,13 +255,15 @@ The search tool. `query` is required and non-empty.
 
 When the best hit is below **0.85** relevance and leads the runner-up by less
 than **0.10**, the top candidates are rescored by the local cross-encoder
-(`RERANK_TOP_K`, default 10). Reranked rows carry `_rerank_score` (a softmax
-over the rescored block) and an updated `_relevance_score`; the answer reports
-`reranked`. A reranker failure adds `rerank_error` and a
-`reranking skipped: ...` warning and leaves the first-stage order unchanged.
+(`RERANK_TOP_K`, default 10). Reranked rows carry `_rerank_score` (a
+per-candidate sigmoid of the cross-encoder logit) and a capped
+`_relevance_score`; the answer reports `reranked`. A reranker failure adds
+`rerank_error` and a `reranking skipped: ...` warning and leaves the first-stage
+order unchanged.
 
 The answer reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
+`dropped_by_expired` (rows hidden because their TTL passed),
 `dropped_by_coverage` (the number of full-text hits that covered too little of
 the query), plus `fulltext_only` when a hit came only from the full-text leg.
 `dropped_by_relevance`, `dropped_by_decay` and `dropped_by_superseded` are
@@ -272,8 +274,8 @@ hits survived, so a non-empty result is never quietly short.
 [Retrieval](retrieval.md) for the score fields.
 
 An empty result names every filter that removed something (`min_similarity`,
-`min_relevance`, `min_decay_score`, `only_superseded`, the coverage floor) -
-not just the first
+`min_relevance`, `min_decay_score`, `only_superseded`, the coverage floor,
+the TTL) - not just the first
 one, so the caller does not debug the wrong filter. The strongest rejected
 vector hit is additionally reported as `best_dropped_by_similarity`
 (`id`, `similarity`, `scope`, `content_preview`) and named in the warning, so

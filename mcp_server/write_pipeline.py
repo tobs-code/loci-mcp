@@ -61,6 +61,12 @@ from mcp_server.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
+# Metadata that belongs to a graph edge's synthetic relation-context memory.
+# It must not leak onto a real fact when that context row is superseded.
+_GRAPH_METADATA_KEYS = frozenset({
+    "relation_context", "from", "to", "relation_type", "weight",
+})
+
 
 @dataclass
 class WriteIntent:
@@ -360,6 +366,8 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
     if replaced_ids and intent.metadata_mode == "merge":
         for old_id in replaced_ids:
             for key, value in _read_metadata(cur, store_project, old_id).items():
+                if key in _GRAPH_METADATA_KEYS:
+                    continue
                 if key not in meta and key not in carried_keys:
                     meta[key] = value
                     carried_keys.append(key)

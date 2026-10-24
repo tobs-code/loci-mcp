@@ -64,8 +64,8 @@ both scopes, the project copy wins.
 | `_similarity` | `1 - cosine distance` (0..1), the same scale as `min_similarity`. |
 | `_distance` | Raw cosine distance to the query. |
 | `_text_score` | Normalized rank of the full-text hit (1.0 = best). |
-| `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. After reranking this is the rerank probability (plus scope boost) for the rescored block. |
-| `_rerank_score` | Per-candidate sigmoid of the cross-encoder logit (0..1), so a score does not depend on how many candidates were reranked. Only present when reranking ran. |
+| `_relevance_score` | Normalized 0..1 combination of both signals; `null` for graph-only hits. A reranked row is capped by the cross-encoder: `min(first_stage, sigmoid(logit + RERANK_LOGIT_BIAS))`, so the reranker can lower confidence but never promote a weak first-stage hit. |
+| `_rerank_score` | Per-candidate sigmoid of the cross-encoder logit (0..1), so a score does not depend on how many candidates were reranked. It is a relative signal, not an absolute relevance. Only present when reranking ran. |
 | `_exact_match` | `"content"` or `"substring"` when the query or an identifier-like token hit literally; such rows get a relevance floor of 0.95/0.85. |
 | `_history_penalty` | `0.5` on a superseded, forgotten or expired row included on purpose: its relevance is halved, so the current fact wins a near-tie. |
 | `_scope_boost` | The compressed boost a project row gets on top of `_relevance_score`: `0.05 × (1 − relevance)`, at most 0.05 for a weak hit. |
@@ -137,7 +137,8 @@ empty-result reason; graph-only hits carry no relevance score and are never
 dropped by it.
 
 `recall` reports `candidates` (the hits that made it into the ranking),
-`dropped_by_similarity` (the number of vector hits the filter removed) and
+`dropped_by_similarity` (the number of vector hits the filter removed),
+`dropped_by_expired` (rows hidden because their TTL passed) and
 `dropped_by_coverage` (the number of full-text hits the coverage filter
 removed). `dropped_by_relevance`, `dropped_by_decay` and
 `dropped_by_superseded` are reported whenever the `min_relevance` /
@@ -165,8 +166,24 @@ the common path. `RERANK_ALWAYS=true` reranks every query,
 Reranked rows carry `_rerank_score` (a per-candidate sigmoid of the
 cross-encoder logit, so the value does not shift with the block size) and an
 updated `_relevance_score`; `_similarity`, `_rrf_score` and `_rrf_norm` stay
-the first-stage values. The reranked block is ordered by the cross-encoder, the
-remaining first-stage hits follow in their previous order. `recall` reports
+the first-stage values. The raw logits are not calibrated probabilities: a
+clearly relevant pair commonly scores around **-0.3** (sigmoid 0.43) and an
+unrelated one around **-5**. Replacing the first-stage relevance with those
+values made every answer look unreliable, so the cross-encoder now only
+**caps** it:
+
+```
+_relevance_score = min(first_stage_relevance,
+                       sigmoid(logit + RERANK_LOGIT_BIAS))
+```
+
+`RERANK_LOGIT_BIAS` defaults to **1.0** and maps the observed neutral region
+to roughly 0.73 while leaving strong negatives low. The block is ordered by the
+capped relevance, with `_rerank_score` and `_rrf_score` as tie-breakers: a
+reranker may demote a candidate but cannot promote a weak first-stage hit. An
+exact literal hit keeps its 0.95/0.85 floor, and the first stage's
+`_scope_boost` / `_history_penalty` are not applied twice. The remaining
+first-stage hits follow in their previous order. `recall` reports
 `reranked` (the number of rescored rows); a reranker failure adds
 `rerank_error` and the warning `reranking skipped: ...`, and the first-stage
 ranking is returned unchanged. `recall_batch` inherits this per query.

@@ -108,6 +108,40 @@ def test_supersede_marks_after_insert_and_carries_metadata(monkeypatch):
     assert '"ticket": "T-1"' in params[0]
 
 
+def test_supersede_drops_graph_metadata_from_the_context_row(monkeypatch):
+    """A relation-context row's edge metadata is not a fact's metadata.
+
+    Superseding the synthetic `<from>_<rel>_<to>` memory used to copy
+    `relation_context`, `from`, `to`, `relation_type` and `weight` onto the
+    real replacement, which made the fact look like an edge sentence and
+    hid it from `get_entity`/recall.
+    """
+    _quiet_pipeline(
+        monkeypatch,
+        _supersede_targets=lambda *a, **k: (["context-1"], []),
+        _read_metadata=lambda *a, **k: {
+            "relation_context": True,
+            "from": "API",
+            "to": "Postgres",
+            "relation_type": "USES",
+            "weight": 1.0,
+            "ticket": "T-2",
+        })
+    store = FakeStore()
+
+    outcome = wp.write_one(store, wp.WriteIntent(
+        content="The API uses Postgres for storage", embedding=[0.0]))
+
+    inserted = store.calls[1]
+    assert inserted[4] == {}
+    assert outcome.metadata_carried == ["ticket"]
+    sql, params = store.cur.executed[-1]
+    assert "UPDATE memories SET metadata" in sql
+    assert '"ticket": "T-2"' in params[0]
+    for key in ("relation_context", "from", "to", "relation_type", "weight"):
+        assert f'"{key}"' not in params[0]
+
+
 def test_link_failure_is_a_warning_not_a_lost_fact(monkeypatch):
     _quiet_pipeline(
         monkeypatch,

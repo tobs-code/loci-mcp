@@ -185,6 +185,7 @@ remember(content="The API runs on Postgres", entity="API", project="api")
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available), `cpu` or `cuda` |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model |
+| `LLM_REASONING_EFFORT` | `low` for Groq/gpt-oss | Reasoning budget (`low`/`medium`/`high`; `none` disables) |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
 | `LLM_BASE_URL` | provider default | Base URL for OpenAI-compatible or Ollama endpoints |
 | `GROQ_API_KEY` / `GROQ_MODEL` | – | Groq key and model (backwards compatible) |

@@ -57,7 +57,7 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 
 | Tool | Behaviour and key parameters |
 |------|------------------------------|
-| `recall` | Hybrid vector + FTS search with RRF. `query`, `project`, `include_global`, `limit`, `offset`, `hybrid`; `min_similarity`, `min_relevance` (floor on `_relevance_score`; graph-only hits are never dropped by it), `min_decay_score`, `include_decay`; `include_superseded`, `only_superseded`, `include_deleted`, `include_expired`; `graph_boost`, `graph_entity`, `entity`; `updated_after`, `metadata_filter`; `include_relation_context`; `fields`, `detail` (`full`/`slim`). Logs `access_count`. Reports `candidates`, `dropped_by_*` (including `dropped_by_cross_scope_duplicate`), `scopes_searched`, `detail`, `has_more`/`next_offset`, plus `confidence` (`high` >= 0.60, `medium` >= 0.45, `low`, `none`, `graph`) and `best_relevance`; a low-confidence answer warns. Hidden rows carry `forgotten`/`expired` markers. |
+| `recall` | Hybrid vector + FTS search with RRF. `query`, `project`, `include_global`, `limit`, `offset`, `hybrid`; `min_similarity`, `min_relevance` (floor on `_relevance_score`; graph-only hits are never dropped by it), `min_decay_score`, `include_decay`; `include_superseded`, `only_superseded`, `include_deleted`, `include_expired`; `graph_boost`, `graph_entity`, `entity`; `updated_after`, `metadata_filter`; `include_relation_context`; `fields`, `detail` (`full`/`slim`). Logs `access_count`. Reports `candidates`, `dropped_by_*` (including `dropped_by_cross_scope_duplicate` and `dropped_by_expired`), `scopes_searched`, `detail`, `has_more`/`next_offset`, plus `confidence` (`high` >= 0.60, `medium` >= 0.45, `low`, `none`, `graph`) and `best_relevance`; a low-confidence answer warns. Hidden rows carry `forgotten`/`expired` markers. |
 | `recall_batch` | Run 1-25 independent searches in one call (`queries`), with shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `fields`, `detail`. Each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched`; a failed query (including an empty one) is named in the top-level `warnings` and answered in its own entry instead of aborting the batch. |
 | `list_memories` | Browse without a query, newest first. `entity`, `mem_type`, `project`, `include_global`, `limit`, `offset`, `fields`, `updated_after`, `metadata_filter`, `order_by` (`updated_at`/`created_at`/`access_count`/`importance`), `contains` (case-insensitive literal), `memory_id`, `memory_ids` (bulk direct lookup, max 200; reports `missing` and a warning, mutually exclusive with `memory_id`; rows that exist but are hidden are listed separately in `hidden` with `reasons`/`reveal_flags`); `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates`. `total`/`has_more`/`next_offset` describe the deduped row set; identical content in another scope is hidden by default and counted in `duplicates_hidden` with a warning (`include_duplicates=true` shows every copy). Reports `scopes_searched` plus `total_by_scope` (before dedup) and `listed_by_scope` (after dedup). With `memory_id` it is the direct lookup: the answer carries the single `memory` (plus a one-item `results`), a hidden row answers `ok: false` and names the flag that reveals it, an id in several scopes is refused with `scopes`, `"*"` searches every scope, and browse filters are reported as ignored. An empty filtered browse warns and names the filters that narrowed it to zero. |
 | `get_entity` | Entity details, linked memories and graph connections. `entity` (alias `name`), `project`, `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`. Reports `total`, `relation_context_count`, `has_more`, `scopes_searched`, `memories_by_scope`; `total` follows the same cross-scope dedupe as the returned page; `include_relation_context=false` hides the edge sentences (the entity's own memories stay). An unknown project is named in `warnings` like `recall`. When the name exists in several scopes, `details.scopes_with_entity` names each occurrence and a warning names the scope `details` describes. On a miss the not-found answer carries `scopes_with_entity` (the other scopes holding the entity) and the error/warning say to repeat the call with `project=<name>`, so a cross-scope lookup needs no second discovery round trip. `project="*"` is rejected. |
@@ -183,6 +183,9 @@ counts and health.
   write cannot silently replace another subject's fact.
 - Replaced metadata is carried over by default (`metadata_mode="merge"`);
   explicitly passed keys win. `metadata_mode="replace"` drops the old keys.
+  Graph-edge metadata (`relation_context`, `from`, `to`, `relation_type`,
+  `weight`) is never carried: a relation-context row's edge fields do not
+  describe the replacement fact.
 - `mem_type` is optional on `remember`/`remember_batch`. An explicit type wins;
   otherwise a supersede carries the replaced memory's type and a fresh fact
   defaults to `"fact"`.
@@ -231,7 +234,8 @@ counts and health.
   filters **vector** hits only; full-text hits survive a bad embedding score.
   `recall` reports `dropped_by_similarity`, `dropped_by_coverage`,
   `dropped_by_decay`, `dropped_by_relevance`, `dropped_by_superseded`,
-  `dropped_by_cross_scope_duplicate`; an empty result names every filter that
+  `dropped_by_expired`, `dropped_by_cross_scope_duplicate`; an empty result
+  names every filter that
   removed something. The strongest rejected vector hit is reported
   as `best_dropped_by_similarity` (id, similarity, scope, `content_preview`),
   so a barely-missed fact is visible instead of hidden behind a count; the
@@ -257,11 +261,14 @@ counts and health.
   - `_rrf_norm` (0..1) and raw `_rrf_score`.
   - `_relevance_score` (0..1): vector similarity + FTS rank, plus
     `_scope_boost` for project rows (max 0.05). `null` for graph-only hits.
-    After reranking it is the rerank probability (plus scope boost) for the
-    rescored block.
+    After reranking it is capped, not replaced:
+    `min(first_stage, sigmoid(logit + RERANK_LOGIT_BIAS))`, so the reranker
+    can demote but never promote a weak first-stage hit.
   - `_rerank_score` (0..1): per-candidate sigmoid of the cross-encoder logit,
-    so a score does not depend on how many candidates were reranked; only
-    present when reranking ran.
+    so a score does not depend on how many candidates were reranked; it is a
+    relative signal, not an absolute relevance. Only present when reranking
+    ran. The reranked block is ordered by the capped relevance, with
+    `_rerank_score`/`_rrf_score` as tie-breakers.
   - `_history_penalty` (0.5) marks a superseded, forgotten or expired row that
     was included on purpose. Its relevance is halved, so the current fact wins
     a near-tie while history stays readable when it is the only match.
@@ -345,7 +352,9 @@ counts and health.
     ("candidate loading consumed the NLI time budget ..."), `budget_exhausted`
     and the unjudged pairs named in `nli_failures` instead of pushing the call
     past the client's transport timeout.
-- Candidates are not restricted to `mem_type="fact"`.
+- Candidates are not restricted to `mem_type="fact"`, but synthetic
+  relation-context sentences (`relation_context=true`) never compete: an edge's
+  explanation must not be superseded by the fact it describes.
 - A score of 0.7 or higher is a contradiction. Auto-supersede marks the old
   memory with `superseded_by = new_id`; with `resolve="newest"` the older
   memory of each same-entity pair is superseded. "Newest" is the creation
@@ -434,10 +443,12 @@ counts and health.
 | `RERANK_TRIGGER_SCORE` | `0.85` | Best relevance at or above this value is trusted |
 | `RERANK_TRIGGER_MARGIN` | `0.10` | Lead over the runner-up at or above this value is trusted |
 | `RERANK_ALWAYS` | `false` | Rerank every query instead of only ambiguous ones |
+| `RERANK_LOGIT_BIAS` | `1.0` | Offset applied before the sigmoid cap; the raw logits are not calibrated (-5..5) |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu`, `cuda`; `cuda` still falls back without a visible device |
 | `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | Build arg for the inference image; `https://download.pytorch.org/whl/cpu` builds the smaller CPU-only variant |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto`, `none` |
 | `LLM_MODEL` | provider default | NLI model |
+| `LLM_REASONING_EFFORT` | `low` for Groq/gpt-oss | Reasoning budget (`low`/`medium`/`high`; `none` disables). A reasoning model otherwise spends the token budget before the JSON answer and returns empty content |
 | `LLM_API_KEY` | – | Generic key, overrides provider-specific keys |
 | `LLM_BASE_URL` | provider default | OpenAI-compatible/Ollama endpoint |
 | `GROQ_API_KEY` / `GROQ_MODEL` | – / compose value | Backwards-compatible Groq settings |
