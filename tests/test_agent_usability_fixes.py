@@ -4,6 +4,8 @@ Covers:
 - remember/remember_batch/contradictions_report survive an NLI outage and
   say so instead of presenting zeros as a clean scan.
 - inference_client.nli rejects an error payload instead of reading zeros.
+- a PARTIAL NLI failure on a write is never read as "no contradiction"
+  (the write-side check uses nli_detailed and raises on a partial payload).
 - exact-hash short-circuit visible in the duplicate message (semantic dedupe).
 - list_memories exposes a machine-readable `forgotten` flag and hides the
   '__forgotten__' sentinel from superseded_by.
@@ -29,7 +31,7 @@ def _raise_nli(*args, **kwargs):
 def test_remember_survives_nli_outage_and_warns(monkeypatch):
     remember(content="Seed fact about the gateway.",
              entity="Gateway", project="nli-outage")
-    monkeypatch.setattr("mcp_server.storage.nli", _raise_nli)
+    monkeypatch.setattr("mcp_server.storage.nli_detailed", _raise_nli)
     result = remember(
         content="The gateway deploys to staging on Fridays.",
         entity="Gateway",
@@ -47,7 +49,7 @@ def test_remember_survives_nli_outage_and_warns(monkeypatch):
 def test_remember_batch_survives_nli_outage_and_warns(monkeypatch):
     remember(content="Seed fact about the batch gateway.",
              entity="Gateway", project="nli-outage-batch")
-    monkeypatch.setattr("mcp_server.storage.nli", _raise_nli)
+    monkeypatch.setattr("mcp_server.storage.nli_detailed", _raise_nli)
     result = remember_batch(
         facts=[{
             "content": "The gateway deploys to staging on Fridays.",

@@ -153,6 +153,11 @@ def list_projects(
 
     `project` on every row is the value to pass to the other tools (`global`
     for the shared scope). `has_table=False` marks a graph-only scope.
+
+    With `include_counts=True`: `memories` counts the ACTIVE rows (what every
+    read shows), while `total_memories` counts every row including superseded,
+    forgotten and expired history. `superseded_memories`/`forgotten_memories`
+    name the history parts, so the numbers decompose without guessing.
     """
     logger.info("list_projects include_empty=%s", include_empty)
     db = MemoryStore()

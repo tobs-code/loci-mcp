@@ -7,7 +7,7 @@ from mcp_server.config import (
     SENTINEL_FORGOTTEN,
 )
 from mcp_server.duplicates import find_duplicate, find_near_duplicate
-from mcp_server.inference_gateway import nli
+from mcp_server.inference_gateway import nli_detailed
 from mcp_server.lifecycle import ACTIVE_ROW_SQL
 from mcp_server.scope_catalog import _mem_table, _retrieval_tables
 from mcp_server.scoring import _gen_id, _now, _content_hash
@@ -325,6 +325,13 @@ def _check_contradictions(cur, content: str, entity: str | None,
     is just as harmful as a fact that contradicts a fact. Restricting the
     comparison to `mem_type = 'fact'` hid most real conflicts, because the
     conflicting memory is often a decision, a pattern or a convention.
+
+    Judgments travel through `nli_detailed`, matching the report path: a
+    candidate document the provider could not judge is never read as a 0.0
+    "neutral" score. A partial failure raises, so the write surfaces
+    "contradiction check skipped: NLI unavailable: ..." instead of silently
+    leaving a possibly contradicting pair active (this used to be silent on
+    the thin `nli()` wrapper, which dropped `partial_error`).
     """
     from mcp_server.contradiction_scan import nearest_active
 
@@ -363,8 +370,15 @@ def _check_contradictions(cur, content: str, entity: str | None,
     # The entity labels are hints for the NLI model: a differing port of two
     # different services reads very differently when the model knows that the
     # two facts are stored under different entities.
-    scores = nli(content, candidate_contents,
-                 query_entity=entity, document_entities=candidate_entities)
+    scores, partial_error, _failed = nli_detailed(
+        content, candidate_contents,
+        query_entity=entity, document_entities=candidate_entities)
+    if partial_error:
+        # At least one candidate was not judged. Its 0.0 placeholder is not a
+        # clean verdict, and the unjudged neighbour may be the contradicting
+        # one: raising makes the write surface the skip loudly (the fact is
+        # still stored) instead of silently treating the pair as neutral.
+        raise RuntimeError(partial_error)
 
     contradictions = []
     for (eid, econtent, _eentity), score in zip(candidates, scores):

@@ -86,15 +86,15 @@ def test_check_contradictions_sends_the_fact_entities(monkeypatch):
 
     captured = {}
 
-    def fake_nli(query, documents, query_entity=None, document_entities=None,
-                 *args, **kwargs):
+    def fake_nli_detailed(query, documents, query_entity=None,
+                          document_entities=None, *args, **kwargs):
         captured.update(
             query=query, documents=documents,
             query_entity=query_entity, document_entities=document_entities,
         )
-        return [0.0] * len(documents)
+        return [0.0] * len(documents), None, []
 
-    monkeypatch.setattr(storage, "nli", fake_nli)
+    monkeypatch.setattr(storage, "nli_detailed", fake_nli_detailed)
 
     remember("The resolve relay answers on port 5100", entity="Relay")
     remember("The resolve relay answers on port 5200", entity="Relay",

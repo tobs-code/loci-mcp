@@ -348,10 +348,13 @@ counts and health.
   inference side also retries with backoff (3 attempts) on 429/5xx, timeout,
   connection error and Groq's transient `400 json_validate_failed`/`tool_use_failed`,
   then falls back through provider-level `json_schema`/`json_object`/plain. A
-  partial failure sets `partial_error`/`failed`; `contradictions_report`
-  reports an incomplete scan and names `nli_failures`. Write tools keep the
-  fact and warn (`contradiction check skipped: NLI unavailable: ...`) in
-  `warnings` and `contradictions.skipped`. Zero scores are always trustworthy.
+   partial failure sets `partial_error`/`failed`; `contradictions_report`
+   reports an incomplete scan and names `nli_failures`. Write tools keep the
+   fact and warn (`contradiction check skipped: NLI unavailable: ...`) in
+   `warnings` and `contradictions.skipped`; a partial failure surfaces the
+   same way, so an unjudged pair is never silently read as "no contradiction"
+   (the write-side check travels through `nli_detailed`). Zero scores are
+   always trustworthy.
 - `contradictions_report` short-circuits when no LLM provider is configured
   and returns `nli_configured=false` plus a warning.
 - `/nli` uses the configured LLM provider (`LLM_PROVIDER`: `groq`, `openai`,
