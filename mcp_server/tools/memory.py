@@ -314,9 +314,7 @@ BatchUpdateInput = Annotated[BatchUpdate, BeforeValidator(_sanitize_batch_update
 def remember(
     content: Annotated[str, Field(description="The fact to remember (non-empty).")],
     mem_type: Annotated[
-        Literal["fact", "decision", "learning", "preference", "pattern", "incident",
-                "runbook", "context", "observation", "convention", "command",
-                "note"] | None,
+        str | None,
         Field(description=MEMORY_TYPE_HELP + " Omit it when the fact replaces "
                           "another memory: the replaced memory's type is "
                           "carried over, so a decision stays a decision.")] = None,
@@ -914,7 +912,8 @@ def remember_batch(
             continue
         mem_type = fact.get("mem_type")
         if mem_type is not None and mem_type not in MEMORY_TYPES:
-            prepared.append((None, f"invalid mem_type {mem_type!r}"))
+            prepared.append((None, f"Invalid mem_type. Choose from: "
+                                   f"{', '.join(sorted(MEMORY_TYPES))}"))
             continue
         try:
             importance = float(fact.get("importance", 0.5))
@@ -1070,7 +1069,7 @@ def remember_batch(
             if spec is None:
                 raw = facts[i].get("content", "") if isinstance(facts[i], dict) else ""
                 results.append({"id": None, "content": raw, "status": "error",
-                                "error": err})
+                                "error": err, "warnings": []})
                 continue
             store_project = spec["project"]
             try:
@@ -1110,7 +1109,8 @@ def remember_batch(
                 results.append({"id": None, "content": spec["content"],
                                 "status": "error", "error": str(exc),
                                 "scope": spec["scope"],
-                                "project": (store_project or "global")})
+                                "project": (store_project or "global"),
+                                "warnings": []})
                 continue
 
             if outcome.status == STATUS_DUPLICATE:
@@ -1138,8 +1138,9 @@ def remember_batch(
                     warnings.extend(outcome.duplicate_supersede_warnings)
                     if outcome.cross_scope_warning:
                         warnings.append(outcome.cross_scope_warning)
-                if warnings:
-                    entry["warnings"] = warnings
+                # Stable shape: every entry exposes `warnings`, so a caller
+                # can iterate without a key check.
+                entry["warnings"] = warnings
                 if outcome.superseded:
                     entry["superseded"] = outcome.superseded
                     if outcome.cross_scope_superseded:
@@ -1855,7 +1856,8 @@ def update_batch(
             if spec is None:
                 raw = updates[i]
                 raw_id = raw.get("memory_id") if isinstance(raw, dict) else None
-                results.append({"id": raw_id, "status": "error", "error": err})
+                results.append({"id": raw_id, "status": "error", "error": err,
+                                "warnings": []})
                 continue
             memory_id = spec["memory_id"]
             entry_project = spec["project"]
@@ -1869,7 +1871,8 @@ def update_batch(
                             _undo(savepoint)
                             results.append({
                                 "id": memory_id, "status": "not_found",
-                                "error": f"NOT FOUND: {memory_id}"})
+                                "error": f"NOT FOUND: {memory_id}",
+                                "warnings": []})
                             continue
                     else:
                         scopes = _memory_scopes(cur, memory_id)
@@ -1881,7 +1884,7 @@ def update_batch(
                                           f"it exists in the scopes {scopes}; "
                                           f"pass project=<name> to say which "
                                           f"one to restore"),
-                                "scopes": scopes})
+                                "scopes": scopes, "warnings": []})
                             continue
                         restore_tables = _all_mem_tables(cur)
                     restored_table, restored = restore_rows(
@@ -1894,13 +1897,14 @@ def update_batch(
                             "id": memory_id,
                             "status": blocked[0] if blocked else "not_found",
                             "error": (blocked[1] if blocked
-                                      else f"NOT FOUND: {memory_id}")})
+                                      else f"NOT FOUND: {memory_id}"),
+                            "warnings": []})
                         continue
                     scope = _scope_of_table(cur, restored_table)
                     db.release(savepoint)
                     results.append({"id": memory_id,
                                     "status": STATUS_RESTORED,
-                                    "project": scope})
+                                    "project": scope, "warnings": []})
                     continue
                 sets: list[str] = []
                 params: list[Any] = []
@@ -1933,7 +1937,7 @@ def update_batch(
                                       f"exists in the scopes {scopes}; pass "
                                       f"project=<name> to say which one to "
                                       f"update"),
-                            "scopes": scopes})
+                            "scopes": scopes, "warnings": []})
                         continue
                     tables = _all_mem_tables(cur)
 
@@ -1953,7 +1957,7 @@ def update_batch(
                     results.append({
                         "id": memory_id,
                         "status": "conflict" if reason else "not_found",
-                        "error": error})
+                        "error": error, "warnings": []})
                     continue
                 scope = _scope_of_table(cur, active_table)
                 if spec["metadata_mode"] == "merge" \
@@ -2011,24 +2015,25 @@ def update_batch(
                                     params):
                     _undo(savepoint)
                     results.append({"id": memory_id, "status": "not_found",
-                                    "error": f"NOT FOUND: {memory_id}"})
+                                    "error": f"NOT FOUND: {memory_id}",
+                                    "warnings": []})
                     continue
                 db.release(savepoint)
             except Exception as exc:
                 _undo(savepoint)
                 results.append({"id": memory_id, "status": "error",
-                                "error": str(exc)})
+                                "error": str(exc), "warnings": []})
                 continue
             entry: dict[str, Any] = {"id": memory_id,
                                      "status": STATUS_UPDATED,
-                                     "project": scope}
+                                     "project": scope, "warnings": []}
             if near_dup:
-                entry["warnings"] = [
+                entry["warnings"].append(
                     _near_duplicate_warning(
                         near_dup, near_entity, near_conflict, update=True,
-                        new_content=spec["fields"]["content"])]
+                        new_content=spec["fields"]["content"]))
             if spec.get("ttl_warning"):
-                entry.setdefault("warnings", []).append(spec["ttl_warning"])
+                entry["warnings"].append(spec["ttl_warning"])
             results.append(entry)
         db.commit()
     except Exception as e:

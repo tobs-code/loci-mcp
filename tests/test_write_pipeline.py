@@ -170,6 +170,7 @@ def test_remember_batch_reports_one_failed_entry(monkeypatch):
     assert result["results"][1] == {
         "id": None, "content": "bad", "status": "error",
         "error": "boom", "scope": "global", "project": "global",
+        "warnings": [],
     }
     savepoints = [c for c in store.calls if c[0] == "savepoint"]
     assert savepoints == [("savepoint", "fact_0"), ("savepoint", "fact_1")]

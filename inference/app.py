@@ -172,6 +172,8 @@ class RerankRequest(BaseModel):
 class RerankResponse(BaseModel):
     # Raw cross-encoder logits, one per document. They are not probabilities
     # and only meaningful relative to the other documents in this request.
+    # The MCP client applies its own sigmoid, so the service must NOT apply
+    # the model's default activation (see the /rerank handler).
     scores: list[float]
     error: str | None = None
 
@@ -252,8 +254,15 @@ def rerank(req: RerankRequest):
     try:
         model = _get_reranker()
         with _reranker_predict_lock:
+            # CrossEncoder.predict applies the model's activation by default;
+            # for a one-label reranker that is Sigmoid. The contract of this
+            # endpoint (and of mcp_server.inference_client) is a raw logit,
+            # so identity is required here: applying sigmoid twice squashed
+            # every score into 0.5-0.73 and made unrelated hits look
+            # "medium confidence".
             scores = model.predict(
-                [(req.query, document) for document in req.documents]
+                [(req.query, document) for document in req.documents],
+                activation_fn=torch.nn.Identity(),
             )
     except Exception as exc:
         # A reranker outage must not turn into an empty answer: the caller

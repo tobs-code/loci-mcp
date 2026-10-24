@@ -7,6 +7,8 @@ logic directly with a stubbed client.
 
 from mcp_server import search
 
+import pytest
+
 
 def _rows():
     return [
@@ -85,3 +87,34 @@ def test_rerank_rescoring_keeps_the_project_scope_boost(monkeypatch):
     assert rows[0]["id"] == "project"
     assert rows[0]["_scope_boost"] > 0
     assert rows[0]["_relevance_score"] > rows[0]["_rerank_score"]
+
+
+def test_rerank_sigmoid_is_applied_exactly_once():
+    """The inference service returns raw logits, so the client sigmoids once.
+
+    Applying the model's default sigmoid in the service AND again here
+    squashed every score into 0.5-0.73: an unrelated pair looked like
+    "medium confidence" and survived `min_relevance=0.5`.
+    """
+    neutral, unrelated, relevant = search._sigmoid_scores([0.0, -5.0, 5.0])
+
+    assert neutral == pytest.approx(0.5)
+    assert unrelated < 0.01
+    assert relevant > 0.99
+
+
+def test_rerank_keeps_unrelated_candidates_low(monkeypatch):
+    monkeypatch.setattr(search, "RERANK_ENABLED", True)
+    monkeypatch.setattr(search, "RERANK_ALWAYS", True)
+    monkeypatch.setattr(search, "rerank",
+                        lambda query, docs: [-5.0, -4.0])
+
+    rows = [
+        {"id": "db", "content": "The database runs PostgreSQL 16.",
+         "_relevance_score": 0.30, "_rrf_score": 0.02},
+        {"id": "deploy", "content": "Deployments happen on Sunday.",
+         "_relevance_score": 0.29, "_rrf_score": 0.01},
+    ]
+    search._rerank_rows(rows, "quantum entanglement in qubits", {}, False)
+
+    assert max(row["_relevance_score"] for row in rows) < 0.05
