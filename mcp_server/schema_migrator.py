@@ -50,7 +50,7 @@ def migrate_fts_indexes() -> int:
         cur = conn.cursor()
         cur.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name LIKE 'mem\\_%'"
+            "WHERE table_schema = 'public' AND table_name ~ '^mem_[A-Za-z0-9_]+$'"
         )
         for (table,) in cur.fetchall():
             cur.execute(

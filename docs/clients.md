@@ -15,7 +15,10 @@ Add the following to your MCP configuration (`cline_mcp_settings.json` or
   "mcpServers": {
     "loci": {
       "type": "streamable-http",
-      "url": "http://localhost:8766"
+      "url": "http://localhost:8766",
+      "headers": {
+        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
+      }
     }
   }
 }
@@ -28,7 +31,10 @@ Add the following to your MCP configuration (`cline_mcp_settings.json` or
   "mcpServers": {
     "loci": {
       "type": "streamable-http",
-      "url": "http://localhost:8766"
+      "url": "http://localhost:8766",
+      "headers": {
+        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
+      }
     }
   }
 }
@@ -37,20 +43,27 @@ Add the following to your MCP configuration (`cline_mcp_settings.json` or
 ### Zed
 
 Open `settings.json` (`~/.config/zed/settings.json` or
-`Cmd+Shift+P` → `zed: open settings file`) and add:
+`Cmd+Shift+P`  `zed: open settings file`) and add:
 
 ```json
 {
   "context_servers": {
     "loci": {
-      "url": "http://localhost:8766"
+      "url": "http://localhost:8766",
+      "headers": {
+        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
+      }
     }
   }
 }
 ```
 
-> **Note:** Port `8766` is already exposed by `docker-compose.yml`. From another
-> machine, use the host IP instead of `localhost`.
+Replace `<MCP_AUTH_TOKEN>` with the value from your `.env`. A request without
+the header is rejected with HTTP 401.
+
+> **Note:** Port `8766` is published on `127.0.0.1` only. To reach the server
+> from another machine, change the compose mapping to `"8766:8766"` and keep
+> `MCP_AUTH_TOKEN` set.
 
 ## stdio (local development, e.g. Claude Code)
 
@@ -72,7 +85,7 @@ Then in the Claude Code MCP config:
       "command": "python",
       "args": ["-m", "mcp_server"],
       "env": {
-        "MEMORY_DATABASE_URL": "postgresql://memory:geheim@localhost:5432/memory",
+        "MEMORY_DATABASE_URL": "postgresql://memory:<POSTGRES_PASSWORD>@localhost:5432/memory",
         "MEMORY_INFERENCE_URL": "http://localhost:8001"
       }
     }
@@ -84,9 +97,9 @@ Then in the Claude Code MCP config:
 
 | Transport | Selected with | Notes |
 |-----------|---------------|-------|
-| `stdio` | `MCP_TRANSPORT=stdio` (default) | The client starts the server itself. |
-| `streamable-http` | `MCP_TRANSPORT=streamable-http` | The server listens on `MCP_HOST:MCP_PORT` (default `0.0.0.0:8766`). |
-| `sse` | `MCP_TRANSPORT=sse` | Legacy transport. |
+| `stdio` | `MCP_TRANSPORT=stdio` (default) | The client starts the server itself; no token needed. |
+| `streamable-http` | `MCP_TRANSPORT=streamable-http` | Listens on `MCP_HOST:MCP_PORT` (default `0.0.0.0:8766`); requires `MCP_AUTH_TOKEN`. |
+| `sse` | `MCP_TRANSPORT=sse` | Legacy transport; requires `MCP_AUTH_TOKEN`. |
 
 ## Checking the connection
 

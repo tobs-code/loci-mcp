@@ -4,11 +4,15 @@
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MEMORY_DATABASE_URL` | `postgresql://memory:geheim@localhost:5432/memory` | Postgres DSN |
+| `MEMORY_DATABASE_URL` | `postgresql://memory@localhost:5432/memory` | Postgres DSN (supply the password here) |
+| `POSTGRES_PASSWORD` | - (required by compose) | Password for the bundled Postgres; compose also builds the DSN from it |
+| `POSTGRES_USER` / `POSTGRES_DB` | `memory` | Bundled Postgres user and database |
 | `MEMORY_INFERENCE_URL` | `http://localhost:8001` | Inference API |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
+| `MCP_AUTH_TOKEN` | - (required for HTTP) | Shared bearer token; every HTTP request must send `Authorization: Bearer <token>` |
+| `MCP_ALLOW_INSECURE_HTTP` | `false` | Allow an unauthenticated non-loopback HTTP bind. Sandbox only; never in production |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary; invalid names fall back to `english` |
 | `MCP_TOOLSET` | `full` | `full` (25 tools) or `core` (15 daily read/write/graph tools); an unknown value warns and falls back to `full` |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu` or `cuda`; `cuda` still falls back if no device is visible |
@@ -32,6 +36,29 @@
 | `CONTRADICTION_SCAN_BUDGET_SECONDS` | `40` | Wall-clock budget for the whole `contradictions_report` scan (candidate loading plus the NLI leg); on exhaustion the scan stops early and names unjudged pairs in `nli_failures` |
 | `CONTRADICTION_NEIGHBORS` | `6` | Vector neighbours fetched per memory per searched scope table (1-20); the closest pairs are judged first |
 | `CONTRADICTION_NLI_WORKERS` | `6` | Bounded concurrency of the NLI calls (1-16) |
+
+## HTTP authentication
+
+The `streamable-http` and `sse` transports expose every tool, including
+`drop_project`, `prune_memories` and `import_memories`. They are protected by a
+shared bearer token:
+
+```dotenv
+MCP_AUTH_TOKEN=<generate with: python -c "import secrets; print(secrets.token_urlsafe(32))">
+```
+
+Every request must send `Authorization: Bearer <MCP_AUTH_TOKEN>`; requests
+without it are answered with HTTP 401 before they reach a tool. `stdio` is
+unaffected (the client owns the process).
+
+Startup is fail-closed: an HTTP transport bound to a non-loopback address
+without a token refuses to start. `MCP_ALLOW_INSECURE_HTTP=true` disables that
+check for a trusted sandbox. Docker Compose publishes the MCP, Postgres and
+inference ports on `127.0.0.1` only; to expose the MCP port to another machine,
+change the mapping to `"8766:8766"` and keep the token set.
+
+The Docker Compose file requires `POSTGRES_PASSWORD` as well and refuses to
+start while it is empty.
 
 ## LLM providers
 
@@ -79,7 +106,23 @@ the verdict and reports the unjudged ones as `contradictions.unjudged` plus a
 `contradiction check incomplete` warning; only a failure that leaves nothing
 judable skips the check.
 
-Embeddings always run locally — no key needed. The default image is CUDA
+### Data egress
+
+`groq`, `openai` and `anthropic` are hosted services. A contradiction check
+sends the two compared memory texts to the provider (`/nli` builds
+`Fact A: ...` / `Fact B: ...` and posts it to the provider endpoint). This is
+the only path that moves stored content off the machine: embeddings and
+reranking run locally.
+
+Use `LLM_PROVIDER=ollama` or `openai-compatible` with a local endpoint, or
+`LLM_PROVIDER=none`, to keep memory content local. `server_health` reports the
+active `llm_provider`, and `data_egress` is `true` when that provider is a
+hosted one; it adds a `data egress` warning in that case.
+
+Stored content still leaves the machine when a tool result is returned to the
+calling agent - that is the client's transport, not this server.
+
+Embeddings always run locally - no key needed. The default image is CUDA
 enabled and uses an NVIDIA GPU when one is exposed; without a GPU it runs on
 CPU.
 

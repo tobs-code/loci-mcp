@@ -6,11 +6,14 @@ import psycopg2.extras
 from contextlib import contextmanager
 
 from mcp_server.config import FTS_LANGUAGE
+from mcp_server.startup_status import record_warning
 logger = logging.getLogger(__name__)
 
+# No password in the default: the credential belongs in MEMORY_DATABASE_URL.
+# Docker Compose supplies a DSN built from POSTGRES_USER/POSTGRES_PASSWORD.
 DATABASE_URL = os.environ.get(
     "MEMORY_DATABASE_URL",
-    "postgresql://memory:geheim@localhost:5432/memory",
+    "postgresql://memory@localhost:5432/memory",
 )
 
 # An IVFFlat index probes only `ivfflat.probes` lists (default 1). With 100
@@ -189,6 +192,11 @@ def ensure_schema():
             except Exception as e:
                 cur.execute("ROLLBACK TO SAVEPOINT ddl")
                 logger.warning("Schema statement skipped (%s): %s", str(idx)[:80], e)
+                if "tsvector" in idx:
+                    # A missing/broken full-text index degrades every search
+                    # silently; expose it through server_health instead of a
+                    # log line alone.
+                    record_warning(f"full-text index unavailable: {e}")
         dedup_sql = """
             DELETE FROM relations WHERE id IN (
                 SELECT id FROM (

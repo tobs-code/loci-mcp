@@ -3,11 +3,12 @@ services:
     build: .
     shm_size: 1g
     environment:
-      POSTGRES_PASSWORD: geheim
-      POSTGRES_USER: memory
-      POSTGRES_DB: memory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: ${POSTGRES_USER:-memory}
+      POSTGRES_DB: ${POSTGRES_DB:-memory}
     ports:
-      - "5432:5432"
+      # Loopback only: the database is an internal service, not a public API.
+      - "127.0.0.1:5432:5432"
     volumes:
       - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql
       - pgdata:/var/lib/postgresql/data
@@ -23,7 +24,9 @@ services:
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}
     ports:
-      - "8001:8000"
+      # Loopback only: the MCP server reaches inference over the compose
+      # network, so the host does not need an externally reachable port.
+      - "127.0.0.1:8001:8000"
     environment:
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       LLM_PROVIDER: ${LLM_PROVIDER:-groq}
@@ -53,12 +56,21 @@ services:
       context: .
       dockerfile: mcp_server/Dockerfile
     ports:
-      - "8766:8766"
+      # Loopback only by default. To reach the server from another machine,
+      # publish it explicitly ("8766:8766") AND keep MCP_AUTH_TOKEN set.
+      - "127.0.0.1:8766:8766"
     environment:
-      MEMORY_DATABASE_URL: postgresql://memory:geheim@postgres:5432/memory
+      # Special characters in the password must be percent-encoded for a URL,
+      # or set MEMORY_DATABASE_URL explicitly.
+      MEMORY_DATABASE_URL: postgresql://${POSTGRES_USER:-memory}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-memory}
       MEMORY_INFERENCE_URL: http://inference:8000
       MCP_TRANSPORT: streamable-http
       MCP_PORT: "8766"
+      # Required: the HTTP transport exposes every tool, including the
+      # destructive maintenance ones. The server refuses to start on a
+      # non-loopback bind without this token.
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
+      MCP_ALLOW_INSECURE_HTTP: ${MCP_ALLOW_INSECURE_HTTP:-false}
       RERANK_ENABLED: ${RERANK_ENABLED:-true}
       RERANK_MODEL: ${RERANK_MODEL:-mixedbread-ai/mxbai-rerank-base-v1}
       RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-256}

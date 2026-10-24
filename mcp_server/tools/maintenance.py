@@ -50,9 +50,15 @@ from mcp_server.scope_catalog import (
     _table_exists,
 )
 from mcp_server.storage import clear_dangling_supersede
+from mcp_server.startup_status import startup_warnings
 from mcp_server.version import STARTED_AT, VERSION, code_fingerprint
 
 logger = logging.getLogger(__name__)
+
+# Providers whose endpoint is hosted by a third party. A contradiction check
+# sends the compared memory content to them; the local providers do not leave
+# the machine.
+_EXTERNAL_LLM_PROVIDERS = {"groq", "openai", "anthropic"}
 
 
 # A scope-wide scan performs one NLI call per candidate fact; without a
@@ -577,6 +583,18 @@ def server_health() -> dict[str, Any]:
     toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
     if toolset not in ("core", "full"):
         toolset = "full"
+    llm_provider = (inference_details.get("llm_provider")
+                    if inference_details is not None else None)
+    # `data_egress` is None when no provider is known, True when memory content
+    # can leave the machine for a contradiction check, False for local/off.
+    data_egress = (None if llm_provider is None
+                   else llm_provider in _EXTERNAL_LLM_PROVIDERS)
+    warnings: list[str] = []
+    if data_egress:
+        warnings.append(
+            f"data egress: contradiction checks send memory content to the "
+            f"{llm_provider} API; use LLM_PROVIDER=ollama/openai-compatible "
+            f"with a local endpoint (or none) to keep it on this machine")
     return ok(
         STATUS_OK,
         version=VERSION,
@@ -587,6 +605,11 @@ def server_health() -> dict[str, Any]:
         nli_configured=(inference_details.get("llm_configured")
                         if inference_details is not None
                         and "llm_configured" in inference_details else None),
+        llm_provider=llm_provider,
+        llm_model=(inference_details.get("llm_model")
+                   if inference_details is not None else None),
+        data_egress=data_egress,
+        startup_warnings=startup_warnings(),
         rerank_enabled=RERANK_ENABLED,
         rerank_model=(inference_details.get("rerank_model")
                       if inference_details is not None
@@ -596,6 +619,7 @@ def server_health() -> dict[str, Any]:
         rerank_error=(inference_details.get("rerank_error")
                       if inference_details is not None else None),
         toolset=toolset,
+        warnings=warnings,
     )
 
 
@@ -640,6 +664,7 @@ def stats_resource() -> str:
         "entities": entities,
         "relations": relations,
         "inference_healthy": _health_check(),
+        "startup_warnings": startup_warnings(),
     }, indent=2)
 
 

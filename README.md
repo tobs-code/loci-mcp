@@ -16,7 +16,9 @@ read, connect and forget.
 ## Quick Start
 
 ```bash
-cp .env.example .env   # configure an LLM provider (Groq by default)
+cp .env.example .env
+# Required: set POSTGRES_PASSWORD and MCP_AUTH_TOKEN (see the comments in
+# .env.example; generate each with: python -c "import secrets; print(secrets.token_urlsafe(32))")
 docker compose up -d
 ```
 
@@ -24,15 +26,28 @@ That starts three services:
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **PostgreSQL** | `5432` | User/DB: `memory`, password: `geheim` |
-| **Inference API** | `8001` | Embeddings (local; GPU when available, CPU fallback) + NLI (configurable LLM) |
-| **Loci MCP** | `8766` | The MCP server (Streamable HTTP) |
+| **PostgreSQL** | `127.0.0.1:5432` | User/DB from `.env` (`memory`/`memory` by default), password from `POSTGRES_PASSWORD` |
+| **Inference API** | `127.0.0.1:8001` | Embeddings (local; GPU when available, CPU fallback) + NLI (configurable LLM) |
+| **Loci MCP** | `127.0.0.1:8766` | The MCP server (Streamable HTTP, bearer-token protected) |
 
+> **Authentication.** The HTTP transport exposes every tool, including
+> `drop_project` and `prune_memories`. Every request must send
+> `Authorization: Bearer <MCP_AUTH_TOKEN>`; the server refuses to start on a
+> non-loopback bind without a token. Ports are published on loopback only by
+> default. To reach the server from another machine, change the mapping to
+> `"8766:8766"` **and** keep the token set.
+>
 > Contradiction detection needs an LLM key. Groq is the default; set
 > `LLM_PROVIDER` to `openai`, `anthropic`, `ollama`, `openai-compatible` or
 > `auto` to use another provider, or `none` to disable NLI. Embeddings always
 > run locally: the image uses an NVIDIA GPU when Docker exposes one and falls
 > back to CPU otherwise. See [GPU acceleration](docs/configuration.md#gpu).
+>
+> **Data egress.** `groq`, `openai` and `anthropic` are hosted providers: when
+> a contradiction check runs, the compared memory content is sent to them.
+> Use `ollama`/`openai-compatible` with a local endpoint (or `LLM_PROVIDER=none`)
+> to keep memory content on this machine. `server_health` reports the active
+> provider and whether it is external (`data_egress`).
 >
 > ```bash
 > # Requires a driver and the NVIDIA Container Toolkit
@@ -46,7 +61,10 @@ That starts three services:
   "mcpServers": {
     "loci": {
       "type": "streamable-http",
-      "url": "http://localhost:8766"
+      "url": "http://localhost:8766",
+      "headers": {
+        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
+      }
     }
   }
 }
@@ -155,11 +173,15 @@ remember(content="The API runs on Postgres", entity="API", project="api")
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MEMORY_DATABASE_URL` | `postgresql://memory:geheim@localhost:5432/memory` | Postgres DSN |
+| `MEMORY_DATABASE_URL` | `postgresql://memory@localhost:5432/memory` | Postgres DSN (supply the password here) |
+| `POSTGRES_PASSWORD` | - (required by compose) | Password for the bundled Postgres; also used to build the DSN |
+| `POSTGRES_USER` / `POSTGRES_DB` | `memory` | Bundled Postgres user and database |
 | `MEMORY_INFERENCE_URL` | `http://localhost:8001` | Inference API |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http` only) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http` only) |
+| `MCP_AUTH_TOKEN` | - (required for HTTP) | Bearer token every HTTP request must send |
+| `MCP_ALLOW_INSECURE_HTTP` | `false` | Allow an unauthenticated non-loopback HTTP bind (sandbox only) |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available), `cpu` or `cuda` |
 | `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
 | `LLM_MODEL` | provider default | NLI model |

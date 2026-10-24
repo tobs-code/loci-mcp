@@ -175,6 +175,14 @@ RERANK_ALWAYS = _env_bool("RERANK_ALWAYS", False)
 RERANK_MAX_LENGTH = _env_int("RERANK_MAX_LENGTH", 256, 64, 512)
 
 
+# HTTP transports expose every tool, including the destructive maintenance
+# ones. A shared bearer token is required for a non-loopback bind; see
+# mcp_server.http_auth. `MCP_ALLOW_INSECURE_HTTP=true` is the explicit opt-out
+# for a trusted sandbox (it is never a good default).
+MCP_AUTH_TOKEN = (os.getenv("MCP_AUTH_TOKEN") or "").strip()
+MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
+
+
 PROJECT_SCOPE_BOOST = 0.05
 
 

@@ -40,7 +40,7 @@ CREATE TABLE relations (
 );
 
 CREATE INDEX idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-CREATE INDEX idx_memories_tsvector ON memories USING GIN (to_tsvector('german', content));
+CREATE INDEX idx_memories_tsvector ON memories USING GIN (to_tsvector('english', content));
 CREATE INDEX idx_memories_type ON memories(mem_type);
 CREATE INDEX idx_memories_entity ON memories(entity);
 CREATE INDEX idx_memories_hash ON memories(content_hash);

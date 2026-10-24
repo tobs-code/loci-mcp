@@ -3,8 +3,14 @@ import os
 
 from mcp_server.app import app
 from mcp_server.backup import export_memories, import_memories
-from mcp_server.config import SENTINEL_FORGOTTEN
+from mcp_server.config import (
+    MCP_ALLOW_INSECURE_HTTP,
+    MCP_AUTH_TOKEN,
+    SENTINEL_FORGOTTEN,
+)
 from mcp_server.db import ensure_schema, get_conn
+from mcp_server.http_auth import BearerAuthMiddleware, resolve_http_auth
+from mcp_server.startup_status import record_warning
 from mcp_server.graph import (
     find_connections,
     find_paths,
@@ -152,11 +158,28 @@ def main() -> None:
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8766"))
 
+    # Fail before touching the database: an exposed, unauthenticated HTTP
+    # transport hands every tool (including drop_project/prune_memories) to
+    # anyone who can reach the port.
+    auth_token = resolve_http_auth(
+        transport, host,
+        token=MCP_AUTH_TOKEN,
+        allow_insecure=MCP_ALLOW_INSECURE_HTTP,
+    )
+    if auth_token:
+        logger.info("HTTP bearer authentication enabled")
+    elif transport in {"sse", "streamable-http"} and MCP_ALLOW_INSECURE_HTTP:
+        logger.warning(
+            "MCP_ALLOW_INSECURE_HTTP=true: the HTTP transport is running "
+            "without authentication - only use this in a trusted sandbox")
+
     try:
         ensure_schema()
         logger.info("Schema OK")
     except Exception as e:
-        logger.warning("Schema may already exist: %s", e)
+        message = f"schema initialization failed: {e}"
+        logger.error(message)
+        record_warning(message)
 
     # Full-text indexes must use the configured dictionary; rebuild stale ones.
     try:
@@ -165,12 +188,16 @@ def main() -> None:
             logger.info("Rebuilt %s full-text index(es) for the current dictionary",
                         rebuilt)
     except Exception as e:
-        logger.warning("Full-text index migration skipped: %s", e)
+        message = f"full-text index migration skipped: {e}"
+        logger.error(message)
+        record_warning(message)
 
     try:
         migrate_memory_tables()
     except Exception as e:
-        logger.warning("Schema migration skipped: %s", e)
+        message = f"memory table migration skipped: {e}"
+        logger.error(message)
+        record_warning(message)
 
     # Deduplicate AGE edges (keep only the first edge per directed pair+type)
     try:
@@ -188,18 +215,25 @@ def main() -> None:
         if dup_rows:
             logger.info("Deduplicated %s duplicate AGE edge groups", len(dup_rows))
     except Exception as e:
-        logger.warning("AGE edge dedup skipped: %s", e)
+        message = f"AGE edge dedup skipped: {e}"
+        logger.error(message)
+        record_warning(message)
 
     if transport == "sse":
         import uvicorn
-        asgi_app = app.sse_app()
+        asgi_app = _with_auth(app.sse_app(), auth_token)
         logger.info("Starting SSE MCP server on %s:%s", host, port)
         uvicorn.run(asgi_app, host=host, port=port, log_level="info")
     elif transport == "streamable-http":
         import uvicorn
-        asgi_app = app.streamable_http_app()
+        asgi_app = _with_auth(app.streamable_http_app(), auth_token)
         logger.info("Starting Streamable HTTP MCP server on %s:%s", host, port)
         uvicorn.run(asgi_app, host=host, port=port, log_level="info")
     else:
         logger.info("Starting MCP server (transport=stdio)")
         app.run(transport="stdio")
+
+
+def _with_auth(asgi_app, token: str | None):
+    """Wrap an ASGI app with bearer auth when a token is configured."""
+    return BearerAuthMiddleware(asgi_app, token) if token else asgi_app

@@ -296,7 +296,8 @@ def recall(
     When the first stage is ambiguous (best relevance below 0.85 and margin
     to the runner-up below 0.10), the top candidates are reranked by a local
     cross-encoder; `reranked` reports how many were rescored. Reranked rows
-    carry `_rerank_score` (a softmax over that candidate block) and an
+    carry `_rerank_score` (a per-candidate sigmoid of the cross-encoder logit,
+    so the value does not depend on the candidate block size) and an
     updated `_relevance_score`; `_similarity` still reports the vector score.
     A reranker failure is reported in `rerank_error` and falls back to the
     first-stage ranking.
@@ -306,8 +307,9 @@ def recall(
     alone. `_similarity` is the raw cosine similarity (0..1): a natural
     language question that matches scores ~0.6-0.95, a bare keyword that
     occurs verbatim in the memory only ~0.3-0.6.
-    `_scope_boost` (0.05) is added to `_relevance_score` for a project row,
-    so a project memory outranks an equally relevant global one.
+    `_scope_boost` is compressed with the relevance for a project row:
+    `0.05 * (1 - relevance)`, so a weak project hit gains more than a strong
+    one and a project memory outranks an equally relevant global one.
     `_final_score` is the ranking score in 0..1: relevance blended with decay
     plus the graph boost. It is only present with `include_decay=True` or
     `graph_boost=True`; without them the ranking is `_relevance_score`.

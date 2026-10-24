@@ -1,4 +1,8 @@
 import psycopg2, json
+import os
+
+DSN = os.environ.get(
+    "MEMORY_DATABASE_URL", "postgresql://memory@postgres:5432/memory")
 
 
 # Manual debug script for Apache AGE Cypher parameters. Run it from inside
@@ -8,7 +12,7 @@ import psycopg2, json
 # not collect or import-execute it.
 
 def probe(desc, sql, params=None):
-    conn = psycopg2.connect("postgresql://memory:geheim@postgres:5432/memory")
+    conn = psycopg2.connect(DSN)
     cur = conn.cursor()
     cur.execute("LOAD 'age'")
     cur.execute("SET search_path TO ag_catalog, public")

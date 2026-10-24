@@ -86,7 +86,7 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 | `verify_integrity` | Find rows hidden by a broken `superseded_by` (target missing or self), report supersede chains and expired active rows. Broken links and chain rows are listed in `results` (`problem` names the kind, chains also carry `chain_to`); `chains` counts them even when `limit` truncates the list; a chain alone adds a warning instead of "no integrity problems found". `project`, `fix` (clear broken links), `limit`. `fix=true` never deletes content or restores a valid supersede, and the counts and `results` then describe the state AFTER the repair (`fixed` carries what was cleared). |
 | `drop_project` | Remove a scope completely: memory table, registry entry, graph nodes, mirror rows. `project`, `dry_run`. `global` is refused. A graph-only scope is removed as well. Dangling supersede links of other scopes are cleared. Counts include `active_memories`/`already_forgotten` so a dry run can be compared with `forget(entity="*")`. |
 | `prune_memories` | Permanently delete inactive rows only (active memories are never touched). `project` (default: every scope), `older_than_days` (default 30), `include_expired`/`include_forgotten` (default true), `include_superseded` (default false: history is kept), `dry_run` (default true). Removes rows whose `expires_at`/`deleted_at` is older than the cutoff, and clears supersede links that would dangle afterwards. `counts` carries `memories` and per-scope `by_scope`; the message says "Would remove" or "Removed". |
-| `server_health` | Check Postgres, inference and NLI configuration. Reports `version`, `code_fingerprint` (detects a stale container), `started_at`, `toolset`. |
+| `server_health` | Check Postgres, inference and NLI configuration. Reports `version`, `code_fingerprint` (detects a stale container), `started_at`, `toolset`, `llm_provider`/`llm_model`, `data_egress` (true when contradiction checks send memory content to a hosted LLM: `groq`/`openai`/`anthropic`), and `startup_warnings` (schema/FTS migrations that failed at startup instead of only logging). Adds a `data egress` warning for a hosted provider. |
 
 `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (15 tools:
 `remember`, `remember_batch`, `update_memory`, `forget`, `recall`,
@@ -411,11 +411,14 @@ counts and health.
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MEMORY_DATABASE_URL` | `postgresql://memory:geheim@localhost:5432/memory` | PostgreSQL connection string |
+| `MEMORY_DATABASE_URL` | `postgresql://memory@localhost:5432/memory` | PostgreSQL connection string |
 | `MEMORY_INFERENCE_URL` | `http://localhost:8001` | Inference API base URL |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (`sse`/`streamable-http`) |
 | `MCP_PORT` | `8766` | Port (`sse`/`streamable-http`) |
+| `MCP_AUTH_TOKEN` | – (required for HTTP) | Shared bearer token; every HTTP request must send `Authorization: Bearer <token>`. A non-loopback HTTP bind refuses to start without it |
+| `MCP_ALLOW_INSECURE_HTTP` | `false` | Allow an unauthenticated non-loopback HTTP bind (trusted sandbox only) |
+| `POSTGRES_PASSWORD` | – (required by compose) | Password for the bundled Postgres; compose builds the DSN from it |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary (invalid values fall back to `english`) |
 | `RERANK_ENABLED` | `true` | Local cross-encoder reranking of ambiguous first-stage results |
 | `RERANK_MODEL` | `mixedbread-ai/mxbai-rerank-base-v1` | Cross-encoder model; loaded by the inference service |
@@ -446,6 +449,8 @@ python -m mcp_server
 
 # Full stack
 cp .env.example .env
+# set POSTGRES_PASSWORD and MCP_AUTH_TOKEN first, e.g.
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 docker compose up -d
 
 # GPU inference (NVIDIA Container Toolkit required; base compose stays on CPU)
