@@ -60,6 +60,7 @@ from mcp_server.scope_catalog import (
     _norm_entity,
     _project_names,
     _scope_key,
+    _scope_of_table,
 )
 from mcp_server.scoring import _decay_norm
 from mcp_server.search import (
@@ -1317,6 +1318,7 @@ def get_entity(name: Annotated[
     scopes_searched: list[str] = []
     memories_by_scope: dict[str, int] = {}
     scope_presence: dict[str, str] = {}
+    found_elsewhere: dict[str, str] = {}
     try:
         cur = db.cur
         tables, scopes_searched = (tables_and_scopes(cur, scope, MODE_PROJECT)
@@ -1368,6 +1370,27 @@ def get_entity(name: Annotated[
             entity_data = {"id": row[0], "name": row[1], "type": "graph",
                            "label": row[2], "project": row[3],
                            "connections": details["connections"]}
+        if entity_data is None and not memories:
+            # "Not found" in the searched scopes does not mean the name is
+            # unknown: the same entity tag can live in another scope the
+            # caller did not search (a project table or its graph). Name
+            # those scopes, so a plain miss is never mistaken for a typo.
+            # Best-effort: a hint failure must degrade to a plain not-found,
+            # not turn the whole lookup into an error.
+            try:
+                for entity_table in _all_mem_tables(cur):
+                    table_scope = _scope_of_table(cur, entity_table)
+                    if table_scope in scopes_searched:
+                        continue
+                    if entity_present(db, entity_table, target):
+                        found_elsewhere[table_scope] = "memory"
+                for entity_project in graph_projects(db, target):
+                    scope_name = entity_project or "global"
+                    if scope_name in scopes_searched:
+                        continue
+                    found_elsewhere[scope_name] = "graph"
+            except Exception as e:
+                logger.warning("get_entity scope hint failed: %s", e)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -1384,7 +1407,23 @@ def get_entity(name: Annotated[
             "connections": [],
         }
     if entity_data is None and not memories:
-        return fail(STATUS_NOT_FOUND, f"entity not found: {target}", entity=target)
+        if found_elsewhere:
+            return fail(
+                STATUS_NOT_FOUND,
+                f"entity not found: {target} (in the searched scopes: "
+                f"{', '.join(scopes_searched)}; it exists in the scope(s) "
+                f"{', '.join(sorted(found_elsewhere))} - repeat the call "
+                f"with project=<name> for one of them)",
+                entity=target,
+                scopes_with_entity=found_elsewhere,
+                warnings=[
+                    f"entity {target!r} exists in the scope(s) "
+                    f"{', '.join(sorted(found_elsewhere))} - repeat the call "
+                    f"with project=<name> for one of them"
+                ],
+            )
+        return fail(STATUS_NOT_FOUND, f"entity not found: {target}",
+                    entity=target)
     if len(scope_presence) > 1:
         entity_data["scopes_with_entity"] = scope_presence
         detail_scope = entity_data.get("project") or "global"

@@ -744,7 +744,16 @@ class ContradictionScan:
         self._clock = clock
 
     def scan(self, request: ScanRequest) -> ScanReport:
+        # The budget is the wall-clock contract of the whole call, not only
+        # of the NLI leg: loading candidates (a pgvector search per seed) sits
+        # in front of the judge leg, so a budget that starts at the judge
+        # call alone could push the total past the client's transport
+        # timeout - the exact failure the budget exists to prevent.
+        started = self._clock()
         loaded = self._load(request)
+        # A small reserve covers result assembly and the resolution pass; the
+        # judge leg gets the rest.
+        remaining = request.budget_seconds - (self._clock() - started) - 1.5
         if loaded.warning is not None:
             return ScanReport(warnings=[loaded.warning],
                               candidates=0, entity=request.entity)
@@ -757,11 +766,31 @@ class ContradictionScan:
                     f"enough to be worth comparing"],
                 candidates=0, timestamps=loaded.timestamps,
                 entity=request.entity)
+        if remaining <= 0.5:
+            warnings = [
+                f"scan incomplete: candidate loading consumed the NLI time "
+                f"budget of {request.budget_seconds}s (remaining "
+                f"{remaining:.1f}s for judge calls); narrow the scan with "
+                f"`entity`, lower `limit`, or raise `budget_seconds`"
+            ]
+            failures = [{
+                "fact_id": group.fact["id"],
+                "neighbor_ids": [n.id for n in group.neighbours],
+                "reason": SKIPPED_BUDGET_REASON,
+                "kind": "budget",
+            } for group in loaded.groups]
+            return ScanReport(
+                warnings=warnings,
+                budget_exhausted=True,
+                candidates=len(loaded.groups),
+                failures=failures,
+                timestamps=loaded.timestamps,
+                entity=request.entity)
 
         try:
             judgement = judge_candidates(
                 loaded.groups, self._nli,
-                budget=request.budget_seconds,
+                budget=remaining,
                 workers=request.workers,
                 clock=self._clock,
             )
@@ -778,6 +807,15 @@ class ContradictionScan:
                 candidates=len(loaded.groups),
                 timestamps=loaded.timestamps,
                 entity=request.entity)
+
+    @staticmethod
+    def _unjudged_entry(group: CandidateGroup) -> dict:
+        return {
+            "fact_id": group.fact["id"],
+            "neighbor_ids": [n.id for n in group.neighbours],
+            "reason": SKIPPED_BUDGET_REASON,
+            "kind": "budget",
+        }
 
     def plan_resolution(self, report: ScanReport, *, resolve: str,
                         min_confidence: float,

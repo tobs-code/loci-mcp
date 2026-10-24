@@ -29,7 +29,7 @@
 | `OPENAI_API_KEY` | – | Used when `LLM_PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | – | Used when `LLM_PROVIDER=anthropic` |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Ollama endpoint |
-| `CONTRADICTION_SCAN_BUDGET_SECONDS` | `40` | Wall-clock budget for the NLI leg of `contradictions_report`; on exhaustion the scan stops early and names unjudged pairs in `nli_failures` |
+| `CONTRADICTION_SCAN_BUDGET_SECONDS` | `40` | Wall-clock budget for the whole `contradictions_report` scan (candidate loading plus the NLI leg); on exhaustion the scan stops early and names unjudged pairs in `nli_failures` |
 | `CONTRADICTION_NEIGHBORS` | `6` | Vector neighbours fetched per memory per searched scope table (1-20); the closest pairs are judged first |
 | `CONTRADICTION_NLI_WORKERS` | `6` | Bounded concurrency of the NLI calls (1-16) |
 
@@ -74,7 +74,10 @@ treating those zeros as judgments. `contradictions_report` short-circuits when
 health reports no configured provider and returns `nli_configured=false` plus
 a warning; write tools keep the fact and warn
 (`contradiction check skipped: NLI unavailable: ...`) in `warnings` and
-`contradictions.skipped`.
+`contradictions.skipped`. A partial NLI failure with judged candidates keeps
+the verdict and reports the unjudged ones as `contradictions.unjudged` plus a
+`contradiction check incomplete` warning; only a failure that leaves nothing
+judable skips the check.
 
 Embeddings always run locally — no key needed. The default image is CUDA
 enabled and uses an NVIDIA GPU when one is exposed; without a GPU it runs on

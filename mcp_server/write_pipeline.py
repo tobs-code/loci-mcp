@@ -241,19 +241,22 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
                 if compute_near else None)
 
     contradictions: list[dict] = []
+    contradiction_unjudged: list[dict] = []
+    contradiction_partial_error: str | None = None
     contradiction_skip: str | None = None
     nli_unavailable = (intent.check_contradictions
                        and intent.probe_nli_config
                        and nli_configured() is False)
     if intent.check_contradictions and not nli_unavailable:
         try:
-            contradictions = _check_contradictions(
+            contradictions, contradiction_unjudged = _check_contradictions(
                 cur, content, entity, store_project, emb)
         except Exception as e:
             # A failed NLI must not kill the write: the fact is stored
             # unencumbered, but the skipped check is surfaced loudly.
             logger.warning("contradiction check failed: %s", e)
             contradictions = []
+            contradiction_unjudged = []
             contradiction_skip = f"NLI unavailable: {e}"
 
     # Resolve the replaced memories before storing: "supersede_last" must see
@@ -384,7 +387,8 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         # (explicit supersede or the contradiction check) needs no extra
         # advice: the `superseded` list already names it.
         near_warning = _near_duplicate_warning(
-            near_dup, entity, near_conflict, new_content=content)
+            near_dup, entity, near_conflict, new_content=content,
+            explicit_supersede=intent.supersede or intent.supersede_content)
 
     cross_warning = (_cross_scope_warning(cross_scope_superseded)
                      if cross_scope_superseded else None)
@@ -409,6 +413,11 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
                     if nli_unavailable else None))
         if skip:
             contradictions_payload["skipped"] = skip
+        if contradiction_unjudged:
+            # A partial NLI failure no longer discards the whole check: the
+            # judged pairs count, the rest is reported as unverified, so a
+            # skipped candidate is never silently read as "no contradiction".
+            contradictions_payload["unjudged"] = contradiction_unjudged
         if not entity and not skip:
             # Transparency: the check ran, but beyond the entity tag.
             contradictions_payload["cross_entity"] = True
@@ -424,6 +433,14 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         warnings.append(cross_warning)
     if cross_duplicate_warning:
         warnings.append(cross_duplicate_warning)
+    if contradiction_unjudged:
+        reason = (contradiction_unjudged[0].get("reason")
+                  or "NLI provider failure")
+        warnings.append(
+            f"contradiction check incomplete: NLI could not judge "
+            f"{len(contradiction_unjudged)} of the candidate memories "
+            f"({reason}); those pairs are unverified "
+            f"(contradictions.unjudged)")
 
     return WriteOutcome(
         status=STATUS_STORED,
@@ -779,7 +796,8 @@ def _same_subject_entity(near_dup: dict, entity: str | None) -> bool:
 def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
                             conflict: bool = False,
                             update: bool = False,
-                            new_content: str | None = None) -> str:
+                            new_content: str | None = None,
+                            explicit_supersede: str | None = None) -> str:
     """Warning for a write that dedupe did not match but that still reads
     like a reworded copy of an active memory (remember + remember_batch).
 
@@ -794,7 +812,26 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
     point at a separate supersede (remember call) or an edit of that row -
     "pass supersede=<id>" on the tool that is running would be advice the
     caller cannot execute.
+
+    `explicit_supersede` names the supersede directive the SAME write already
+    carried (its id or content). The near-duplicate matched a different row,
+    so the two hints must not be stacked as "pass supersede=<near id>" with
+    no context: the caller sent one supersede directive and it did not
+    replace THIS memory. The advice then carries a reconciliation note naming
+    both ids, instead of reading like a contradiction between the response's
+    own warnings.
     """
+    note = ""
+    if not update and explicit_supersede:
+        # The near-duplicate id is never the supersede target itself here:
+        # a write that replaced its own near-duplicate is excluded upstream
+        # ("already listed in superseded"). So the directive the caller sent
+        # pointed somewhere else and the advice has to say that.
+        note = (
+            f" Note: this write already carried a supersede directive "
+            f"({explicit_supersede}) that did not replace {near_dup['id']} - "
+            f"reconcile the two supersede targets in your next call"
+        )
     if not _same_subject_entity(near_dup, entity):
         old_entity = near_dup.get("entity")
         new_entity = entity if entity is not None else "untagged"
@@ -821,7 +858,7 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"same subject, tag them with the same entity; only pass "
             f"supersede={near_dup['id']} if you are sure the other fact must "
             f"be replaced. Matched content: {preview!r}"
-        )
+        ) + note
     if (new_content is not None and near_dup.get("content")
             and not _shares_subject(
                 new_content, near_dup["content"], entity,
@@ -849,7 +886,7 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"they describe different subjects/attributes and were stored as "
             f"separate facts. Do not pass supersede={near_dup['id']} merely "
             f"because the wording is close. Matched content: {preview!r}"
-        )
+        ) + note
     if conflict:
         if update:
             return (
@@ -870,7 +907,7 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"check_contradictions=true to let NLI decide, "
             f"supersede={near_dup['id']} to replace the old fact, or "
             f"dedupe='off' to store without this warning"
-        )
+        ) + note
     if update:
         return (
             f"near-duplicate: active memory {near_dup['id']} matches the "
@@ -885,7 +922,7 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
         f"with similarity {near_dup['similarity']} - the write looks like a "
         f"reworded copy; pass supersede={near_dup['id']} to replace it, or "
         f"dedupe='off' to store without this warning"
-    )
+    ) + note
 
 
 def _ttl_past_warning(value: Any) -> str | None:

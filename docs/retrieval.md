@@ -297,14 +297,17 @@ and warns about the broader comparison, so it is never silent.
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
    memory, not one call per pair. The calls run in a bounded pool (6 workers,
    `CONTRADICTION_NLI_WORKERS`) and are reported in candidate order.
-4. The NLI leg has a wall-clock budget (`budget_seconds`, default 40s or
-   `CONTRADICTION_SCAN_BUDGET_SECONDS`). When it runs out the scan stops early,
-   returns the pairs judged so far, sets `budget_exhausted: true` and lists
-   every unchecked pair in `nli_failures` with
-   `reason: "skipped: NLI time budget exhausted"`. The transport call no
-   longer dies with a timeout, so a partial scan is visible and machine
-   readable. Narrow the scan (`entity`, lower `limit`) or raise the budget to
-   check more.
+4. The whole scan runs on one wall-clock budget (`budget_seconds`, default
+   40s or `CONTRADICTION_SCAN_BUDGET_SECONDS`): candidate loading (a pgvector
+   search per seed) eats into the same budget as the NLI leg, so the total
+   call stays inside the client's transport timeout. A load that consumed
+   the budget returns before any NLI call with a warning
+   ("candidate loading consumed the NLI time budget ..."), sets
+   `budget_exhausted: true` and lists every unchecked pair in `nli_failures`
+   with `reason: "skipped: NLI time budget exhausted"`. When the judge leg
+   runs out, the scan returns the pairs judged so far. A partial scan is
+   visible and machine readable. Narrow the scan (`entity`, lower `limit`)
+   or raise the budget to check more.
 5. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
    the entity of both facts and a `cross_entity` flag.
 6. `resolve="newest"` (opt-in) keeps the most recently **created** memory of
@@ -352,7 +355,13 @@ write tools keep the fact and warn
 **outage**: `/nli` sets an `error` field instead of silently returning zeros,
 and the client raises. `contradictions_report` marks the scan as incomplete
 (`warnings: ["scan incomplete: ... - the result is not a clean contradiction
-scan"]`) when the loop aborts mid-way.
+scan"]`) when the loop aborts mid-way. A write-side **partial** failure keeps
+the verdict: the candidates the provider did judge still produce
+contradictions, and the rest is reported as `contradictions.unjudged`
+(`existing_id`, `existing_content`, `reason`) plus a `contradiction check
+incomplete` warning - an unjudged pair is never silently read as "no
+contradiction". Only a failure that leaves nothing judable skips the whole
+check (`contradictions.skipped`).
 
 ## Superseding
 

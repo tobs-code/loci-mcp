@@ -308,8 +308,14 @@ def _find_last_in_scope(cur, project: str | None,
 def _check_contradictions(cur, content: str, entity: str | None,
                           project: str | None,
                           embedding_vec: list[float] | None = None,
-                          max_candidates: int = 15) -> list[dict]:
+                          max_candidates: int = 15
+                          ) -> tuple[list[dict], list[dict]]:
     """NLI-check the new fact against the nearest active memories of the scope.
+
+    Returns (contradictions, unjudged): `contradictions` are the confirmed
+    pairs, `unjudged` names the candidates the provider could not judge
+    (each with the provider's `reason`), so those pairs are reported as
+    unverified instead of being read as clean "neutral" 0.0 placeholders.
 
     With an `entity`, that entity's memories are candidates first; any seats
     left over go to the nearest neighbours from *other* entities, so a conflict
@@ -328,10 +334,13 @@ def _check_contradictions(cur, content: str, entity: str | None,
 
     Judgments travel through `nli_detailed`, matching the report path: a
     candidate document the provider could not judge is never read as a 0.0
-    "neutral" score. A partial failure raises, so the write surfaces
+    "neutral" score. A partial failure no longer discards the whole check:
+    the candidates that WERE judged still produce contradictions, and
+    `unjudged` lists the rest. Only a failure that leaves nothing judable
+    (an outage, or a stale inference container that cannot name its failed
+    indices) raises, so the write surfaces
     "contradiction check skipped: NLI unavailable: ..." instead of silently
-    leaving a possibly contradicting pair active (this used to be silent on
-    the thin `nli()` wrapper, which dropped `partial_error`).
+    leaving a possibly contradicting pair active.
     """
     from mcp_server.contradiction_scan import nearest_active
 
@@ -363,29 +372,40 @@ def _check_contradictions(cur, content: str, entity: str | None,
 
     candidates = candidates[:max_candidates]
     if not candidates:
-        return []
+        return [], []
 
     candidate_contents = [c[1] for c in candidates]
     candidate_entities = [c[2] for c in candidates]
     # The entity labels are hints for the NLI model: a differing port of two
     # different services reads very differently when the model knows that the
     # two facts are stored under different entities.
-    scores, partial_error, _failed = nli_detailed(
+    scores, partial_error, failed_indices = nli_detailed(
         content, candidate_contents,
         query_entity=entity, document_entities=candidate_entities)
-    if partial_error:
-        # At least one candidate was not judged. Its 0.0 placeholder is not a
-        # clean verdict, and the unjudged neighbour may be the contradicting
-        # one: raising makes the write surface the skip loudly (the fact is
-        # still stored) instead of silently treating the pair as neutral.
+    if partial_error and not failed_indices:
+        # Nothing points at the failed candidates: no index is reliable and
+        # no 0.0 placeholder may be trusted for any pair. The check is
+        # unusable as a whole - raise, so the write surfaces the skip loudly
+        # (the fact is still stored) instead of treating every pair as
+        # neutral.
         raise RuntimeError(partial_error)
 
+    failed = set(failed_indices or ())
     contradictions = []
-    for (eid, econtent, _eentity), score in zip(candidates, scores):
-        if score >= 0.7:
+    unjudged: list[dict] = []
+    for i, (eid, econtent, _eentity) in enumerate(candidates):
+        if i in failed:
+            # The provider could not judge this candidate. Its 0.0 is a
+            # placeholder, not a verdict: report the pair as unverified
+            # (unjudged, with the provider's reason) instead of silently
+            # treating it as neutral while the judged pairs still count.
+            unjudged.append({"existing_id": eid, "existing_content": econtent,
+                             "reason": partial_error})
+            continue
+        if scores[i] >= 0.7:
             contradictions.append({"existing_id": eid, "existing_content": econtent,
-                                    "similarity": round(score, 3)})
-    return contradictions
+                                    "similarity": round(scores[i], 3)})
+    return contradictions, unjudged
 
 
 def _log_access(cur, mem_ids: list[str], project: str | None,

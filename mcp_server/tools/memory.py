@@ -159,6 +159,20 @@ class BatchFact(BaseModel):
     dedupe: Any = Field(default=None, json_schema_extra={
         "type": ["string", "null"], "enum": ["exact", "semantic", "off", None],
     }, description="Duplicate detection: 'exact' (content hash), 'semantic' (vector similarity) or 'off'.")
+    links: Any = Field(default=None, json_schema_extra={
+        "type": ["array", "null"],
+        "items": {"type": "object",
+                   "properties": {"to_entity": {"type": "string"},
+                                   "relation_type": {"type": "string"},
+                                   "weight": {"type": "number"},
+                                   "context": {"type": "string"},
+                                   "from_entity": {"type": "string"}},
+                   "required": ["to_entity", "relation_type"]},
+    }, description="Graph edges created in the same step: each item needs "
+                   "'to_entity' and 'relation_type'; 'from_entity' defaults "
+                   "to the fact's entity. A malformed edge is a per-fact "
+                   "error; an edge runtime failure keeps the fact and warns "
+                   "(links failed: ...).")
 
 
 def _sanitize_batch_fact(value: Any) -> Any:
@@ -615,7 +629,8 @@ def remember(
               and outcome.near_duplicate["id"] not in superseded):
             warnings.append(_near_duplicate_warning(
                 outcome.near_duplicate, entity, outcome.near_conflict,
-                new_content=content))
+                new_content=content,
+                explicit_supersede=supersede or supersede_content))
         if outcome.cross_scope_warning:
             warnings.append(outcome.cross_scope_warning)
         if outcome.cross_duplicate_warning:
@@ -641,6 +656,13 @@ def remember(
         elif outcome.contradiction_skip:
             warnings.append(
                 f"contradiction check skipped: {outcome.contradiction_skip}")
+        unjudged = (outcome.contradictions or {}).get("unjudged") or []
+        if unjudged:
+            warnings.append(
+                f"contradiction check incomplete: NLI could not judge "
+                f"{len(unjudged)} of the candidate memories "
+                f"({(unjudged[0].get('reason') or 'NLI provider failure')}); "
+                f"those pairs are unverified (contradictions.unjudged)")
         if check_contradictions and not entity and not outcome.nli_unavailable \
                 and not outcome.contradiction_skip:
             warnings.append(
@@ -795,7 +817,15 @@ def remember_batch(
     auto_supersede_near_duplicate, expires_at (ISO 8601 TTL timestamp),
     fuzzy_threshold, dedupe ("exact", "semantic", or "off"),
     contradiction_mode ("supersede"/"warn"), contradiction_min_confidence
-    (0.0-1.0) and max_contradiction_supersedes (>= 0); the last three
+    (0.0-1.0), max_contradiction_supersedes (>= 0), and links
+    ([{to_entity, relation_type, weight?, context?, from_entity?}] - graph
+    edges created with the fact, 'from_entity' defaults to the fact's
+    entity); a malformed edge is a per-fact error and an edge runtime failure
+    keeps the fact and warns ("links failed: ...").
+    A stored entry reports its edges in `links` (same shape as remember) and
+    failed edges inside `link_warnings`; a fact that was REJECTED (a
+    near-duplicate reject or a duplicate) stores no edges.
+    The last three contradiction keys
     override the top-level defaults per fact.
     Set skip_duplicates=False to allow storing identical content multiple times.
     Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
@@ -886,6 +916,15 @@ def remember_batch(
         except ValueError as e:
             prepared.append((None, str(e)))
             continue
+        flinks = fact.get("links")
+        if flinks is not None:
+            # A malformed edge is a per-fact argument error, exactly like the
+            # single `remember(links=...)` path - never a silently skipped
+            # edge list.
+            per_link_errors = _validate_links(flinks, fentity)
+            if per_link_errors:
+                prepared.append((None, "; ".join(per_link_errors)))
+                continue
         ft = fact.get("fuzzy_threshold", fuzzy_threshold)
         if ft is not None and not 0.0 <= ft <= 1.0:
             prepared.append((None, "fuzzy_threshold must be between 0.0 and 1.0"))
@@ -961,6 +1000,7 @@ def remember_batch(
             "max_contradiction_supersedes": fact_max_supersedes,
             "expires_at": fexpires,
             "ttl_warning": _ttl_past_warning(fexpires),
+            "links": flinks,
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -1007,6 +1047,7 @@ def remember_batch(
                             "contradiction_min_confidence"],
                         max_contradiction_supersedes=spec[
                             "max_contradiction_supersedes"],
+                        links=spec["links"],
                         embedding=embeddings[i],
                         skip_duplicates=skip_duplicates,
                         probe_nli_config=False,
@@ -1075,6 +1116,11 @@ def remember_batch(
             }
             if outcome.guard_warnings:
                 entry["warnings"] = list(outcome.guard_warnings)
+            if outcome.links:
+                # Same shape as remember(links=[...]): per-edge status plus
+                # the roll-back warnings of failed edges (the fact stays).
+                entry["links"] = outcome.links
+                entry["warnings"].extend(outcome.link_warnings)
             if outcome.exact_copy:
                 entry["warnings"].append(
                     f"identical content is already active as {outcome.exact_copy}; "
@@ -1117,6 +1163,15 @@ def remember_batch(
                         f"active; verify them and resolve explicitly with "
                         f"contradictions_report(resolve='newest') or "
                         f"supersede=<id>")
+                unjudged = entry["contradictions"].get("unjudged") or []
+                if unjudged:
+                    unreason = (unjudged[0].get("reason")
+                                or "NLI provider failure")
+                    entry["warnings"].append(
+                        f"contradiction check incomplete: NLI could not judge "
+                        f"{len(unjudged)} of the candidate memories "
+                        f"({unreason}); those pairs are unverified "
+                        "(contradictions.unjudged)")
                 if outcome.contradiction_skip:
                     entry["contradictions"]["skipped"] = (
                         outcome.contradiction_skip)
@@ -1196,8 +1251,7 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
         if project:
             tables = [_mem_table(project)]
             if not _table_exists(cur, tables[0]):
-                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                            id=memory_id)
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
         else:
             scopes = db.scopes_of(memory_id)
             if len(scopes) > 1:
@@ -1206,7 +1260,7 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
                             f"ambiguous memory id {memory_id}: it exists in "
                             f"the scopes {scopes}; pass project=<name> to say "
                             f"which one to restore",
-                            id=memory_id, scopes=scopes)
+                            scopes=scopes)
             tables = _all_mem_tables(cur)
         restored = 0
         restored_table = None
@@ -1224,13 +1278,12 @@ def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
             blocked = _restore_blocked_reason(db, memory_id, tables)
             if blocked:
                 status, reason = blocked
-                return fail(status, reason, id=memory_id)
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                        id=memory_id)
+                return fail(status, reason)
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
         scope = _scope_of_table(cur, restored_table) if restored_table else None
     except Exception as e:
         db.rollback()
-        return fail(STATUS_ERROR, str(e), id=memory_id)
+        return fail(STATUS_ERROR, str(e))
     finally:
         db.close()
     return ok(STATUS_RESTORED, id=memory_id, project=scope)
@@ -1438,7 +1491,7 @@ def update_memory(
                             f"ambiguous memory id {memory_id}: it exists in "
                             f"the scopes {scopes}; pass project=<name> to say "
                             f"which one to update",
-                            id=memory_id, scopes=scopes)
+                            scopes=scopes)
             tables = _all_mem_tables(cur)
         # Locate the memory BEFORE the "nothing to update" check: an unknown
         # id must answer NOT FOUND even when no field was passed, otherwise
@@ -1451,9 +1504,8 @@ def update_memory(
             if reason:
                 return fail(
                     STATUS_CONFLICT,
-                    f"memory {memory_id} exists but cannot be updated: {reason}",
-                    id=memory_id)
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+                    f"memory {memory_id} exists but cannot be updated: {reason}")
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
         if metadata_value is not None or clear_keys:
             # Metadata merge and key removal need the stored object. This is
             # the only field that is computed from the existing row; the
@@ -1479,8 +1531,7 @@ def update_memory(
                         "nothing to update: pass content, importance, metadata, "
                         "clear_metadata_keys, entity, mem_type, "
                         "expires_at/clear_expires_at, touch=true or "
-                        "restore=true",
-                        id=memory_id)
+                        "restore=true")
         scope = _scope_of_table(cur, active_table)
         # `entity=None` means "keep the current entity", not "untagged": the
         # near-duplicate warning needs the entity the updated row will have.
@@ -1519,12 +1570,11 @@ def update_memory(
             and _content_conflict(content or "", near_dup.get("content") or ""))
         if not apply_fields(db, active_table, memory_id, sets, params):
             db.rollback()
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                        id=memory_id)
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
         db.commit()
     except Exception as e:
         db.rollback()
-        return fail(STATUS_ERROR, str(e), id=memory_id)
+        return fail(STATUS_ERROR, str(e))
     finally:
         db.close()
     warnings = ([_near_duplicate_warning(near_dup, near_entity,
@@ -2069,7 +2119,7 @@ def forget(
         if memory_id:
             tables = _all_mem_tables(cur) if not project else [_mem_table(project)]
             if project and not _table_exists(cur, tables[0]):
-                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
             scopes = db.scopes_of(memory_id)
             if not project and len(scopes) > 1:
                 # The same id can live in several scopes (an import copies
@@ -2080,13 +2130,13 @@ def forget(
                             f"ambiguous memory id {memory_id}: it exists in "
                             f"the scopes {scopes}; pass project=<name> to say "
                             f"which one to remove",
-                            id=memory_id, scopes=scopes)
+                            scopes=scopes)
             removed, _touched = db.forget_rows(
                 memory_id, tables=tables, soft=soft, dry_run=dry_run)
             counts["memories"] += removed
             if not counts["memories"]:
                 db.rollback()
-                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}", id=memory_id)
+                return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
             if not soft and not dry_run:
                 clear_dangling_supersede(cur)
         if entity_name:

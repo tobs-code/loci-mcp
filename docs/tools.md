@@ -77,7 +77,7 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `max_contradiction_supersedes` | int | Maximum number of memories one write may invalidate (default 1). Further confirmed pairs stay active, are listed in `contradictions.kept` and named in a warning, so a single write cannot wipe several facts unconfirmed. |
 | `links` | list? | Graph edges to create in the same write: `[{to_entity, relation_type, weight?, context?, from_entity?}]`; `from_entity` defaults to `entity`. Malformed links are an argument error before the write; a failing edge rolls back to a savepoint, warns (`links failed: ...`) and keeps the fact. Each edge is reported in `links` (`status: created`/`updated`/`duplicate`). |
 | `dedupe` | enum | `exact` (default, content hash), `semantic` (also vector similarity), `off`. |
-| `on_near_duplicate` | enum | Action for a reworded copy of an active memory (near-duplicate, similarity >= 0.75): `warn` (default, store and warn), `supersede` (replace it, list it in `superseded`) or `reject` (`duplicate`, nothing stored). Works under `dedupe="off"` when the policy is not `warn`. **Same-entity guard:** when the matched memory belongs to a different entity, the policy is not applied (the fact is stored and a `near-duplicate across entities` warning names both entities). A high vector similarity alone never deletes another subject's fact. If the content differs in a number or a negation, the warning calls it a **possible contradiction**; `supersede` additionally warns to verify it was an intended update (`check_contradictions=true` gives an NLI verdict). |
+| `on_near_duplicate` | enum | Action for a reworded copy of an active memory (near-duplicate, similarity >= 0.75): `warn` (default, store and warn), `supersede` (replace it, list it in `superseded`) or `reject` (`duplicate`, nothing stored). Works under `dedupe="off"` when the policy is not `warn`. **Same-entity guard:** when the matched memory belongs to a different entity, the policy is not applied (the fact is stored and a `near-duplicate across entities` warning names both entities). A high vector similarity alone never deletes another subject's fact. If the content differs in a number or a negation, the warning calls it a **possible contradiction**; `supersede` additionally warns to verify it was an intended update (`check_contradictions=true` gives an NLI verdict). When the write already carried `supersede`/`supersede_content` and the fact still did not replace that near-dup match, the warning appends a reconciliation note naming the directive, so a caller never assumes its instruction did not exist. |
 | `auto_supersede_near_duplicate` | bool | Backwards-compatible alias for `on_near_duplicate="supersede"`. |
 | `metadata_mode` | enum | `merge` (default: keys the new fact does not set are carried over from the replaced memory) or `replace` (the old keys are dropped). |
 | `expires_at` | string? | ISO 8601 TTL: the memory leaves the active set after this timestamp (hidden in reads, no duplicate candidate). The row itself stays until it is `forget`-den or superseded; exports keep it. Wrong format = named argument error. |
@@ -89,7 +89,12 @@ The answer carries `superseded` (the ids that were invalidated) and, with
 active by the mode/confidence/budget guard), `mode`, `min_confidence` and
 `max_supersedes`. A kept contradiction is also named in `warnings`. A duplicate
 answer names the mode that matched (`duplicate_mode`) and the measured
-similarity.
+similarity. When a partial NLI failure leaves some candidates unjudged (and
+some judged), the object adds `unjudged` (`existing_id`, `existing_content`,
+`reason`) and a `contradiction check incomplete` warning: the judged pairs
+still count, the unverified ones are never silently read as "no
+contradiction". Only a failure that leaves nothing judable skips the whole
+check (`contradictions.skipped` + warning) and keeps the fact.
 
 It also reports the scope the fact really landed in (`scope` and `project`).
 That matters when `scope="global"` is combined with a project: the fact ends up
@@ -123,14 +128,19 @@ copies, so the fork is visible instead of looking like a lost write.
 ### `remember_batch`
 
 `facts` is a list of objects; only `content` is required, everything else works
-like in `remember` (including the per-fact `auto_supersede_near_duplicate` flag
-and the per-fact `contradiction_mode`, `contradiction_min_confidence` and
-`max_contradiction_supersedes`). The top-level `skip_duplicates` flag controls
+like in `remember` (including the per-fact `auto_supersede_near_duplicate` flag,
+the per-fact `contradiction_mode`, `contradiction_min_confidence` and
+`max_contradiction_supersedes`, and per-fact `links` like in
+[`remember`](#remember)). The top-level `skip_duplicates` flag controls
 content dedupe, and `check_contradictions` applies to every fact; the three
 contradiction options can be set at the top level or per fact. Invalid facts are
 reported individually, the rest is still stored (`status: "partial"`). A fact
 without `content` or one that is not an object at all does not abort the batch
-- it is reported as an error entry next to the facts that were stored. Every
+- it is reported as an error entry next to the facts that were stored. A
+malformed `links` edge is a per-fact prepared failure (the entry answers
+`error` and `id: null`); the remaining facts still store. A stored fact
+reports its created edges in `links`, and edge failures hang off the entry's
+`warnings` (`links failed: ...`) while the fact survives. Every
 entry reports the `scope` and `project` it landed in, so a batch that mixes
 scopes stays readable.
 
@@ -336,7 +346,10 @@ already says.
 Memory-only entities have no graph node;
 `details.type` is then `memory-only`; a graph node's `details.type` is `graph`
 with the raw AGE label of its scope in `details.label`. A missing entity
-answers with `status: "not_found"`. The `memories` list is sorted by `updated_at`
+answers with `status: "not_found"`; when the name lives in another scope, the
+answer carries `scopes_with_entity` (`{project: "memory"/"graph"}`) and the
+error/warning say to repeat the call with `project=<name>`, so a cross-scope
+lookup needs no second discovery round trip. The `memories` list is sorted by `updated_at`
 descending, newest change first. It also contains the relation-context
 sentences of the entity's edges - they are stored under the synthetic entity
 `<from>_<relation>_<to>`, so without this they would not show up here at all.
@@ -422,7 +435,7 @@ the graph nodes of the covered scopes, not of the whole database.
 
 | Tool | Description |
 |------|-------------|
-| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); an entity scan covers the entity's memories **plus untagged (entity-less) memories** as their neighbours, so a tagged/untagged conflict stays visible and cross-entity pairs are reported but never auto-resolved; `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older (newest is the creation time; a `touch` does not decide it); cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 40s) bounds the NLI leg: when it is exhausted the scan stops early, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); `nli_failures_count` and `nli_failure_summary` give the compact scale without reading every entry; `nli_failure_kinds` splits them into `budget`/`timeout`/`parse`/`outage`/`error`, and each failure entry carries the same `kind`; other partial NLI failures are named there too |
+| `contradictions_report` | Detect conflicting facts (LLM NLI + vector pre-filter); per entity or scope-wide (all active memories compete, cross-entity pairs included, each pair carries the entity of both facts and `cross_entity`); an entity scan covers the entity's memories **plus untagged (entity-less) memories** as their neighbours, so a tagged/untagged conflict stays visible and cross-entity pairs are reported but never auto-resolved; `resolve="newest"` keeps the newer fact **of same-entity pairs only** and supersedes the older (newest is the creation time; a `touch` does not decide it); cross-entity pairs, pairs below `resolve_min_confidence` (default 0.8) and pairs without a shared content word stay active (named warning); `dry_run=true` reports `would_resolve` and per-pair `resolution.dry_run` without writing; `budget_seconds` (default 40s) is the wall-clock budget of the whole scan (candidate loading plus the NLI leg, so the call stays inside the client timeout): a load that consumed it returns before any NLI call, and when the judge leg runs out the scan returns the pairs judged so far, sets `budget_exhausted` and names every unjudged pair in `nli_failures` (`fact_id`, `neighbor_ids`, `reason: skipped: NLI time budget exhausted`); `nli_failures_count` and `nli_failure_summary` give the compact scale without reading every entry; `nli_failure_kinds` splits them into `budget`/`timeout`/`parse`/`outage`/`error`, and each failure entry carries the same `kind`; other partial NLI failures are named there too |
 | `export_memories` | Backup as JSON/JSONL (`format`, `project`, `include_embeddings`, `include_superseded`, `include_deleted` (default follows `include_superseded`; `false` leaves soft-forgotten rows out), `include_expired`, `include_graph`, `entity`, `mem_type`, `updated_after`, `metadata_filter`); TTL and timestamps are preserved; payload in `data`; without `project` every scope is exported, `project="global"` only the shared scope; `entity` also narrows the graph, keeps the other endpoints of those edges and includes their relation-context sentences; JSONL warns that `include_graph` is ignored; warns about excluded history and included expired rows; `include_expired=false` leaves expired rows out |
 | `verify_integrity` | Report rows whose `superseded_by` points at a missing id or at themselves (both make a row unreadable forever), plus supersede chains and expired active rows; broken links and chains are listed in `results` (chains carry `chain_to`); `project`, `fix` (clear the broken links), `limit`; `fix=true` deletes no content and re-scans after the repair, so the counts and `results` describe the state AFTER the fix (`fixed` carries what was cleared) |
 | `import_memories` | Restore from JSON/JSONL (`data` accepts an object, a list of records or a string, `project` override, `format`, `skip_duplicates`, `fuzzy_threshold`, `dry_run`); IDs, TTL and timestamps are preserved; an id that already exists is always skipped; every record runs in its own savepoint, so one broken record (bad embedding, invalid row) is reported in `errors` and the rest still imports; a malformed JSONL line is collected as `skipped_reasons.invalid` (named as `jsonl line N`) instead of aborting the file; `dry_run` validates without writing and adds `would_create`; dangling supersede links are cleared with a warning, as are self-referencing or internal (`__forgotten__`) `superseded_by` values (`repaired_self_references`); `graph_entities`/`graph_relations` count processed records, `*_created` the new ones; a non-empty `skipped` comes with `skipped_reasons` and a warning |
