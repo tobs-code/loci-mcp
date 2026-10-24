@@ -126,6 +126,7 @@ def test_budget_covers_loading_and_judging():
         "kind": "budget",
     }]
     assert any("NLI time budget" in w for w in report.warnings)
+    assert any("remaining 0.0s" in w for w in report.warnings)
 
 
 def test_failed_writes_answer_id_null():

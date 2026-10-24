@@ -18,7 +18,11 @@ NLI_SYSTEM = (
 NLI_INSTRUCTION = (
     "Two facts about DIFFERENT subjects remain neutral no matter how their "
     "attributes differ: both can be true at the same time (a staging API on "
-    "one port never contradicts a database service on another). A differing "
+    "one port never contradicts a database service on another). A staging "
+    "fact and a production fact are different subjects even when both name "
+    "the same service, so a differing port or host between them is neutral; "
+    "the environment is part of the subject, not a value to compare across "
+    "environments. A differing "
     "attribute (environment, host, port, version, date/time, number, state) "
     "or an explicit negation is a contradiction (score 0.9-1.0) ONLY when "
     "BOTH facts describe the SAME subject. Facts that merely omit details or "

@@ -767,11 +767,13 @@ class ContradictionScan:
                 candidates=0, timestamps=loaded.timestamps,
                 entity=request.entity)
         if remaining <= 0.5:
+            remaining_for_judge = max(0.0, remaining)
             warnings = [
                 f"scan incomplete: candidate loading consumed the NLI time "
                 f"budget of {request.budget_seconds}s (remaining "
-                f"{remaining:.1f}s for judge calls); narrow the scan with "
-                f"`entity`, lower `limit`, or raise `budget_seconds`"
+                f"{remaining_for_judge:.1f}s for judge calls); narrow the "
+                f"scan with `entity`, lower `limit`, or raise "
+                f"`budget_seconds`"
             ]
             failures = [{
                 "fact_id": group.fact["id"],

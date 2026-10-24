@@ -75,6 +75,7 @@ class SearchRequest:
     metadata_filter: dict | None = None
     recent_first: bool = False
     exclude_relation_context: bool = False
+    include_entity_relation_context: bool = False
     stats: dict[str, Any] | None = None
     include_expired: bool = False
     include_deleted: bool = False
@@ -333,6 +334,29 @@ def _extra_conditions(
     return conditions, params
 
 
+def _entity_conditions(
+    entity: str | None,
+    include_relation_context: bool = False,
+) -> tuple[list[str], list[Any]]:
+    """Filter to one entity, optionally including its edge explanations.
+
+    Relation-context sentences live under the synthetic entity
+    ``<from>_<relation>_<to>``, so a plain ``entity = %s`` hides the "why" of
+    every edge from an entity-scoped search. Their metadata names both
+    endpoints, which lets the same filter find the sentences without also
+    returning unrelated context rows.
+    """
+    if not entity:
+        return [], []
+    if not include_relation_context:
+        return ["entity = %s"], [entity]
+    return ([
+        "(entity = %s OR ("
+        "COALESCE(metadata->>'relation_context', 'false') = 'true' AND "
+        "(metadata->>'from' = %s OR metadata->>'to' = %s)))"
+    ], [entity, entity, entity])
+
+
 def _parse_timestamp(value: str):
     """Parse an ISO-8601 date/datetime into a timezone-aware datetime."""
     text = str(value).strip()
@@ -482,6 +506,7 @@ def _search_memories_rrf(
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
     exclude_relation_context: bool = False,
+    include_entity_relation_context: bool = False,
     stats: dict[str, Any] | None = None,
 ) -> list[dict]:
     """
@@ -537,9 +562,10 @@ def _search_memories_rrf(
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
-        if entity:
-            conditions.append("entity = %s")
-            params.append(entity)
+        entity_conditions, entity_params = _entity_conditions(
+            entity, include_entity_relation_context)
+        conditions.extend(entity_conditions)
+        params.extend(entity_params)
         conditions.extend(extra_conditions)
         params.extend(extra_params)
         where = " AND ".join(conditions)
@@ -825,6 +851,7 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
     metadata_filter = request.metadata_filter
     recent_first = request.recent_first
     exclude_relation_context = request.exclude_relation_context
+    include_entity_relation_context = request.include_entity_relation_context
     stats = request.stats
     include_expired = request.include_expired
     include_deleted = request.include_deleted
@@ -836,7 +863,9 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
             include_deleted=include_deleted,
             tables=tables, updated_after=updated_after,
             metadata_filter=metadata_filter,
-            exclude_relation_context=exclude_relation_context, stats=stats,
+            exclude_relation_context=exclude_relation_context,
+            include_entity_relation_context=include_entity_relation_context,
+            stats=stats,
         )
         _rerank_rows(rows, query_text, stats, include_decay)
         return rows[:limit]
@@ -900,9 +929,10 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
-        if entity:
-            conditions.append("entity = %s")
-            params.append(entity)
+        entity_conditions, entity_params = _entity_conditions(
+            entity, include_entity_relation_context)
+        conditions.extend(entity_conditions)
+        params.extend(entity_params)
         conditions.extend(extra_conditions)
         params.extend(extra_params)
 

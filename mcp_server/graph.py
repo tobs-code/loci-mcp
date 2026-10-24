@@ -16,6 +16,7 @@ from mcp_server.graph_store import GraphStore
 from mcp_server.scope_catalog import (
     _norm_entity,
     _norm_project,
+    _project_exists,
     _retrieval_tables,
     _safe_ident,
     _scope_key,
@@ -38,6 +39,30 @@ class RelationEdge(TypedDict):
                     "project.")]]
 
 
+def _graph_scope_exists(graph: GraphStore, project: str | None) -> bool:
+    """True when the scope has a memory table or graph data of its own."""
+    if project is None:
+        return True
+    if _project_exists(graph.cur, project):
+        return True
+    graph.cur.execute(
+        "SELECT 1 FROM entities WHERE project = %s LIMIT 1", (project,))
+    return graph.cur.fetchone() is not None
+
+
+def _unknown_graph_project_warning(graph: GraphStore,
+                                   project: str | None) -> str | None:
+    """Warn when a named graph scope does not exist at all.
+
+    A graph read does not fall back to the global graph when a project is
+    given, so an empty answer would otherwise look like an empty project.
+    """
+    if project is None or _graph_scope_exists(graph, project):
+        return None
+    return (f"project {project!r} does not exist; no relations were searched "
+            f"- check the name with init_context(project='*')")
+
+
 def _entity_not_found_hint(graph: GraphStore, entity_name: str,
                            project: str | None) -> str:
     """Explain why an entity was not found in the searched graph.
@@ -46,6 +71,9 @@ def _entity_not_found_hint(graph: GraphStore, entity_name: str,
     names the scope that was used and points to the likely cause.
     """
     scope = _scope_key(project)
+    if not _graph_scope_exists(graph, project):
+        return (f"project {project!r} does not exist in the graph; check the "
+                f"name with init_context(project='*')")
     other_scopes = graph.scopes_with_entity(entity_name)
     memory_only = False
     for table in _retrieval_tables(graph.cur, project):
@@ -429,9 +457,14 @@ def list_relations(
     if offset < 0:
         return fail(STATUS_ERROR, "offset must be >= 0")
 
+    warnings: list[str] = []
     db = MemoryStore()
     try:
-        page = GraphStore(db).relation_page(
+        graph = GraphStore(db)
+        unknown = _unknown_graph_project_warning(graph, project)
+        if unknown:
+            warnings.append(unknown)
+        page = graph.relation_page(
             entity=entity, relation_type=relation_type, project=project,
             limit=limit, offset=offset)
         total = page["total"]
@@ -444,7 +477,6 @@ def list_relations(
         db.close()
 
     has_more = total > offset + limit
-    warnings: list[str] = []
     if offset > 0 and total > 0 and not results:
         warnings.append(
             f"no results on this page: offset={offset} is beyond the "

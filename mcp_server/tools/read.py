@@ -418,6 +418,8 @@ def recall(
             updated_after=updated_after,
             metadata_filter=metadata_filter,
             exclude_relation_context=not include_relation_context,
+            include_entity_relation_context=(
+                bool(entity) and include_relation_context),
             stats=stats,
             include_expired=include_expired,
             include_deleted=include_deleted,
@@ -1198,7 +1200,7 @@ def _get_memory(
                     STATUS_ERROR,
                     f"ambiguous memory id {memory_id}: it exists in the "
                     f"scopes {scopes}; pass project=<name> to say which one "
-                    f"to read", id=memory_id, scopes=scopes)
+                    f"to read", scopes=scopes)
             tables = _all_mem_tables(cur)
         if not include_global:
             tables = [table for table in tables if table != "memories"]
@@ -1234,11 +1236,10 @@ def _get_memory(
                         f"{reason} (pass {flag}=true)"
                         for reason, flag in zip(reasons, flags))
                        if reasons else "hidden by a filter"),
-                    id=memory_id, scope=db.scope_of_table(hidden_table),
+                    scope=db.scope_of_table(hidden_table),
                     hidden=True, hidden_reasons=reasons or ["hidden"],
                     reveal_flags=flags)
-            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
-                        id=memory_id)
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
         scope = db.scope_of_table(found_table)
         found["_project"] = scope
         projection_fields = fields
@@ -1260,7 +1261,7 @@ def _get_memory(
         db.commit()
     except Exception as e:
         db.rollback()
-        return fail(STATUS_ERROR, str(e), id=memory_id)
+        return fail(STATUS_ERROR, str(e))
     finally:
         db.close()
     return ok(STATUS_OK, id=memory_id, project=scope, memory=item)

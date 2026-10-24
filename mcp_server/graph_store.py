@@ -826,7 +826,6 @@ class GraphStore:
                 start = rel.get("start_id", rel.get("start"))
                 end = rel.get("end_id", rel.get("end"))
                 edge = {
-                    "type": rel.get("label"),
                     "relation_type": rel.get("label"),
                     "from": names[ids.index(start)] if start in ids else start,
                     "to": names[ids.index(end)] if end in ids else end,

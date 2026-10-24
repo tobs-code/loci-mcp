@@ -175,6 +175,9 @@ class BatchFact(BaseModel):
                    "(links failed: ...).")
 
 
+_BATCH_FACT_FIELDS = frozenset(BatchFact.model_fields)
+
+
 def _sanitize_batch_fact(value: Any) -> Any:
     """Accept a malformed entry without losing the whole batch.
 
@@ -885,6 +888,14 @@ def remember_batch(
         content = content.strip() if isinstance(content, str) else ""
         if not content:
             prepared.append((None, "content is required"))
+            continue
+        unknown = sorted(set(fact) - _BATCH_FACT_FIELDS)
+        if unknown:
+            prepared.append((None, (
+                "unknown argument(s) "
+                + ", ".join(repr(key) for key in unknown)
+                + " for fact; accepted arguments are: "
+                + ", ".join(sorted(_BATCH_FACT_FIELDS)))))
             continue
         mem_type = fact.get("mem_type")
         if mem_type is not None and mem_type not in MEMORY_TYPES:
