@@ -435,6 +435,30 @@ def _partial_reason(partial: str | None) -> str | None:
     return match.group("reason").strip() if match else partial
 
 
+def failure_kind(reason: str | None) -> str:
+    """Classify an NLI failure so a caller can act on it.
+
+    "NLI unavailable" alone hides the difference between a provider outage
+    (retry later), a parse error (the model answered garbage) and a budget
+    stop (narrow the scan). The reason text stays unchanged for backwards
+    compatibility; `kind` is the machine-readable addition.
+    """
+    text = (reason or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "budget" in text or "time budget" in text:
+        return "budget"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "json" in text or "parse" in text or "unparseable" in text:
+        return "parse"
+    if any(token in text for token in (
+            "unavailable", "connection", "connect", "refused", "reset",
+            "http", "429", "500", "502", "503", "504", "rate limit")):
+        return "outage"
+    return "error"
+
+
 def _entities_differ(a: str | None, b: str | None) -> bool:
     """True when two memories are tagged with different entities.
 
@@ -485,7 +509,8 @@ def report_from_judgement(
             failures.append({
                 "fact_id": fact_id,
                 "neighbor_ids": judgement.error_neighbour_ids.get(fact_id, []),
-                "reason": error})
+                "reason": error,
+                "kind": failure_kind(error)})
 
     if judgement.skipped:
         warnings.append(
@@ -507,7 +532,8 @@ def report_from_judgement(
                 failures.append({
                     "fact_id": group.fact["id"],
                     "neighbor_ids": [n.id for n in group.neighbours],
-                    "reason": SKIPPED_BUDGET_REASON})
+                    "reason": SKIPPED_BUDGET_REASON,
+                    "kind": "budget"})
             continue
         checked_pairs += len(group.neighbours) - len(scored[2])
 
@@ -525,12 +551,14 @@ def report_from_judgement(
             # identical partial lines are harder to read than a summary.
             partials.append(partial)
         if failed_indices:
+            reason = _partial_reason(partial) or "NLI unavailable"
             failures.append({
                 "fact_id": group.fact["id"],
                 "neighbor_ids": [group.neighbours[i].id
                                  for i in failed_indices
                                  if 0 <= i < len(group.neighbours)],
-                "reason": _partial_reason(partial) or "NLI unavailable"})
+                "reason": reason,
+                "kind": failure_kind(reason)})
         for neighbour, score in zip(group.neighbours, scores):
             if len(pairs) >= limit:
                 break

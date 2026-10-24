@@ -83,6 +83,25 @@ ranks by position, so the third hit is almost as good as the first (0.97 vs
 Without `include_decay` and `graph_boost` there is no `_final_score`: the
 ranking is then `_relevance_score`, and the result is ordered by it.
 
+## Answer confidence
+
+A non-empty result is not automatically an answer. `recall` reports
+`confidence` and `best_relevance` (the best `_relevance_score` of the page):
+
+| `confidence` | Meaning |
+|--------------|---------|
+| `high` | best relevance >= 0.60 |
+| `medium` | best relevance >= 0.45 |
+| `low` | best relevance below 0.45: the rows are likely the closest noise |
+| `none` | no result |
+| `graph` | only graph-boosted hits returned (they have no relevance) |
+
+A `low` answer warns and names `min_similarity=null` as the way to inspect
+weaker hits, so a barely-relevant hit is never presented as a confident match.
+The warning is suppressed when history or expired rows were requested on
+purpose (`include_superseded`, `include_deleted`, `include_expired`,
+`only_superseded`), because then a weak score is expected.
+
 ## The similarity filter
 
 `min_similarity` defaults to **0.30**, just above the embedding model's
@@ -249,7 +268,12 @@ Two paths, both using **vector pre-filtering** to avoid massive API calls.
    a real contradiction. The comparison carries the entity labels of both
    facts, so the model knows whether they describe the same subject.
 4. At a score >= 0.7 the old memory is automatically invalidated via
-   `superseded_by = new_id`.
+   `superseded_by = new_id`. A write replaces at most **one** memory by
+   default (`max_contradiction_supersedes`, configurable) and only pairs at or
+   above `contradiction_min_confidence` (default 0.70). Further confirmed
+   pairs stay active and are reported in `contradictions.kept` with a warning;
+   `contradiction_mode="warn"` reports without changing anything, so one
+   noisy NLI verdict cannot invalidate several facts.
 
 Every memory type is a candidate: a decision that contradicts a pattern is
 just as harmful as a fact that contradicts a fact, and restricting the
@@ -267,13 +291,13 @@ and warns about the broader comparison, so it is never silent.
    superseded pairs are done and not re-checked). Without an entity the scan
    is scope-wide: all active memories compete, so pairs across different
    entities are reported too.
-2. **Vector self-join**: for each memory, the 8 nearest neighbours per
+2. **Vector self-join**: for each memory, the 6 nearest neighbours per
    searched scope table (project + global) are fetched via
    `ORDER BY embedding <=>` (`CONTRADICTION_NEIGHBORS`, 1-20).
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
-   memory, not one call per pair. The calls run in a bounded pool (4 workers,
+   memory, not one call per pair. The calls run in a bounded pool (6 workers,
    `CONTRADICTION_NLI_WORKERS`) and are reported in candidate order.
-4. The NLI leg has a wall-clock budget (`budget_seconds`, default 25s or
+4. The NLI leg has a wall-clock budget (`budget_seconds`, default 40s or
    `CONTRADICTION_SCAN_BUDGET_SECONDS`). When it runs out the scan stops early,
    returns the pairs judged so far, sets `budget_exhausted: true` and lists
    every unchecked pair in `nli_failures` with

@@ -768,6 +768,16 @@ class GraphStore:
             "weight": float(row[3] or 1.0),
             "project": "global" if row[4] == "global" else row[4],
         } for row in self.cur.fetchall()]
+        # Same rule as `find_connections`: an edge may carry a sentence that
+        # explains why the entities are connected. Browsing without it made
+        # the caller fetch every edge again just to learn the reason.
+        for result in results:
+            sentence = _edge_context(
+                self.cur, None if result["project"] == "global"
+                else result["project"], result["from_entity"],
+                result["to_entity"], result["relation_type"])
+            if sentence:
+                result["context"] = sentence
         return {"total": total, "results": results}
 
     def paths(self, from_entity: str, to_entity: str, project: str | None,
@@ -815,12 +825,19 @@ class GraphStore:
                 props = rel.get("properties", {})
                 start = rel.get("start_id", rel.get("start"))
                 end = rel.get("end_id", rel.get("end"))
-                relations.append({
+                edge = {
                     "type": rel.get("label"),
+                    "relation_type": rel.get("label"),
                     "from": names[ids.index(start)] if start in ids else start,
                     "to": names[ids.index(end)] if end in ids else end,
                     "weight": props.get("weight", 1.0),
-                })
+                }
+                sentence = _edge_context(
+                    self.cur, project, edge["from"], edge["to"],
+                    edge["relation_type"])
+                if sentence:
+                    edge["context"] = sentence
+                relations.append(edge)
             results.append({"nodes": nodes, "relations": relations,
                             "hops": len(nodes) - 1})
         return {"missing": [], "scope": scope, "results": results}

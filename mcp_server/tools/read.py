@@ -18,6 +18,8 @@ from mcp_server.browse import (
     order_column as browse_order_column,
 )
 from mcp_server.config import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_MEDIUM,
     DEFAULT_MIN_SIMILARITY,
     MEMORY_TYPE_HELP,
     MEMORY_TYPES,
@@ -312,6 +314,11 @@ def recall(
     the graph edges from the ranking (they repeat what the edge already says).
     `offset` pages through the ranked results (with `limit`); the response
     reports `has_more` and `next_offset`.
+    The answer carries `confidence` (`high` >= 0.60, `medium` >= 0.45,
+    `low` below that, `none` for no result, `graph` for graph-only hits) and
+    `best_relevance`. A low-confidence answer warns instead of looking like a
+    confident miss; the warning names `min_similarity=null` when the floor
+    may have removed the intended fact.
     `project="*"` searches every scope at once. A project that does not
     exist is reported in `warnings`: the search then only covered the global
     scope.
@@ -567,9 +574,37 @@ def recall(
                 f"{len(rows)} result(s) have _similarity < "
                 f"{DEFAULT_MIN_SIMILARITY} and may be only marginally "
                 f"relevant to the query")
+    # A hit is not automatically an answer. The best relevance of the page
+    # tells the caller whether the query was actually answered or whether the
+    # rows are merely the closest noise above the similarity floor.
+    relevance_scores = [
+        r["_relevance_score"] for r in results
+        if isinstance(r, dict) and r.get("_relevance_score") is not None
+    ]
+    best_relevance = (round(max(relevance_scores), 4)
+                      if relevance_scores else None)
+    if not rows:
+        confidence = "none"
+    elif best_relevance is None:
+        confidence = "graph"
+    elif best_relevance >= CONFIDENCE_HIGH:
+        confidence = "high"
+    elif best_relevance >= CONFIDENCE_MEDIUM:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    if confidence == "low" and not (include_superseded or include_deleted
+                                    or include_expired or only_superseded):
+        warnings.append(
+            f"low confidence: the best match has _relevance_score="
+            f"{best_relevance} (below {CONFIDENCE_MEDIUM}); the results may "
+            f"not answer the query. Rephrase the query or pass "
+            f"min_similarity=null to inspect weaker hits")
     payload: dict[str, Any] = {
         # `candidates` counts the hits that made it into the ranking.
         "candidates": candidates,
+        "confidence": confidence,
+        "best_relevance": best_relevance,
         "dropped_by_similarity": filtered_out,
         "offset": offset,
         "has_more": paging.has_more,
@@ -705,6 +740,9 @@ def recall_batch(
     forcing the agent to concatenate them (which dilutes the vector score).
     The shared options apply to every query; each entry reports its own
     `count`, `warnings`, filter counters and `scopes_searched`.
+    An empty query is reported in its own entry (`ok: false`, `status:
+    error`) and in the top-level `warnings`; the other queries still run, so
+    one bad intent does not discard the whole batch.
     """
     logger.info("recall_batch queries=%s", len(queries or []))
     if not isinstance(queries, list) or not queries:
@@ -713,10 +751,6 @@ def recall_batch(
         return fail(STATUS_ERROR,
                     "queries accepts at most 25 entries per call")
     cleaned = [str(q).strip() if isinstance(q, str) else "" for q in queries]
-    empty = [i for i, q in enumerate(cleaned) if not q]
-    if empty:
-        return fail(STATUS_ERROR,
-                    f"query {empty[0]} is empty; every query needs text")
     if mem_type is not None and mem_type not in MEMORY_TYPES:
         return fail(STATUS_ERROR,
                     f"Invalid mem_type. Choose from: "
@@ -724,6 +758,22 @@ def recall_batch(
     results: list[dict[str, Any]] = []
     warnings: list[str] = []
     for index, query in enumerate(cleaned):
+        # One bad query must not cost the other intents of the batch: it is
+        # reported in its own entry (and named in the top-level warnings), the
+        # remaining queries still run.
+        if not query:
+            entry = {
+                "index": index, "query": query, "ok": False,
+                "status": STATUS_ERROR,
+                "error": "query must not be empty",
+                "warnings": ["empty query skipped; pass non-empty text"],
+                "count": 0, "results": [],
+            }
+            warnings.append(
+                f"query {index} is empty and was skipped; every query needs "
+                f"text")
+            results.append(entry)
+            continue
         call = recall(
             query, mem_type=mem_type, entity=entity, limit=limit,
             offset=offset, project=project, hybrid=hybrid,
@@ -803,9 +853,12 @@ def list_memories(
     memory_ids: Annotated[
         list[str] | None,
         Field(description="Bulk id lookup: returns every requested memory in "
-                          "`results` and names the ids that are missing or "
-                          "ambiguous. Mutually exclusive with `memory_id`; "
-                          "browse filters are ignored.")] = None,
+                          "`results`, names the ids that are missing or "
+                          "ambiguous, and lists rows that exist but are "
+                          "hidden (superseded/forgotten/expired) in `hidden` "
+                          "with the flag that reveals them. Mutually "
+                          "exclusive with `memory_id`; browse filters are "
+                          "ignored.")] = None,
     include_deleted: Annotated[
         bool,
         Field(description="Also list soft-forgotten memories (recognizable by "
@@ -915,6 +968,7 @@ def list_memories(
             ignored.append("order_by")
         results: list[dict] = []
         missing: list[str] = []
+        hidden: list[dict] = []
         errors: list[dict] = []
         for mid in wanted:
             found = _get_memory(
@@ -929,6 +983,16 @@ def list_memories(
                 errors.append({"id": mid, "status": found.get("status"),
                                "error": found.get("error"),
                                "scopes": found["scopes"]})
+            elif found.get("hidden"):
+                # A row that exists but is superseded/forgotten/expired is not
+                # "missing": merging the two sent the caller looking for a
+                # typo instead of a visibility flag.
+                hidden.append({
+                    "id": mid,
+                    "scope": found.get("scope"),
+                    "reasons": found.get("hidden_reasons") or [],
+                    "reveal_flags": found.get("reveal_flags") or [],
+                })
             else:
                 missing.append(mid)
         warnings = []
@@ -937,15 +1001,25 @@ def list_memories(
                             f"{', '.join(ignored)} ignored")
         if missing:
             warnings.append(
-                f"{len(missing)} id(s) not found or hidden: "
+                f"{len(missing)} id(s) not found: "
                 + ", ".join(missing[:10])
                 + (" ..." if len(missing) > 10 else ""))
+        if hidden:
+            warnings.append(
+                f"{len(hidden)} id(s) exist but are hidden (superseded, "
+                f"soft-forgotten or expired): "
+                + ", ".join(
+                    f"{item['id']} ({', '.join(item['reasons'])}; pass "
+                    f"{' and '.join(item['reveal_flags'])}=true)"
+                    for item in hidden[:10])
+                + (" ..." if len(hidden) > 10 else ""))
         if errors:
             warnings.append(
                 f"{len(errors)} id(s) are ambiguous across scopes; pass "
                 f"project=<name> to resolve them")
         return ok(STATUS_OK, count=len(results), results=results,
-                  missing=missing, errors=errors, warnings=warnings)
+                  missing=missing, hidden=hidden, errors=errors,
+                  warnings=warnings)
 
     if memory_id:
         # Direct id lookup: one memory, its history state and the reason it is
@@ -1097,17 +1171,26 @@ def _get_memory(
                 deleted_at = hidden.get("deleted_at")
                 expires_at = hidden.get("expires_at")
                 reasons = []
+                flags = []
                 if deleted_at is not None:
-                    reasons.append("soft-forgotten (pass include_deleted=true)")
+                    reasons.append("soft-forgotten")
+                    flags.append("include_deleted")
                 if superseded_by is not None and superseded_by != SENTINEL_FORGOTTEN:
-                    reasons.append("superseded (pass include_superseded=true)")
+                    reasons.append("superseded")
+                    flags.append("include_superseded")
                 if _is_expired(expires_at):
-                    reasons.append("expired (pass include_expired=true)")
+                    reasons.append("expired")
+                    flags.append("include_expired")
                 return fail(
                     STATUS_NOT_FOUND,
                     f"memory {memory_id} exists but is not visible: "
-                    + ("; ".join(reasons) if reasons else "hidden by a filter"),
-                    id=memory_id, scope=db.scope_of_table(hidden_table))
+                    + ("; ".join(
+                        f"{reason} (pass {flag}=true)"
+                        for reason, flag in zip(reasons, flags))
+                       if reasons else "hidden by a filter"),
+                    id=memory_id, scope=db.scope_of_table(hidden_table),
+                    hidden=True, hidden_reasons=reasons or ["hidden"],
+                    reveal_flags=flags)
             return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}",
                         id=memory_id)
         scope = db.scope_of_table(found_table)

@@ -187,11 +187,18 @@ def test_recall_batch_returns_one_ranked_list_per_query():
     assert all(entry["ok"] for entry in result["results"])
 
 
-def test_recall_batch_rejects_empty_queries():
+def test_recall_batch_skips_empty_queries_without_losing_the_rest():
     result = recall_batch(["deploy", "  "])
 
-    assert result["ok"] is False
-    assert "query 1 is empty" in result["error"]
+    # A bad query is reported in its own entry (and the top-level warnings);
+    # the other intents of the batch still run.
+    assert result["ok"] is True
+    assert result["count"] == 2
+    assert result["results"][0]["ok"] is True
+    assert result["results"][1]["ok"] is False
+    assert result["results"][1]["status"] == "error"
+    assert "empty" in result["results"][1]["error"]
+    assert any("query 1 is empty" in warning for warning in result["warnings"])
 
 
 def test_prune_memories_only_removes_inactive_rows():

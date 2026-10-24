@@ -154,7 +154,7 @@ def contradictions_report(entity: Annotated[
     When the NLI provider fails for some pairs, `nli_failures` names exactly
     which fact/neighbour ids were NOT judged (with the reason), so a partial
     scan is never mistaken for a clean one. The NLI leg has a wall-clock
-    budget (`budget_seconds`, default 25s): when it is exhausted the scan
+    budget (`budget_seconds`, default 40s): when it is exhausted the scan
     stops early, returns the pairs judged so far, sets `budget_exhausted`
     and records the unchecked pairs in `nli_failures` with reason
     `skipped: NLI time budget exhausted`. Narrow the scan with `entity`,
@@ -237,10 +237,17 @@ def contradictions_report(entity: Annotated[
         result["nli_failures"] = report.failures
         result["nli_failures_count"] = len(report.failures)
         summary: dict[str, int] = {}
+        kinds: dict[str, int] = {}
         for failure in report.failures:
             reason = str(failure.get("reason") or "unknown")
             summary[reason] = summary.get(reason, 0) + 1
+            kind = str(failure.get("kind") or "unknown")
+            kinds[kind] = kinds.get(kind, 0) + 1
         result["nli_failure_summary"] = summary
+        # A provider outage, a parse error and an exhausted budget need
+        # different reactions; the kind counts make that visible without
+        # reading every failure entry.
+        result["nli_failure_kinds"] = kinds
     return ok(STATUS_OK, **result)
 
 

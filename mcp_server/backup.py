@@ -458,12 +458,13 @@ def _as_list(value):
 
 def import_memories(
     data: Annotated[
-        str | dict,
-        Field(description="Payload of `export_memories`, either as the object "
-                          "or as its JSON string. JSONL payloads are one "
-                          "record per line. Passing the payload as a JSON "
-                          "string is the most reliable form: some clients "
-                          "repack the arrays inside a free-form object.")],
+        str | dict | list,
+        Field(description="Payload of `export_memories`, either as the object, "
+                          "a list of record objects, or its JSON string. "
+                          "JSONL payloads are one record per line. Passing "
+                          "the payload as a JSON string is the most reliable "
+                          "form: some clients repack the arrays inside a "
+                          "free-form object.")],
     project: Annotated[
         str | None,
         Field(description="Target scope for all records. Without it every "
@@ -508,6 +509,7 @@ def import_memories(
                     f"unsupported format {format!r}; use 'json' or 'jsonl'",
                     imported=0, skipped=0)
     graph: dict | None = None
+    parse_errors: list[str] = []
     try:
         if format == "jsonl" and isinstance(data, dict):
             return fail(
@@ -515,12 +517,7 @@ def import_memories(
                 "format='jsonl' but data is an object; pass a JSONL string "
                 "(one record per line), a list of records, or format='json'",
                 imported=0, skipped=0)
-        if isinstance(data, dict):
-            parsed = data
-        elif format == "jsonl" and isinstance(data, list):
-            # A client that already parsed the lines may send the records as a
-            # list. That is the shape the error message promises; stringifying
-            # it used to fail with "invalid jsonl data".
+        if isinstance(data, (dict, list)):
             parsed = data
         elif format == "jsonl":
             lines = [line for line in str(data).strip().split("\n")
@@ -530,10 +527,9 @@ def import_memories(
                 try:
                     parsed.append(json.loads(line))
                 except json.JSONDecodeError as exc:
-                    return fail(
-                        STATUS_ERROR,
-                        f"invalid jsonl data at line {lineno}: {exc}",
-                        imported=0, skipped=0)
+                    # One broken line must not lose the rest of the backup:
+                    # the line is reported as invalid and the others import.
+                    parse_errors.append(f"jsonl line {lineno}: {exc}")
             if (len(parsed) == 1 and isinstance(parsed[0], dict)
                     and "records" in parsed[0]):
                 # A single line that is a whole export object is not JSONL.
@@ -568,7 +564,9 @@ def import_memories(
 
     db = MemoryStore()
     imported = 0
-    skipped = 0
+    # A broken JSONL line is an invalid entry: it was neither imported nor a
+    # valid record, so it is counted in both `skipped` and `invalid`.
+    skipped = len(parse_errors)
     # Why a record was skipped matters to the caller: an idempotent re-import
     # ("the id already exists") is not the same as a silently dropped record
     # ("no content") or a content duplicate that a flag can override.
@@ -576,7 +574,7 @@ def import_memories(
     skipped_duplicate_content = 0
     skipped_empty_content = 0
     self_reference_repairs = 0
-    errors: list[str] = []
+    errors: list[str] = list(parse_errors)
     graph_entities = 0
     graph_entities_created = 0
     graph_relations = 0
@@ -644,8 +642,21 @@ def import_memories(
                 superseded_by = None
 
             emb = rec.get("embedding")
+            if emb is not None and not isinstance(emb, (list, tuple)):
+                errors.append(
+                    f"record {mid!r}: embedding must be a list of numbers")
+                skipped += 1
+                continue
             if not emb:
                 emb = embed([content])[0]
+            else:
+                emb = list(emb)
+                if not all(isinstance(value, (int, float))
+                           and not isinstance(value, bool) for value in emb):
+                    errors.append(
+                        f"record {mid!r}: embedding must be a list of numbers")
+                    skipped += 1
+                    continue
             if skip_duplicates and not rec.get("id"):
                 duplicate = _deduplicate(cur, content, target, emb,
                                          rec.get("fuzzy_threshold") or fuzzy_threshold)
@@ -664,6 +675,11 @@ def import_memories(
                         f"record {mid!r}: metadata is not valid JSON ({exc})")
                     skipped += 1
                     continue
+            # One broken record must not poison the whole transaction: a
+            # failed INSERT aborts the PostgreSQL transaction, so every later
+            # record (and the final commit) failed with "current transaction
+            # is aborted". A savepoint keeps the rest of the backup usable.
+            cur.execute("SAVEPOINT import_record")
             try:
                 cur.execute(
                     f"INSERT INTO {table} (id, content, content_hash, embedding, "
@@ -685,8 +701,11 @@ def import_memories(
                      _parse_dt(rec.get("created_at"))),
                 )
                 imported += 1
+                cur.execute("RELEASE SAVEPOINT import_record")
             except Exception as exc:
-                errors.append(f"row {imported + skipped}: {exc}")
+                cur.execute("ROLLBACK TO SAVEPOINT import_record")
+                cur.execute("RELEASE SAVEPOINT import_record")
+                errors.append(f"record {mid!r}: {exc}")
                 skipped += 1
 
         if graph is not None and not isinstance(graph, dict):

@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from mcp_server.config import (
+    CONTRADICTION_AUTO_MAX_SUPERSEDES,
+    CONTRADICTION_AUTO_MIN_CONFIDENCE,
     DEDUPE_MODES,
     MEMORY_TYPE_HELP,
     MEMORY_TYPES,
@@ -324,6 +326,27 @@ def remember(
                           "contradictions. With an entity, that entity's "
                           "memories are candidates first; without one, all "
                           "entities compete. Needs a configured LLM provider.")] = False,
+    contradiction_mode: Annotated[
+        Literal["supersede", "warn"],
+        Field(description="What a confirmed contradiction does: 'supersede' "
+                          "(default) replaces the old memory, 'warn' stores "
+                          "the fact and reports the pair without "
+                          "invalidating anything. Only the strongest "
+                          "`max_contradiction_supersedes` pairs at or above "
+                          "`contradiction_min_confidence` are replaced.")] = "supersede",
+    contradiction_min_confidence: Annotated[
+        float,
+        Field(description="Minimum NLI confidence (0.0-1.0, default 0.70) for "
+                          "an automatic supersede. Weaker pairs are stored as "
+                          "`kept` and only reported.",
+              ge=0.0, le=1.0)] = CONTRADICTION_AUTO_MIN_CONFIDENCE,
+    max_contradiction_supersedes: Annotated[
+        int,
+        Field(description="Maximum number of contradicting memories this "
+                          "write may invalidate (default 1). Further pairs "
+                          "stay active and are reported in "
+                          "`contradictions.kept`.",
+              ge=0)] = CONTRADICTION_AUTO_MAX_SUPERSEDES,
     fuzzy_threshold: Annotated[
         float | None,
         Field(description="Similarity threshold 0.0-1.0 for semantic dedup "
@@ -444,6 +467,22 @@ def remember(
     if metadata_mode not in ("merge", "replace"):
         return fail(STATUS_ERROR,
                     "metadata_mode must be 'merge' or 'replace'")
+    if contradiction_mode not in ("supersede", "warn"):
+        return fail(STATUS_ERROR,
+                    "contradiction_mode must be 'supersede' or 'warn'")
+    try:
+        contradiction_min_confidence = float(contradiction_min_confidence)
+    except (TypeError, ValueError):
+        return fail(STATUS_ERROR,
+                    "contradiction_min_confidence must be a number between "
+                    "0.0 and 1.0")
+    if not 0.0 <= contradiction_min_confidence <= 1.0:
+        return fail(STATUS_ERROR,
+                    "contradiction_min_confidence must be between 0.0 and 1.0")
+    if not isinstance(max_contradiction_supersedes, int) \
+            or max_contradiction_supersedes < 0:
+        return fail(STATUS_ERROR,
+                    "max_contradiction_supersedes must be an integer >= 0")
     near_policy = on_near_duplicate
     if auto_supersede_near_duplicate and on_near_duplicate == "warn":
         near_policy = "supersede"
@@ -502,6 +541,9 @@ def remember(
             supersede_last=supersede_last,
             on_near_duplicate=near_policy,
             check_contradictions=check_contradictions,
+            contradiction_mode=contradiction_mode,
+            contradiction_min_confidence=contradiction_min_confidence,
+            max_contradiction_supersedes=max_contradiction_supersedes,
             links=links,
             embedding=emb,
         ))
@@ -579,10 +621,22 @@ def remember(
         if outcome.cross_duplicate_warning:
             warnings.append(outcome.cross_duplicate_warning)
         contradictions = (outcome.contradictions or {}).get("superseded", [])
+        kept_contradictions = (outcome.contradictions or {}).get("kept", [])
         if contradictions:
             warnings.append(
                 f"superseded {len(contradictions)} contradicting memory/facts")
-        elif outcome.nli_unavailable:
+        if kept_contradictions:
+            kept_ids = ", ".join(
+                c["existing_id"] for c in kept_contradictions[:5])
+            mode = (outcome.contradictions or {}).get("mode", "supersede")
+            warnings.append(
+                f"{len(kept_contradictions)} possible contradiction(s) were "
+                f"kept active (contradiction_mode={mode}): {kept_ids}"
+                + (" ..." if len(kept_contradictions) > 5 else "")
+                + "; verify them and resolve explicitly with "
+                  "contradictions_report(resolve='newest') or supersede=<id>")
+        if not contradictions and not kept_contradictions \
+                and outcome.nli_unavailable:
             warnings.append("contradiction check skipped: NLI provider is not configured")
         elif outcome.contradiction_skip:
             warnings.append(
@@ -700,6 +754,22 @@ def remember_batch(
                           "memories of its scope and auto-supersede "
                           "contradictions (facts with an entity get that "
                           "entity's memories first).")] = False,
+    contradiction_mode: Annotated[
+        Literal["supersede", "warn"],
+        Field(description="Default contradiction policy for every fact "
+                          "(per-fact 'contradiction_mode' wins): 'supersede' "
+                          "replaces the old memory, 'warn' only reports it.")] = "supersede",
+    contradiction_min_confidence: Annotated[
+        float,
+        Field(description="Default minimum NLI confidence (0.0-1.0, 0.70) for "
+                          "an automatic supersede.",
+              ge=0.0, le=1.0)] = CONTRADICTION_AUTO_MIN_CONFIDENCE,
+    max_contradiction_supersedes: Annotated[
+        int,
+        Field(description="Default maximum number of memories one fact may "
+                          "invalidate (1). Further pairs stay active and are "
+                          "reported in `contradictions.kept`.",
+              ge=0)] = CONTRADICTION_AUTO_MAX_SUPERSEDES,
     scope: Annotated[
         Literal["global", "project"] | None,
         Field(description="Default scope for all facts (per-fact scope wins). "
@@ -723,7 +793,10 @@ def remember_batch(
     or content), supersede_content, supersede_last, on_near_duplicate
     ("warn"/"supersede"/"reject"),
     auto_supersede_near_duplicate, expires_at (ISO 8601 TTL timestamp),
-    fuzzy_threshold, and dedupe ("exact", "semantic", or "off").
+    fuzzy_threshold, dedupe ("exact", "semantic", or "off"),
+    contradiction_mode ("supersede"/"warn"), contradiction_min_confidence
+    (0.0-1.0) and max_contradiction_supersedes (>= 0); the last three
+    override the top-level defaults per fact.
     Set skip_duplicates=False to allow storing identical content multiple times.
     Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
     Per-fact 'fuzzy_threshold' overrides the top-level value.
@@ -825,6 +898,26 @@ def remember_batch(
             continue
         if fact.get("auto_supersede_near_duplicate") and fact_near == "warn":
             fact_near = "supersede"
+        fact_mode = fact.get("contradiction_mode") or contradiction_mode
+        if fact_mode not in ("supersede", "warn"):
+            prepared.append((None,
+                             ("contradiction_mode must be 'supersede' or "
+                              "'warn'")))
+            continue
+        fact_min_conf = fact.get(
+            "contradiction_min_confidence", contradiction_min_confidence)
+        if not isinstance(fact_min_conf, (int, float)) \
+                or not 0.0 <= float(fact_min_conf) <= 1.0:
+            prepared.append((None,
+                             ("contradiction_min_confidence must be between "
+                              "0.0 and 1.0")))
+            continue
+        fact_max_supersedes = fact.get(
+            "max_contradiction_supersedes", max_contradiction_supersedes)
+        if not isinstance(fact_max_supersedes, int) or fact_max_supersedes < 0:
+            prepared.append((None,
+                             "max_contradiction_supersedes must be >= 0"))
+            continue
         meta = fact.get("metadata") or {}
         if isinstance(meta, str):
             try:
@@ -863,6 +956,9 @@ def remember_batch(
             "supersede_content": fact.get("supersede_content"),
             "supersede_last": bool(fact.get("supersede_last")),
             "on_near_duplicate": fact_near,
+            "contradiction_mode": fact_mode,
+            "contradiction_min_confidence": float(fact_min_conf),
+            "max_contradiction_supersedes": fact_max_supersedes,
             "expires_at": fexpires,
             "ttl_warning": _ttl_past_warning(fexpires),
         }, None))
@@ -906,6 +1002,11 @@ def remember_batch(
                         supersede_last=spec.get("supersede_last"),
                         on_near_duplicate=spec["on_near_duplicate"],
                         check_contradictions=check_contradictions,
+                        contradiction_mode=spec["contradiction_mode"],
+                        contradiction_min_confidence=spec[
+                            "contradiction_min_confidence"],
+                        max_contradiction_supersedes=spec[
+                            "max_contradiction_supersedes"],
                         embedding=embeddings[i],
                         skip_duplicates=skip_duplicates,
                         probe_nli_config=False,
@@ -1006,10 +1107,16 @@ def remember_batch(
                 entry["cross_scope_duplicates"] = outcome.cross_scope_duplicates
                 entry["warnings"].append(outcome.cross_duplicate_warning)
             if check_contradictions:
-                entry["contradictions"] = {
-                    "found": bool(outcome.auto_superseded),
-                    "superseded": outcome.auto_superseded,
-                }
+                entry["contradictions"] = dict(
+                    outcome.contradictions
+                    or {"found": False, "superseded": [], "kept": []})
+                kept = entry["contradictions"].get("kept") or []
+                if kept:
+                    entry["warnings"].append(
+                        f"{len(kept)} possible contradiction(s) were kept "
+                        f"active; verify them and resolve explicitly with "
+                        f"contradictions_report(resolve='newest') or "
+                        f"supersede=<id>")
                 if outcome.contradiction_skip:
                     entry["contradictions"]["skipped"] = (
                         outcome.contradiction_skip)
@@ -1877,7 +1984,10 @@ def forget(
     `memory_ids` accepts a list of ids to remove in one call. Bulk operations
     are more efficient than multiple single calls. Each id is validated
     individually and the response reports which ids were found and which were
-    not. `memory_id` and `memory_ids` are mutually exclusive.
+    not; a found id carries the scope(s) it was removed from, and with
+    `dry_run=True` its status is `would_soft_forget`/`would_delete` instead
+    of `soft_forgotten`/`deleted`. `memory_id` and `memory_ids` are mutually
+    exclusive.
 
     `entity="*"` removes every memory of the given project (memories and
     graph nodes); `project` is required for that, so a stray call cannot wipe
@@ -1921,15 +2031,27 @@ def forget(
             if project and not _table_exists(cur, tables[0]):
                 return fail(STATUS_NOT_FOUND, "NOT FOUND: project table does not exist")
             
+            # A dry run must not look like a completed deletion: the per-id
+            # status says "would_*", and each entry names the scope(s) that
+            # hold the id. Without the scope a cross-scope count of 2 read
+            # like two rows in one project.
+            dry_status = "would_soft_forget" if soft else "would_delete"
+            live_status = "soft_forgotten" if soft else "deleted"
             for mid in memory_ids:
                 if not mid or not isinstance(mid, str):
                     bulk_results.append({"id": mid, "status": "error", "error": "invalid memory id"})
                     continue
-                removed, _touched = db.forget_rows(
+                removed, touched = db.forget_rows(
                     mid, tables=tables, soft=soft, dry_run=dry_run)
                 if removed:
                     counts["memories"] += removed
-                    bulk_results.append({"id": mid, "status": "deleted" if not soft else "soft_forgotten"})
+                    bulk_results.append({
+                        "id": mid,
+                        "status": dry_status if dry_run else live_status,
+                        "count": removed,
+                        "scopes": [_scope_of_table(cur, table)
+                                   for table in touched],
+                    })
                 else:
                     bulk_results.append({"id": mid, "status": "not_found"})
             
@@ -2087,7 +2209,7 @@ def forget(
         extra["scopes_affected"] = affected_scopes
         if len(affected_scopes) > 1:
             warnings.append(
-                f"forget(entity=...) without project=true touched multiple "
+                f"forget(entity=...) without `project` touched multiple "
                 f"scopes ({', '.join(affected_scopes)}); pass project=<name> "
                 f"to restrict the removal to one scope")
     if dry_run:

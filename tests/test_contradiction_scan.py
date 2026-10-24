@@ -89,7 +89,8 @@ def test_nli_outage_is_reported_as_an_incomplete_scan():
 
     assert report.budget_exhausted is False
     assert report.failures == [
-        {"fact_id": "a", "neighbor_ids": ["b"], "reason": "inference down"}]
+        {"fact_id": "a", "neighbor_ids": ["b"], "reason": "inference down",
+         "kind": "error"}]
     assert any(w.startswith("scan incomplete: NLI unavailable: inference down")
                for w in report.warnings)
 

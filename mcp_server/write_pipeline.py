@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mcp_server.config import (
+    CONTRADICTION_AUTO_MAX_SUPERSEDES,
+    CONTRADICTION_AUTO_MIN_CONFIDENCE,
     MEMORY_TYPES,
     NEAR_DUPLICATE_THRESHOLD,
     SUPERSEDE_SIMILARITY_MIN,
@@ -80,6 +82,14 @@ class WriteIntent:
     supersede_last: bool = False
     on_near_duplicate: Literal["warn", "supersede", "reject"] = "warn"
     check_contradictions: bool = False
+    # What a confirmed contradiction does: `supersede` replaces the old
+    # memory (default), `warn` stores the fact and reports the pair without
+    # invalidating anything. Only the strongest `max_contradiction_supersedes`
+    # pairs at or above `contradiction_min_confidence` are replaced, so one
+    # noisy NLI run cannot wipe several correct facts.
+    contradiction_mode: Literal["supersede", "warn"] = "supersede"
+    contradiction_min_confidence: float = CONTRADICTION_AUTO_MIN_CONFIDENCE
+    max_contradiction_supersedes: int = CONTRADICTION_AUTO_MAX_SUPERSEDES
     links: list[dict] | None = None
     # Batch tools pre-embed every fact in one call; passing the vector keeps
     # that batching and its single "embedding failed" answer intact.
@@ -301,11 +311,33 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         db.mark_superseded(old_id, mem_id, project=store_project)
 
     auto_superseded: list[dict] = []
-    for c in contradictions:
-        eid = c["existing_id"]
-        if eid not in superseded:
-            db.mark_superseded(eid, mem_id, project=store_project)
-            auto_superseded.append(c)
+    contradiction_kept: list[dict] = []
+    contradiction_min_confidence = max(
+        0.0, min(1.0, intent.contradiction_min_confidence))
+    max_contradiction_supersedes = max(
+        0, int(intent.max_contradiction_supersedes))
+    if contradictions:
+        eligible: list[dict] = []
+        for c in contradictions:
+            confidence = float(c.get("confidence",
+                                     c.get("similarity", 0.0)) or 0.0)
+            c["confidence"] = round(confidence, 3)
+            if c["existing_id"] in superseded:
+                continue
+            if confidence < contradiction_min_confidence:
+                contradiction_kept.append(c)
+            else:
+                eligible.append(c)
+        eligible.sort(key=lambda c: c["confidence"], reverse=True)
+        if intent.contradiction_mode == "warn":
+            contradiction_kept.extend(eligible)
+        else:
+            auto_superseded = eligible[:max_contradiction_supersedes]
+            contradiction_kept.extend(
+                eligible[max_contradiction_supersedes:])
+            for c in auto_superseded:
+                db.mark_superseded(c["existing_id"], mem_id,
+                                   project=store_project)
 
     # A project write that invalidates a SHARED (global) fact hides that fact
     # in every scope, not only in this project.
@@ -363,7 +395,14 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
     if intent.check_contradictions:
         contradictions_payload = {
             "found": bool(contradictions),
-            "superseded": contradictions,
+            # Only what this write really invalidated; `kept` names the pairs
+            # that stayed active on purpose (mode=warn, below the confidence
+            # floor, or beyond the supersede budget).
+            "superseded": auto_superseded,
+            "kept": contradiction_kept,
+            "mode": intent.contradiction_mode,
+            "min_confidence": contradiction_min_confidence,
+            "max_supersedes": max_contradiction_supersedes,
         }
         skip = (contradiction_skip
                 or ("NLI provider is not configured"

@@ -132,6 +132,26 @@ NEAR_DUPLICATE_THRESHOLD = 0.75
 DEFAULT_MIN_SIMILARITY = 0.30
 
 
+# How strongly a result set answers the query.
+#
+# A caller (especially an agent) needs to know whether a hit is an answer or
+# merely the least-bad row of an unrelated query: `recall` used to return
+# 0.30-0.51 noise hits with no warning. The thresholds follow the measured
+# relevance bands: natural-language matches score 0.6-0.95, vocabulary-
+# shifting paraphrases 0.3-0.55. `low` therefore still returns the rows but
+# says that they may not answer the question.
+CONFIDENCE_HIGH = 0.60
+CONFIDENCE_MEDIUM = 0.45
+
+
+# A write's `check_contradictions` used to supersede EVERY pair the NLI
+# flagged, so one reworded fact could silently invalidate several correct
+# memories. One confirmed replacement is applied by default; further pairs
+# are reported as `kept` and need an explicit decision.
+CONTRADICTION_AUTO_MIN_CONFIDENCE = 0.70
+CONTRADICTION_AUTO_MAX_SUPERSEDES = 1
+
+
 # Cross-encoder reranking of the first-stage candidates.
 #
 # The bi-encoder scores a memory and a query independently, so a paraphrase

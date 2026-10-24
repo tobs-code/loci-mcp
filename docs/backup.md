@@ -45,7 +45,7 @@ import_memories(data=<export data>, format="json")
 
 | Parameter | Meaning |
 |-----------|---------|
-| `data` | The export payload, as the object or as its JSON string. |
+| `data` | The export payload, as the object, as a list of records, or as its JSON/JSONL string. |
 | `project` | Target scope for all records. Without it every record is restored into the scope it was exported from. |
 | `format` | `json` (default) or `jsonl`. |
 | `skip_duplicates` | Skip records whose content already exists when the record has **no** id (default `true`). A record whose id already exists is always skipped - that is what makes a re-import idempotent. |
@@ -69,6 +69,13 @@ distinguishable from a backup that silently lost rows. Records that fail
 validation (bad metadata, blank project, broken row) are counted in `invalid`
 and listed in `errors`; they are a subset of `skipped`, so
 `imported + skipped` still equals the number of records.
+
+Every record runs in its own savepoint, so one broken row does not abort the
+file: a record whose embedding has the wrong type or dimension, or whose insert
+fails, is reported in `errors` (named by its id) and the remaining records still
+import. The same holds for a malformed JSONL line: it is collected as
+`skipped_reasons.invalid` with `jsonl line N` in `errors` while the valid lines
+are imported.
 
 ## Pass the payload as a string
 
