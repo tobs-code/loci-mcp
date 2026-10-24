@@ -107,6 +107,44 @@ app.resource("memory://stats", mime_type="application/json",
              description="Memory server stats: counts, health.")(stats_resource)
 
 
+def migrate_memory_tables() -> None:
+    """Migrate the forgotten sentinel and `deleted_at` on every memory table.
+
+    Only project tables in the public schema are ours. An AGE label table with
+    the same name can live in another schema (ag_catalog); updating it as if it
+    were a memory table fails at startup and hides the real scope.
+    """
+    project_tables_sql = (
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name ~ '^mem_[A-Za-z0-9_]+$'"
+    )
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE memories SET superseded_by = %s WHERE superseded_by = 'forgotten'",
+                    (SENTINEL_FORGOTTEN,))
+        cur.execute(project_tables_sql)
+        for t in cur.fetchall():
+            cur.execute(f"UPDATE {t[0]} SET superseded_by = %s WHERE superseded_by = 'forgotten'",
+                        (SENTINEL_FORGOTTEN,))
+        # Add deleted_at column if missing (migration)
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+        cur.execute(project_tables_sql)
+        for t in cur.fetchall():
+            cur.execute(f"ALTER TABLE {t[0]} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+        # Migrate existing __forgotten__ sentinel to deleted_at
+        cur.execute("UPDATE memories SET deleted_at = updated_at WHERE superseded_by = %s AND deleted_at IS NULL",
+                    (SENTINEL_FORGOTTEN,))
+        cur.execute(project_tables_sql)
+        for t in cur.fetchall():
+            cur.execute(f"UPDATE {t[0]} SET deleted_at = updated_at WHERE superseded_by = %s AND deleted_at IS NULL",
+                        (SENTINEL_FORGOTTEN,))
+        conn.commit()
+        logger.info("deleted_at column migrated")
+    finally:
+        conn.close()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
@@ -130,29 +168,7 @@ def main() -> None:
         logger.warning("Full-text index migration skipped: %s", e)
 
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("UPDATE memories SET superseded_by = %s WHERE superseded_by = 'forgotten'",
-                    (SENTINEL_FORGOTTEN,))
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'mem_%'")
-        for t in cur.fetchall():
-            cur.execute(f"UPDATE {t[0]} SET superseded_by = %s WHERE superseded_by = 'forgotten'",
-                        (SENTINEL_FORGOTTEN,))
-        # Add deleted_at column if missing (migration)
-        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'mem_%'")
-        for t in cur.fetchall():
-            cur.execute(f"ALTER TABLE {t[0]} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
-        # Migrate existing __forgotten__ sentinel to deleted_at
-        cur.execute("UPDATE memories SET deleted_at = updated_at WHERE superseded_by = %s AND deleted_at IS NULL",
-                    (SENTINEL_FORGOTTEN,))
-        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'mem_%'")
-        for t in cur.fetchall():
-            cur.execute(f"UPDATE {t[0]} SET deleted_at = updated_at WHERE superseded_by = %s AND deleted_at IS NULL",
-                        (SENTINEL_FORGOTTEN,))
-        conn.commit()
-        conn.close()
-        logger.info("deleted_at column migrated")
+        migrate_memory_tables()
     except Exception as e:
         logger.warning("Schema migration skipped: %s", e)
 
