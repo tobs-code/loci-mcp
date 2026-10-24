@@ -6,10 +6,42 @@ side effect. The functions are idempotent, so calling them again is safe.
 """
 
 import hashlib
+import logging
 
-from mcp_server.config import FTS_LANGUAGE
+from mcp_server import config
 from mcp_server.db import drop_vector_indexes, get_conn, ivfflat_lists
 from mcp_server.scope_catalog import _norm_project, _project_suffix, _safe_ident
+from mcp_server.startup_status import record_warning
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_fts_language() -> None:
+    """Fall back to `english` when the configured dictionary is not installed.
+
+    `FTS_LANGUAGE` is read from the environment at import time; a typo would
+    otherwise make every full-text query fail at runtime with an undefined
+    text-search configuration. Checking once at startup turns that into a
+    warning plus a working fallback. The query side reads
+    `config.FTS_LANGUAGE` per call, so the fallback also reaches SQL that was
+    built after startup.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_ts_config WHERE cfgname = %s",
+                    (config.FTS_LANGUAGE,))
+        exists = cur.fetchone() is not None
+    finally:
+        conn.close()
+    if exists:
+        return
+    message = (f"FTS_LANGUAGE={config.FTS_LANGUAGE!r} is not an installed "
+               f"PostgreSQL text-search dictionary; falling back to "
+               f"'english'")
+    logger.warning(message)
+    record_warning(message)
+    config.FTS_LANGUAGE = "english"
 
 
 def ensure_fts_index(cur, table: str, index_name: str) -> None:
@@ -25,7 +57,7 @@ def ensure_fts_index(cur, table: str, index_name: str) -> None:
         (table,),
     )
     for name, indexdef in cur.fetchall():
-        if f"to_tsvector('{FTS_LANGUAGE}'" not in indexdef:
+        if f"to_tsvector('{config.FTS_LANGUAGE}'" not in indexdef:
             cur.execute(f'DROP INDEX IF EXISTS "{name}"')
     cur.execute(
         "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND tablename = %s "
@@ -35,7 +67,7 @@ def ensure_fts_index(cur, table: str, index_name: str) -> None:
     if not cur.fetchone():
         cur.execute(
             f"CREATE INDEX {index_name} ON {table} USING GIN "
-            f"(to_tsvector('{FTS_LANGUAGE}', content))"
+            f"(to_tsvector('{config.FTS_LANGUAGE}', content))"
         )
 
 
@@ -59,7 +91,7 @@ def migrate_fts_indexes() -> int:
                 (table,),
             )
             stale = [d for (d,) in cur.fetchall()
-                     if f"to_tsvector('{FTS_LANGUAGE}'" not in d]
+                     if f"to_tsvector('{config.FTS_LANGUAGE}'" not in d]
             if not stale:
                 continue
             safe = table[len("mem_"):]

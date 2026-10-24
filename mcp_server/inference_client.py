@@ -14,6 +14,42 @@ INFERENCE_URL = os.environ.get(
 
 _local = threading.local()
 
+# Statuses that a retry can plausibly fix (the same set the inference service
+# retries itself). A 400 is a request problem, not a transient outage, so it is
+# surfaced immediately instead of being sent three times.
+RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# Transport failures that are worth a second attempt. `requests` raises these
+# for a refused connection or a timeout, both of which a restarted inference
+# container fixes without any change to the request.
+RETRYABLE_TRANSPORT_ERRORS = (requests.Timeout, requests.ConnectionError)
+
+
+def _post(url: str, *, json: dict, timeout: float) -> requests.Response:
+    """POST with a short retry for transient transport/status failures."""
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.5 * attempt)
+        try:
+            resp = _get_session().post(url, json=json, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except RETRYABLE_TRANSPORT_ERRORS as exc:
+            last_error = exc
+            logger.warning("%s failed (attempt %s/3): %s", url, attempt + 1, exc)
+            continue
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in RETRYABLE_HTTP_STATUS:
+                last_error = exc
+                logger.warning("%s returned HTTP %s (attempt %s/3)",
+                               url, status, attempt + 1)
+                continue
+            raise
+    assert last_error is not None
+    raise last_error
+
 
 def _get_session():
     """One session per thread: `requests.Session` is not thread-safe, and
@@ -27,12 +63,8 @@ def _get_session():
 
 def embed(texts: list[str], mode: str = "document") -> list[list[float]]:
     """Embed texts. mode="query" for search queries, "document" for stored content."""
-    r = _get_session().post(
-        f"{INFERENCE_URL}/embed",
-        json={"texts": texts, "mode": mode},
-        timeout=30,
-    )
-    r.raise_for_status()
+    r = _post(f"{INFERENCE_URL}/embed",
+              json={"texts": texts, "mode": mode}, timeout=30)
     return r.json()["embeddings"]
 
 
@@ -45,12 +77,9 @@ def rerank(query: str, documents: list[str], *, timeout: float = 60.0) -> list[f
     """
     if not documents:
         return []
-    resp = _get_session().post(
-        f"{INFERENCE_URL}/rerank",
-        json={"query": query, "documents": documents},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
+    resp = _post(f"{INFERENCE_URL}/rerank",
+                 json={"query": query, "documents": documents},
+                 timeout=timeout)
     try:
         payload = resp.json()
     except ValueError as e:
@@ -107,20 +136,46 @@ def nli_detailed(query: str,
         if attempt:
             # A short pause with linear backoff before the retry: the same
             # immediate resend would most likely hit the very same transient
-            # state again.
-            time.sleep(0.5 * attempt)
+            # state again. The pause must not consume the caller's remaining
+            # budget: a scan that is almost out of time retries immediately
+            # (or reports the timeout) instead of sleeping past its deadline.
+            delay = 0.5 * attempt
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("NLI time budget exhausted")
+                delay = min(delay, remaining)
+            time.sleep(delay)
         request_timeout = timeout
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("NLI time budget exhausted")
-            request_timeout = max(0.5, min(timeout, remaining))
-        resp = _get_session().post(
-            f"{INFERENCE_URL}/nli",
-            json=body,
-            timeout=request_timeout,
-        )
-        resp.raise_for_status()
+            request_timeout = max(0.01, min(timeout, remaining))
+        try:
+            resp = _get_session().post(
+                f"{INFERENCE_URL}/nli",
+                json=body,
+                timeout=request_timeout,
+            )
+            resp.raise_for_status()
+        except RETRYABLE_TRANSPORT_ERRORS as e:
+            # A refused connection or a timeout is the common failure when the
+            # inference container is restarting; retry within the budget
+            # instead of reporting the whole scan as an outage.
+            last_error = f"inference request failed: {e}"
+            if attempt < 2:
+                logger.warning("NLI request failed, retrying: %s", last_error)
+                continue
+            raise RuntimeError(last_error) from e
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            last_error = f"NLI request failed with HTTP {status}: {e}"
+            if attempt < 2 and status in RETRYABLE_HTTP_STATUS:
+                logger.warning("NLI request failed with a retryable status, "
+                               "retrying: %s", last_error)
+                continue
+            raise
         try:
             payload = resp.json()
         except ValueError as e:

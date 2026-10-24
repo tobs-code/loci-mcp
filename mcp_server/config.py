@@ -95,9 +95,17 @@ FTS_MIN_COVERAGE = 0.3
 # restricted to a plain identifier. An empty or malformed value falls back to
 # English instead of breaking startup with a syntax error.
 _fts_language = os.getenv("FTS_LANGUAGE", "english").strip() or "english"
-FTS_LANGUAGE = (_fts_language
-                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _fts_language)
-                else "english")
+if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _fts_language):
+    FTS_LANGUAGE = _fts_language
+else:
+    # A typo must not silently leave the server on English stemming: the
+    # fallback is safe, but the operator has to see that the setting was
+    # ignored. `server_health` reports startup warnings.
+    from mcp_server.startup_status import record_warning
+    FTS_LANGUAGE = "english"
+    record_warning(
+        f"FTS_LANGUAGE={_fts_language!r} is not a valid text-search "
+        f"configuration name; using english")
 
 
 # Similarity threshold used by the "semantic" dedupe mode.

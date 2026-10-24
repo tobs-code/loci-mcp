@@ -63,6 +63,10 @@ def _norm_entity(entity: str | None) -> str | None:
         raise ValueError(
             "entity must not be an empty or whitespace-only string: pass a "
             "name or omit it")
+    if "$" in name or "`" in name:
+        raise ValueError(
+            f"invalid entity {name!r}: '$' and '`' are reserved characters "
+            f"and not allowed in an entity name")
     return name
 
 

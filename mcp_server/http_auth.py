@@ -32,7 +32,7 @@ class BearerAuthMiddleware:
 
     def __init__(self, app: Any, token: str) -> None:
         self.app = app
-        self._expected = f"Bearer {token}".encode("utf-8")
+        self._expected = token.encode()
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         # Lifespan and websocket scopes are not tool calls; only HTTP requests
@@ -45,7 +45,17 @@ class BearerAuthMiddleware:
             for key, value in (scope.get("headers") or [])
         }
         provided = headers.get(b"authorization", b"")
-        if hmac.compare_digest(provided, self._expected):
+        # The auth scheme is case-insensitive (RFC 9110); only the credentials
+        # are compared in constant time. Splitting on whitespace also keeps a
+        # header like "Bearer secret extra" invalid, because the remainder is
+        # then compared as a whole.
+        try:
+            scheme, credentials = provided.decode("latin-1").split(None, 1)
+        except ValueError:
+            await _reject(send)
+            return
+        if scheme.lower() == "bearer" and hmac.compare_digest(
+                credentials.encode("latin-1"), self._expected):
             await self.app(scope, receive, send)
             return
         await _reject(send)

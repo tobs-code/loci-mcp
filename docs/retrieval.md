@@ -115,7 +115,11 @@ substring and fused with a stronger RRF weight. Exact content hits get a
 relevance floor of 0.95, substring hits 0.85, so an exact id outranks a vaguely
 similar vector match. `recall` reports `hidden_exact_match` when the literal
 exists only in a hidden row and names the flag (`include_deleted`,
-`include_expired` or `include_superseded`) that reveals it.
+`include_expired` or `include_superseded`) that reveals it. The hint applies
+the query's non-visibility filters (entity, `mem_type`, `updated_after`,
+`metadata_filter`), reports the project name of every matching scope in
+`scopes`, and sets `truncated: true` when a scope returned more rows than the
+100-row summary inspects, so a capped count is not mistaken for the total.
 
 The old **0.40** default came from assuming that unrelated facts score below
 0.30. The model card's own example scores unrelated documents at **0.50-0.61**,
@@ -299,7 +303,10 @@ and warns about the broader comparison, so it is never silent.
 1. All **active** memories of the given entity are loaded (max 200; already
    superseded pairs are done and not re-checked). Without an entity the scan
    is scope-wide: all active memories compete, so pairs across different
-   entities are reported too.
+   entities are reported too. When a scope holds more than 200 candidates,
+   the seed cap checks the first 200 and names every unchecked seed in
+   `nli_failures` (`kind: seed_limit`) with a warning; `limit` only caps the
+   reported pairs and does not raise the seed cap.
 2. **Vector self-join**: for each memory, the 6 nearest neighbours per
    searched scope table (project + global) are fetched via
    `ORDER BY embedding <=>` (`CONTRADICTION_NEIGHBORS`, 1-20).
@@ -317,7 +324,7 @@ and warns about the broader comparison, so it is never silent.
    runs out, the scan returns the pairs judged so far. A partial scan is
    visible and machine readable. Narrow the scan (`entity`, lower `limit`)
    or raise the budget to check more.
-5. Pairs with a confidence > 0.7 count as a contradiction. Each pair names
+5. Pairs with a confidence of 0.7 or higher count as a contradiction. Each pair names
    the entity of both facts and a `cross_entity` flag.
 6. `resolve="newest"` (opt-in) keeps the most recently **created** memory of
    each pair of the **same entity** active and supersedes the older one (a

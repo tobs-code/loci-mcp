@@ -15,6 +15,7 @@ row or an edge without its relation row would make `list_entities` and
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from mcp_server.config import SENTINEL_FORGOTTEN
@@ -32,11 +33,30 @@ from mcp_server.schema_migrator import ensure_project_table
 from mcp_server.storage import _store_memory, _supersede
 
 
+def _dollar_quote(body: str) -> str:
+    """Wrap a Cypher body in a dollar-quoted literal with a collision-free tag.
+
+    AGE's `cypher()` requires its query argument to be a dollar-quoted string
+    literal at parse time (it rejects a bind parameter), so the body cannot be
+    passed via `%s`. A fixed `$$` delimiter lets a user-controlled value such
+    as an entity name containing `$$` close the literal and inject SQL. The
+    tag is therefore generated and verified not to occur in the body: no value
+    can terminate the literal early.
+    """
+    tag = "$loci$"
+    suffix = 0
+    while tag in body:
+        suffix += 1
+        tag = f"$loci{suffix}$"
+    return f"{tag}{body}{tag}"
+
+
 def _cypher(cur, body: str, columns: str):
     """Run one Cypher statement against the shared AGE graph."""
     cur.execute("SET search_path TO ag_catalog, public")
     cur.execute(
-        f"SELECT * FROM cypher('memory_graph', $$ {body} $$) AS ({columns})"
+        f"SELECT * FROM cypher('memory_graph', {_dollar_quote(body)}) "
+        f"AS ({columns})"
     )
     # AGE needs ag_catalog on the path, but leaving it there makes later
     # unqualified SQL resolve against ag_catalog first: a project table
@@ -52,6 +72,20 @@ def _cypher(cur, body: str, columns: str):
     return cur
 
 
+_AGE_TYPE_SUFFIX = re.compile(r"::(?:vertex|edge)(?=\s*[,}\]])")
+
+
+def _age_json(value: Any) -> Any:
+    """Decode AGE's JSON-ish output without mangling string values.
+
+    AGE appends `::vertex`/`::edge` to objects, which makes the value invalid
+    JSON. A blind `.replace()` also rewrites those characters when they occur
+    inside a quoted name, so only a type annotation that directly follows a
+    value (before a comma, brace or bracket) is stripped.
+    """
+    return json.loads(_AGE_TYPE_SUFFIX.sub("", str(value)))
+
+
 def _ensure_entity(cur, name: str, project: str | None,
                    ent_type: str | None = None) -> bool:
     """Create the AGE node and SQL entity row for one scope (idempotent)."""
@@ -59,21 +93,40 @@ def _ensure_entity(cur, name: str, project: str | None,
     scope = _scope_key(project)
     name_json = json.dumps(name)
     scope_json = json.dumps(scope)
-    _cypher(cur, f"MATCH (n:{label} {{name: {name_json}}}) RETURN n",
-            "n agtype")
-    created = cur.fetchone() is None
-    if created:
-        _cypher(
-            cur,
-            f"CREATE (n:{label} {{name: {name_json}, project: {scope_json}}}) "
-            f"RETURN n",
-            "n agtype",
-        )
+    # MATCH-then-CREATE is a time-of-check/time-of-use race: two concurrent
+    # `relate` calls for the same new entity could both see no node and create
+    # one each, leaving duplicate graph nodes. Serialize the check and the
+    # creation for the rest of the transaction.
+    #
+    # One lock per SCOPE, not per (label, name): a per-entity lock taken in
+    # caller order deadlocks when two transactions touch the same two entities
+    # in opposite order (`relate(A, B)` vs `relate(B, A)`). A single scope key
+    # has no ordering to invert and graph writes are short.
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (label,),
+    )
+    _cypher(
+        cur,
+        f"MERGE (n:{label} {{name: {name_json}}}) "
+        f"SET n.project = {scope_json} RETURN n",
+        "n agtype",
+    )
     cur.execute(
         "INSERT INTO entities (name, type, project) VALUES (%s, %s, %s) "
-        "ON CONFLICT (name, project) DO UPDATE SET type = EXCLUDED.type",
+        "ON CONFLICT (name, project) DO NOTHING RETURNING 1",
         (name, ent_type or label, scope),
     )
+    # `RETURNING (xmax = 0)` is not a reliable created-flag: under READ
+    # COMMITTED a row just committed by another transaction can also report
+    # xmax = 0, which made an update look like a creation. The insert either
+    # produced a row (created) or hit the conflict and must update the type.
+    created = cur.fetchone() is not None
+    if not created:
+        cur.execute(
+            "UPDATE entities SET type = %s WHERE name = %s AND project = %s",
+            (ent_type or label, name, scope),
+        )
     return created
 
 
@@ -350,10 +403,14 @@ def _edge_context(cur, project: str | None, from_entity: str, to_entity: str,
         f"SELECT content FROM {table} "
         "WHERE entity = %s AND superseded_by IS NULL "
         "AND deleted_at IS NULL "
+        "AND (expires_at IS NULL OR expires_at > NOW()) "
         "AND metadata->>'relation_context' = 'true' "
+        "AND metadata->>'from' = %s "
+        "AND metadata->>'to' = %s "
         "AND metadata->>'relation_type' = %s "
         "ORDER BY updated_at DESC LIMIT 1",
-        (f"{from_entity}_{relation_type}_{to_entity}", relation_type),
+        (f"{from_entity}_{relation_type}_{to_entity}",
+         from_entity, to_entity, relation_type),
     )
     row = cur.fetchone()
     return row[0] if row else None
@@ -612,8 +669,13 @@ class GraphStore:
                 self.cur.execute(
                     f"SELECT id, content FROM {ctx_table} WHERE entity = %s "
                     f"AND superseded_by IS NULL AND deleted_at IS NULL "
-                    f"LIMIT 1",
-                    (ctx_entity,),
+                    f"AND (expires_at IS NULL OR expires_at > NOW()) "
+                    f"AND metadata->>'from' = %s "
+                    f"AND metadata->>'to' = %s "
+                    f"AND metadata->>'relation_type' = %s "
+                    f"ORDER BY updated_at DESC LIMIT 1",
+                    (ctx_entity, e["from_entity"], e["to_entity"],
+                     e["relation_type"]),
                 )
                 row = self.cur.fetchone()
                 if row and row[1] == e["context"]:
@@ -735,9 +797,11 @@ class GraphStore:
     def relation_page(self, entity: str | None = None,
                       relation_type: str | None = None,
                       project: str | None = None, limit: int = 50,
-                      offset: int = 0) -> dict:
+                      offset: int = 0,
+                      all_scopes: bool | None = None) -> dict:
         """Browse mirror edges (strongest first) without a start entity."""
-        all_scopes = project is None or str(project).strip() == "*"
+        if all_scopes is None:
+            all_scopes = project is None or str(project).strip() == "*"
         conditions: list[str] = []
         params: list[Any] = []
         if not all_scopes:
@@ -802,11 +866,9 @@ class GraphStore:
         results: list[dict] = []
         seen_paths: set[tuple] = set()
         for r in rows:
-            nodes_str = str(r[0]).replace("::vertex", "").replace("::edge", "")
-            rels_str = str(r[1]).replace("::vertex", "").replace("::edge", "")
             try:
-                parsed = json.loads(nodes_str)
-                parsed_rels = json.loads(rels_str)
+                parsed = _age_json(r[0])
+                parsed_rels = _age_json(r[1])
             except json.JSONDecodeError:
                 continue
             names = [n.get("properties", {}).get("name", "?") for n in parsed]

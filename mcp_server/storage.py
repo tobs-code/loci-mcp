@@ -20,12 +20,17 @@ def clear_dangling_supersede(cur, tables: list[str] | None = None) -> int:
     an id that is gone: the row then stays invisible to every read even though
     nothing supersedes it any more. Called after hard deletes and imports so a
     dangling link can never make a memory permanently unreachable.
+
+    Link validity is global: an id may live in another scope (a project write
+    can supersede a shared fact). The id universe is therefore always read
+    from every memory table; `tables` only narrows which tables are repaired.
     """
     from mcp_server.scope_catalog import _all_mem_tables  # avoid import cycle
 
-    targets = tables if tables is not None else _all_mem_tables(cur)
+    universe = _all_mem_tables(cur)
+    targets = tables if tables is not None else universe
     all_ids: set[str] = set()
-    for table in targets:
+    for table in universe:
         cur.execute(f"SELECT id FROM {table}")
         all_ids |= {row[0] for row in cur.fetchall()}
     repaired = 0

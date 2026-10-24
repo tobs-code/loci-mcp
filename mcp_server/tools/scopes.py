@@ -196,9 +196,11 @@ def list_projects(
                         "superseded_memories": table_counts["superseded"],
                         "forgotten_memories": table_counts["forgotten"],
                     })
-                if include_counts:
-                    counts["entities"] = entity_count(db, scope)
-                    counts["relations"] = relation_count(db, scope)
+            if include_counts:
+                # A graph-only scope has no memory table, but its entities and
+                # relations still exist and must not be reported as zero.
+                counts["entities"] = entity_count(db, scope)
+                counts["relations"] = relation_count(db, scope)
             has_graph = scope in graph_scopes
             if include_empty or active_count > 0 or has_graph:
                 row = {

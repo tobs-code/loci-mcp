@@ -226,21 +226,32 @@ class MemoryStore:
         return mem_id
 
     def mark_superseded(self, memory_id: str, superseded_by: str, *,
-                        project: str | None = None) -> int:
-        """Mark a memory as replaced, in its scope and (for a project) global.
+                        project: str | None = None,
+                        target: str | None = None) -> int:
+        """Mark a memory as replaced, in the table the id was resolved in.
 
-        The global update is deliberately unconditional: a project write may
-        replace a shared fact, and that fact must disappear from every scope.
+        `target` is the scope the id belongs to ("project" or "global").
+        A project write that replaces a shared fact must still hide that fact
+        in every scope, but a same-named id in the other table is a different
+        memory: updating it would invalidate an unrelated row. Without a
+        resolved target the historical behaviour (project table plus global)
+        is kept for callers that cannot know the scope.
         """
-        touched = self.execute(
-            f"UPDATE {_mem_table(project)} SET superseded_by = %s, "
-            f"updated_at = NOW() WHERE id = %s",
-            (superseded_by, memory_id),
-        )
-        if project:
+        if target == "global":
+            tables = ["memories"]
+        elif target == "project":
+            tables = [_mem_table(project)]
+        else:
+            tables = [_mem_table(project)]
+            if project:
+                tables.append("memories")
+        touched = 0
+        for table in dict.fromkeys(tables):
             touched += self.execute(
-                "UPDATE memories SET superseded_by = %s, updated_at = NOW() "
-                "WHERE id = %s", (superseded_by, memory_id))
+                f"UPDATE {table} SET superseded_by = %s, "
+                f"updated_at = NOW() WHERE id = %s",
+                (superseded_by, memory_id),
+            )
         return touched
 
     def forget_rows(self, memory_id: str, *, project: str | None = None,

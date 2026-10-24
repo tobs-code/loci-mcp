@@ -11,9 +11,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.tools.base import Tool
 from mcp.server.fastmcp.tools.tool_manager import ToolManager
+from mcp.shared.exceptions import UrlElicitationRequiredError
 from pydantic import ValidationError
 
 from mcp_server.envelope import STATUS_ERROR, fail
@@ -69,6 +71,17 @@ class EnvelopeTool(Tool):
     failed call never raises.
     """
 
+    def _run_sync(self, arguments, context, convert_result):
+        parsed = self.fn_metadata.pre_parse_json(arguments)
+        model = self.fn_metadata.arg_model.model_validate(parsed)
+        kwargs = model.model_dump_one_level()
+        if self.context_kwarg is not None:
+            kwargs[self.context_kwarg] = context
+        result = self.fn(**kwargs)
+        if convert_result:
+            result = self.fn_metadata.convert_result(result)
+        return result
+
     async def run(self, arguments, context=None, convert_result: bool = False):
         result = None
         try:
@@ -89,7 +102,18 @@ class EnvelopeTool(Tool):
                 result = fail(STATUS_ERROR, extra_error)
         if result is None:
             try:
-                return await super().run(arguments, context, convert_result)
+                if self.is_async:
+                    return await super().run(
+                        arguments, context, convert_result)
+                # The tool functions are synchronous (DB and inference work),
+                # so running them inline in the event loop would block every
+                # other MCP request for the duration of the call.
+                return await anyio.to_thread.run_sync(
+                    self._run_sync, arguments, context, convert_result)
+            except UrlElicitationRequiredError:
+                # The SDK turns this into the documented MCP error response
+                # (code -32042); wrapping it in an envelope would hide it.
+                raise
             except Exception as exc:
                 result = fail(STATUS_ERROR, _error_message(exc))
         if convert_result:

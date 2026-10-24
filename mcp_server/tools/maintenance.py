@@ -106,7 +106,7 @@ def contradictions_report(entity: Annotated[
     limit: Annotated[
         int,
         Field(description="Maximum number of candidate pairs to report "
-                          "(default 20).")] = 20,
+                          "(default 20).", ge=1, le=500)] = 20,
     budget_seconds: Annotated[
         float | None,
         Field(description="Wall-clock budget for the NLI leg (default: "
@@ -539,7 +539,7 @@ def prune_memories(
         if dry_run:
             db.rollback()
         else:
-            clear_dangling_supersede(cur, tables)
+            clear_dangling_supersede(cur)
             db.commit()
     except Exception as e:
         db.rollback()
@@ -571,14 +571,19 @@ def server_health() -> dict[str, Any]:
     """Check if all services (Postgres, Inference) are healthy."""
     logger.info("server_health")
     pg_ok = False
+    db = None
     try:
         db = MemoryStore()
         db.ping()
         pg_ok = True
         db.commit()
-        db.close()
     except Exception:
-        pass
+        logger.warning("server_health postgres ping failed", exc_info=True)
+    finally:
+        if db is not None:
+            # A store whose ping failed still owns a connection; leaving it
+            # open leaks one connection per health check.
+            db.close()
     inference_details = health_details()
     toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
     if toolset not in ("core", "full"):

@@ -614,6 +614,15 @@ def import_memories(
                     f"expires_at is not a valid ISO 8601 timestamp")
                 skipped += 1
                 continue
+            deleted_at = _parse_dt(rec.get("deleted_at"))
+            if rec.get("deleted_at") not in (None, "") and deleted_at is None:
+                # Silently treating a broken `deleted_at` as None would
+                # resurrect a forgotten memory as active.
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: "
+                    f"deleted_at is not a valid ISO 8601 timestamp")
+                skipped += 1
+                continue
             table = _mem_table(target)
             if target:
                 ensure_project_table(cur, target)
@@ -695,7 +704,7 @@ def import_memories(
                      (float(rec["importance"])
                       if rec.get("importance") is not None else 0.5),
                      json.dumps(meta), int(rec.get("access_count", 0) or 0),
-                     superseded_by, _parse_dt(rec.get("deleted_at")),
+                     superseded_by, deleted_at,
                      expires, _parse_dt(rec.get("created_at")),
                      _parse_dt(rec.get("updated_at")),
                      _parse_dt(rec.get("created_at"))),
@@ -714,21 +723,31 @@ def import_memories(
             graph_store = GraphStore(cur=cur)
 
             def _resolve(value):
-                scope = project if project is not None else _norm_project(value)
-                try:
-                    return _norm_project(scope)
-                except ValueError:
-                    # A blank project in a graph record stays a data problem
-                    # of that record, not of the whole import.
-                    return None
+                # `project` overrides the scope stored in the record. The
+                # normalization raises for a blank name; every call site keeps
+                # it inside its own try so one bad graph record does not abort
+                # the whole import (and silently fall back to global).
+                return _norm_project(project if project is not None else value)
 
             for ent in _as_list(graph.get("entities", [])):
                 if not isinstance(ent, dict) or not ent.get("name"):
                     continue
-                if graph_store.ensure_entity(
-                    ent["name"], _resolve(ent.get("project")),
-                    ent.get("type"),
-                ):
+                # A bad graph record must not abort the memory import (or the
+                # rest of the graph): each entity gets its own savepoint.
+                cur.execute("SAVEPOINT import_entity")
+                try:
+                    created = graph_store.ensure_entity(
+                        ent["name"], _resolve(ent.get("project")),
+                        ent.get("type"),
+                    )
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT import_entity")
+                    cur.execute("RELEASE SAVEPOINT import_entity")
+                    errors.append(
+                        f"graph entity {ent['name']!r}: {exc}")
+                    continue
+                cur.execute("RELEASE SAVEPOINT import_entity")
+                if created:
                     graph_entities_created += 1
                 graph_entities += 1
 
@@ -738,14 +757,39 @@ def import_memories(
                     continue
                 if not rel.get("from_entity") or not rel.get("to_entity"):
                     continue
-                grouped.setdefault(_resolve(rel.get("project")), []).append({
+                try:
+                    weight = float(rel.get("weight", 1.0))
+                except (TypeError, ValueError):
+                    errors.append(
+                        f"graph relation "
+                        f"{rel.get('from_entity')!r} -> "
+                        f"{rel.get('to_entity')!r}: weight must be a number")
+                    continue
+                try:
+                    relation_scope = _resolve(rel.get("project"))
+                except ValueError as exc:
+                    errors.append(
+                        f"graph relation "
+                        f"{rel.get('from_entity')!r} -> "
+                        f"{rel.get('to_entity')!r}: {exc}")
+                    continue
+                grouped.setdefault(relation_scope, []).append({
                     "from_entity": rel["from_entity"],
                     "to_entity": rel["to_entity"],
                     "relation_type": rel["relation_type"],
-                    "weight": float(rel.get("weight", 1.0)),
+                    "weight": weight,
                 })
-            for scope, edges in grouped.items():
-                restored = graph_store.relate(edges, scope)
+            for index, (scope, edges) in enumerate(grouped.items()):
+                savepoint = f"import_relations_{index}"
+                cur.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    restored = graph_store.relate(edges, scope)
+                except Exception as exc:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    errors.append(f"graph relations: {exc}")
+                    continue
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                 graph_relations += len(restored)
                 graph_relations_created += sum(
                     1 for edge in restored if edge.get("status") == "created")

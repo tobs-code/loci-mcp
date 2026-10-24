@@ -51,7 +51,6 @@ class BrowseRequest:
     include_deleted: bool = False
     include_expired: bool = False
     include_superseded: bool = False
-    only_superseded: bool = False
     include_duplicates: bool = False
     limit: int = 20
     offset: int = 0

@@ -436,6 +436,11 @@ the graph nodes of the covered scopes, not of the whole database.
 - `list_relations` pages through edges directly; `project` omitted (or `"*"`)
   covers every scope, `"global"` only the shared graph. Each edge carries its
   `context` sentence when one was stored, like `find_connections`.
+- Entity names are trimmed before use. A blank or whitespace-only name is an
+  argument error, and a name containing `$` or a backtick is refused: those
+  characters are reserved by the Cypher layer, so accepting them would create
+  a node that no subsequent lookup can address. Relation types are restricted
+  to letters, digits and `_`.
 
 ## Maintenance tools
 

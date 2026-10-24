@@ -73,7 +73,10 @@ def find_duplicate(
         max_dist = 1.0 - threshold
         cur.execute(
             f"SELECT id, embedding <=> %s::vector AS dist "
-            f"FROM {table} WHERE {ACTIVE_ROW_SQL} AND embedding IS NOT NULL"
+            f"FROM {table} WHERE {ACTIVE_ROW_SQL} AND embedding IS NOT NULL "
+            # A relation-context sentence describes an edge, not a fact;
+            # it must never absorb a new fact as its duplicate.
+            f"AND COALESCE(metadata->>'relation_context', 'false') <> 'true'"
             f"{exclude_sql} "
             f"ORDER BY dist ASC LIMIT 1",
             [embedding_vec] + exclude_params,
@@ -144,7 +147,10 @@ def find_near_duplicate(
 
 # --- Subject predicates ----------------------------------------------------
 
-_WORD_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
+# Unicode letters/digits, not just ASCII: an accented word ("für", "Straße")
+# was split into one-letter fragments, so the stopword filter never saw it and
+# the fragments could make two unrelated facts share a "subject word".
+_WORD_RE = re.compile(r"[^\W_]+(?:[._-][^\W_]+)*", re.UNICODE)
 _CAMEL_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
 
@@ -162,7 +168,7 @@ _STOPWORDS = {
     # fact about "the service" share them without sharing a subject.
     "service", "application", "app", "system", "platform", "component",
     "der", "die", "das", "ein", "eine", "einer", "und", "oder", "ist", "sind",
-    "auf", "fuer", "für", "mit", "von", "zu", "im", "in", "den", "dem",
+    "auf", "fuer", "für", "mit", "von", "zu", "im", "den", "dem",
     "des", "wird", "werden", "hat", "haben",
 }
 
@@ -389,12 +395,6 @@ def _tokens(content: str) -> set[str]:
     text = (content or "").lower()
     chars = [c if c.isalnum() or c.isspace() else " " for c in text]
     return {_stem(w) for w in "".join(chars).split() if w}
-
-
-def normalize_content(content: str) -> str:
-    """Key for near-duplicate detection: case, punctuation and plurals
-    insensitive."""
-    return " ".join(sorted(_tokens(content)))
 
 
 def _similarity(a: set[str], b: set[str]) -> float:

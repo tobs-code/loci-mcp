@@ -45,7 +45,12 @@ _NLI_PARTIAL_RE = re.compile(
     r"(?P<reason>.*)", re.DOTALL)
 
 CONTRADICTION_SCORE_THRESHOLD = 0.7
+# Seed memories loaded per scan. The report's `limit` counts the pairs it
+# returns, not how much of the scope is checked; coupling both made
+# `limit=5` silently inspect only five memories.
+MAX_SCAN_SEEDS = 200
 SKIPPED_BUDGET_REASON = "skipped: NLI time budget exhausted"
+SKIPPED_SEED_REASON = "skipped: candidate seed limit reached"
 ALREADY_SUPERSEDED_REASON = "already superseded by an earlier pair in this run"
 
 
@@ -562,7 +567,7 @@ def report_from_judgement(
         for neighbour, score in zip(group.neighbours, scores):
             if len(pairs) >= limit:
                 break
-            if score > CONTRADICTION_SCORE_THRESHOLD:
+            if score >= CONTRADICTION_SCORE_THRESHOLD:
                 pairs.append(_contradiction_pair(
                     group.fact, neighbour,
                     Judge(group.fact["id"], neighbour.id, score)))
@@ -755,17 +760,18 @@ class ContradictionScan:
         # judge leg gets the rest.
         remaining = request.budget_seconds - (self._clock() - started) - 1.5
         if loaded.warning is not None:
-            return ScanReport(warnings=[loaded.warning],
-                              candidates=0, entity=request.entity)
+            return self._note_seed_limit(ScanReport(
+                warnings=[loaded.warning],
+                candidates=0, entity=request.entity), loaded)
         if not loaded.groups:
             scope_desc = (f"active memories of {request.entity!r}"
                           if request.entity else "active memories of the scope")
-            return ScanReport(
+            return self._note_seed_limit(ScanReport(
                 warnings=[
                     f"no candidate pairs: no two {scope_desc} are similar "
                     f"enough to be worth comparing"],
                 candidates=0, timestamps=loaded.timestamps,
-                entity=request.entity)
+                entity=request.entity), loaded)
         if remaining <= 0.5:
             remaining_for_judge = max(0.0, remaining)
             warnings = [
@@ -781,13 +787,13 @@ class ContradictionScan:
                 "reason": SKIPPED_BUDGET_REASON,
                 "kind": "budget",
             } for group in loaded.groups]
-            return ScanReport(
+            return self._note_seed_limit(ScanReport(
                 warnings=warnings,
                 budget_exhausted=True,
                 candidates=len(loaded.groups),
                 failures=failures,
                 timestamps=loaded.timestamps,
-                entity=request.entity)
+                entity=request.entity), loaded)
 
         try:
             judgement = judge_candidates(
@@ -796,19 +802,45 @@ class ContradictionScan:
                 workers=request.workers,
                 clock=self._clock,
             )
-            return report_from_judgement(
+            return self._note_seed_limit(report_from_judgement(
                 loaded.groups, judgement,
                 entity=request.entity, limit=request.limit,
-                timestamps=loaded.timestamps)
+                timestamps=loaded.timestamps), loaded)
         except Exception as e:  # noqa: BLE001 - an outage is surfaced loudly
             logger.warning("contradictions_report NLI failed: %s", e)
-            return ScanReport(
+            return self._note_seed_limit(ScanReport(
                 warnings=[
                     f"scan incomplete: NLI unavailable: {e} - the result is "
                     f"not a clean contradiction scan; retry later"],
                 candidates=len(loaded.groups),
                 timestamps=loaded.timestamps,
-                entity=request.entity)
+                entity=request.entity), loaded)
+
+    @staticmethod
+    def _note_seed_limit(report: ScanReport,
+                         loaded: "LoadedCandidates") -> ScanReport:
+        """Name the seeds the scan cap kept out of the candidate pool.
+
+        A silently truncated seed list reads like "every fact was compared";
+        the warning and the per-fact failure entries say otherwise.
+        """
+        if not loaded.skipped_seeds:
+            return report
+        report.warnings.append(
+            f"scan incomplete: {loaded.skipped_seeds} candidate seed(s) were "
+            f"not checked because the scan processes at most "
+            f"{MAX_SCAN_SEEDS} seeds; their fact ids are listed in "
+            f"`nli_failures` (reason '{SKIPPED_SEED_REASON}'). The scope may "
+            f"hold more active memories than the scan examined; narrow the "
+            f"scan with `entity` (`limit` only caps the reported pairs and "
+            f"does not raise the seed cap)")
+        report.failures.extend({
+            "fact_id": fact_id,
+            "neighbor_ids": [],
+            "reason": SKIPPED_SEED_REASON,
+            "kind": "seed_limit",
+        } for fact_id in loaded.skipped_seed_ids)
+        return report
 
     @staticmethod
     def _unjudged_entry(group: CandidateGroup) -> dict:
@@ -837,7 +869,10 @@ class ContradictionScan:
                 query_embedding=None,
                 query_text=None,
                 entity=request.entity,
-                limit=200,
+                # Load one row beyond the cap: without the extra row the seed
+                # loop below never has a leftover seed to report, so the
+                # skipped-seed warning was unreachable in production.
+                limit=MAX_SCAN_SEEDS + 1,
                 project=request.project,
                 include_embedding=True,
                 include_superseded=False,
@@ -892,11 +927,16 @@ class ContradictionScan:
         where = ("(entity = %s OR entity IS NULL)" if request.entity else "")
         where_params = (request.entity,) if request.entity else ()
 
-        for fact in facts:
-            if not fact.get("embedding"):
-                continue
-            if len(candidates) >= request.limit:
+        embeddable = [fact for fact in facts if fact.get("embedding")]
+        processed_seeds = 0
+        for fact in embeddable:
+            # A seed that produced no neighbour still used a similarity search;
+            # counting only the groups that were kept let the cap run over the
+            # seed list. `processed_seeds` bounds the work, `skipped_seeds`
+            # makes the cut visible instead of dropping facts silently.
+            if processed_seeds >= MAX_SCAN_SEEDS:
                 break
+            processed_seeds += 1
             found: list[Neighbour] = []
             for row in db.nearest(
                     project=request.project,
@@ -929,7 +969,11 @@ class ContradictionScan:
 
         groups = list(candidates.values())
         groups.sort(key=lambda group: group.neighbours[0].distance)
-        return LoadedCandidates(groups=groups, timestamps=timestamps)
+        skipped = embeddable[processed_seeds:]
+        return LoadedCandidates(
+            groups=groups, timestamps=timestamps,
+            skipped_seeds=len(skipped),
+            skipped_seed_ids=[fact["id"] for fact in skipped])
 
 
 @dataclass
@@ -937,3 +981,8 @@ class LoadedCandidates:
     groups: list[CandidateGroup] = field(default_factory=list)
     timestamps: dict[str, Any] = field(default_factory=dict)
     warning: str | None = None
+    # Seeds that were embeddable but never checked because the scan reached
+    # MAX_SCAN_SEEDS. A cap that silently stops the loop makes the report look
+    # complete while whole facts were never compared.
+    skipped_seeds: int = 0
+    skipped_seed_ids: list[str] = field(default_factory=list)

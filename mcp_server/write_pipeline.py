@@ -242,7 +242,6 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
 
     contradictions: list[dict] = []
     contradiction_unjudged: list[dict] = []
-    contradiction_partial_error: str | None = None
     contradiction_skip: str | None = None
     nli_unavailable = (intent.check_contradictions
                        and intent.probe_nli_config
@@ -311,7 +310,9 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
                        scope=effective_scope, expires_at=intent.expires_at)
 
     for old_id in superseded:
-        db.mark_superseded(old_id, mem_id, project=store_project)
+        db.mark_superseded(
+            old_id, mem_id, project=store_project,
+            target=_scope_of_id(cur, old_id, store_project))
 
     auto_superseded: list[dict] = []
     contradiction_kept: list[dict] = []
@@ -339,8 +340,9 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
             contradiction_kept.extend(
                 eligible[max_contradiction_supersedes:])
             for c in auto_superseded:
-                db.mark_superseded(c["existing_id"], mem_id,
-                                   project=store_project)
+                db.mark_superseded(
+                    c["existing_id"], mem_id, project=store_project,
+                    target=_scope_of_id(cur, c["existing_id"], store_project))
 
     # A project write that invalidates a SHARED (global) fact hides that fact
     # in every scope, not only in this project.
@@ -668,7 +670,7 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
             # target, so an entity tag must not block the fallback: the same
             # text without (or with another) tag is still the intended fact.
             c_hash = _content_hash((supersede_content or "").strip())
-            found = _by_content_hash(cur, "memories", c_hash, entity)
+            found = _by_content_hash(cur, "memories", c_hash, None)
         if found:
             targets.append(found)
         else:

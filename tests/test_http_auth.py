@@ -143,3 +143,12 @@ def test_middleware_leaves_lifespan_scopes_alone():
 
     assert _status(sent) == 204
     assert inner.calls == 1
+
+def test_middleware_accepts_a_lowercase_bearer_scheme():
+    inner = _Recorder()
+    app = BearerAuthMiddleware(inner, "secret")
+
+    sent = _call(app, {"Authorization": "bearer secret"})
+
+    assert _status(sent) == 204
+    assert inner.calls == 1

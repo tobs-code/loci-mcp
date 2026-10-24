@@ -5,7 +5,7 @@ import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
 
-from mcp_server.config import FTS_LANGUAGE
+from mcp_server import config
 from mcp_server.startup_status import record_warning
 logger = logging.getLogger(__name__)
 
@@ -163,9 +163,9 @@ def ensure_schema():
             "WHERE schemaname = 'public' AND indexname = 'idx_memories_tsvector'"
         )
         row = cur.fetchone()
-        if row and f"to_tsvector('{FTS_LANGUAGE}'" not in row[0]:
+        if row and f"to_tsvector('{config.FTS_LANGUAGE}'" not in row[0]:
             cur.execute("DROP INDEX IF EXISTS idx_memories_tsvector")
-            logger.info("Recreating full-text index with dictionary %s", FTS_LANGUAGE)
+            logger.info("Recreating full-text index with dictionary %s", config.FTS_LANGUAGE)
 
         index_statements = []
         if lists is not None:
@@ -174,7 +174,7 @@ def ensure_schema():
                 f"USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists})"
             )
         for idx in index_statements + [
-            f"CREATE INDEX IF NOT EXISTS idx_memories_tsvector ON memories USING GIN (to_tsvector('{FTS_LANGUAGE}', content))",
+            f"CREATE INDEX IF NOT EXISTS idx_memories_tsvector ON memories USING GIN (to_tsvector('{config.FTS_LANGUAGE}', content))",
             "CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash)",
             "CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity)",
             "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(mem_type)",

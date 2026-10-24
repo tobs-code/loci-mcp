@@ -229,7 +229,11 @@ def relate_batch(
             indexed.setdefault(_norm_project(edge.get("project", project)),
                                []).append((i, edge))
         results: list[Any] = [None] * len(edges)
-        for scope, pairs in indexed.items():
+        # Sorted scope order: `_ensure_entity` takes a per-scope advisory lock,
+        # so two batches covering the same scopes in opposite insertion order
+        # would otherwise deadlock. Results still land at the caller's index.
+        for scope, pairs in sorted(indexed.items(),
+                                   key=lambda item: item[0] or ""):
             try:
                 batch = graph.relate([edge for _, edge in pairs], scope)
             except Exception as e:
@@ -466,7 +470,7 @@ def list_relations(
             warnings.append(unknown)
         page = graph.relation_page(
             entity=entity, relation_type=relation_type, project=project,
-            limit=limit, offset=offset)
+            limit=limit, offset=offset, all_scopes=all_scopes)
         total = page["total"]
         results = page["results"]
         db.commit()

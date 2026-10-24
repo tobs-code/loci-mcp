@@ -20,7 +20,7 @@ from mcp_server.graph import (
     unrelate,
 )
 from mcp_server.graph_store import GraphStore
-from mcp_server.schema_migrator import migrate_fts_indexes
+from mcp_server.schema_migrator import ensure_fts_language, migrate_fts_indexes
 from mcp_server.tools.maintenance import (
     contradictions_report,
     prune_memories,
@@ -172,6 +172,15 @@ def main() -> None:
         logger.warning(
             "MCP_ALLOW_INSECURE_HTTP=true: the HTTP transport is running "
             "without authentication - only use this in a trusted sandbox")
+
+    # A dictionary that does not exist would break every FTS query later, so
+    # resolve it before the schema/index work builds SQL with it.
+    try:
+        ensure_fts_language()
+    except Exception as e:
+        message = f"full-text language check skipped: {e}"
+        logger.error(message)
+        record_warning(message)
 
     try:
         ensure_schema()

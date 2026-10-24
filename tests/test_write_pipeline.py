@@ -32,9 +32,10 @@ class FakeStore:
                            dict(metadata), project, scope))
         return "new-id"
 
-    def mark_superseded(self, memory_id, superseded_by, *, project=None):
+    def mark_superseded(self, memory_id, superseded_by, *, project=None,
+                        target=None):
         self.calls.append(("mark_superseded", memory_id, superseded_by,
-                           project))
+                           project, target))
         return 1
 
 

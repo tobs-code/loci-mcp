@@ -113,7 +113,8 @@ def entity_row_count(store, target: str, tables: list[str],
     rows: list[dict] = []
     for table in tables:
         for item in store.all(
-                f"SELECT id, content_hash, superseded_by, deleted_at "
+                f"SELECT id, content_hash, superseded_by, deleted_at, "
+                f"expires_at "
                 f"FROM {table} WHERE {where}", (target,)):
             item["_table"] = table
             rows.append(item)

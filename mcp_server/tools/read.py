@@ -38,6 +38,7 @@ from mcp_server.lifecycle import (
     is_expired as _is_expired,
 )
 from mcp_server.lifecycle import (
+    is_visible,
     visibility_sql as _visibility_condition,
 )
 from mcp_server.projection import (
@@ -524,7 +525,7 @@ def recall(
     projectable = [r for r in results if isinstance(r, dict)]
     rows, expired_count = project_rows(
         projectable, fields, projection_fields=projection_fields,
-        all_markers=fields is None)
+        all_markers=fields is None, include_deleted=include_deleted)
     if expired_count:
         warnings.append(
             f"{expired_count} result(s) have an expired TTL: they are not "
@@ -1014,35 +1015,12 @@ def list_memories(
             ignored.append("offset")
         if order_by != "updated_at":
             ignored.append("order_by")
-        results: list[dict] = []
-        missing: list[str] = []
-        hidden: list[dict] = []
-        errors: list[dict] = []
-        for mid in wanted:
-            found = _get_memory(
-                memory_id=mid, project=raw_project,
-                include_superseded=include_superseded,
-                include_deleted=include_deleted,
-                include_expired=include_expired, fields=fields,
-                include_global=include_global)
-            if found.get("ok"):
-                results.append(found["memory"])
-            elif found.get("scopes"):
-                errors.append({"id": mid, "status": found.get("status"),
-                               "error": found.get("error"),
-                               "scopes": found["scopes"]})
-            elif found.get("hidden"):
-                # A row that exists but is superseded/forgotten/expired is not
-                # "missing": merging the two sent the caller looking for a
-                # typo instead of a visibility flag.
-                hidden.append({
-                    "id": mid,
-                    "scope": found.get("scope"),
-                    "reasons": found.get("hidden_reasons") or [],
-                    "reveal_flags": found.get("reveal_flags") or [],
-                })
-            else:
-                missing.append(mid)
+        results, missing, hidden, errors = _bulk_memory_lookup(
+            wanted, raw_project=raw_project,
+            include_global=include_global,
+            include_superseded=include_superseded,
+            include_deleted=include_deleted,
+            include_expired=include_expired, fields=fields)
         warnings = []
         if ignored:
             warnings.append("memory_ids performs a bulk id lookup: "
@@ -1136,6 +1114,113 @@ def list_memories(
               total_by_scope=page.total_by_scope,
               listed_by_scope=page.listed_by_scope,
               warnings=page.warnings, results=page.results)
+
+
+def _bulk_memory_lookup(
+    wanted: list[str],
+    *,
+    raw_project: str | None,
+    include_global: bool,
+    include_superseded: bool,
+    include_deleted: bool,
+    include_expired: bool,
+    fields: list[str] | None,
+) -> tuple[list[dict], list[str], list[dict], list[dict]]:
+    """Fetch many ids with one query per scope table (no N+1).
+
+    The result keeps the per-id buckets of the singular lookup: found rows,
+    missing ids, hidden rows with their reveal flags, and ids that exist in
+    several scopes.
+    """
+    scope = resolve_scope(raw_project, include_global)
+    db = MemoryStore()
+    try:
+        cur = db.cur
+        if scope.global_only:
+            tables = ["memories"]
+        elif scope.project:
+            tables = scope.tables(cur, MODE_LOOKUP)
+        else:
+            tables = _all_mem_tables(cur)
+        if not include_global:
+            tables = [table for table in tables if table != "memories"]
+
+        matches: dict[str, list[tuple[str, dict]]] = {}
+        for table in tables:
+            for row in db.all(
+                    f"SELECT * FROM {table} WHERE id = ANY(%s)", (wanted,)):
+                matches.setdefault(row["id"], []).append((table, row))
+
+        all_scopes = raw_project is None or str(raw_project).strip() == "*"
+        results: list[dict] = []
+        missing: list[str] = []
+        hidden: list[dict] = []
+        errors: list[dict] = []
+        for mid in wanted:
+            found = matches.get(mid)
+            if not found:
+                missing.append(mid)
+                continue
+            if all_scopes:
+                scopes = []
+                for table, _row in found:
+                    name = db.scope_of_table(table)
+                    if name not in scopes:
+                        scopes.append(name)
+                if len(scopes) > 1:
+                    errors.append({
+                        "id": mid, "status": STATUS_ERROR,
+                        "error": (f"ambiguous memory id {mid}: it exists in "
+                                  f"the scopes {scopes}; pass project=<name> "
+                                  f"to say which one to read"),
+                        "scopes": scopes,
+                    })
+                    continue
+            table, row = found[0]
+            if not is_visible(row, include_deleted, include_superseded,
+                              include_expired):
+                superseded_by = row.get("superseded_by")
+                deleted_at = row.get("deleted_at")
+                reasons = []
+                flags = []
+                if deleted_at is not None:
+                    reasons.append("soft-forgotten")
+                    flags.append("include_deleted")
+                if (superseded_by is not None
+                        and superseded_by != SENTINEL_FORGOTTEN):
+                    reasons.append("superseded")
+                    flags.append("include_superseded")
+                if _is_expired(row.get("expires_at")):
+                    reasons.append("expired")
+                    flags.append("include_expired")
+                hidden.append({
+                    "id": mid,
+                    "scope": db.scope_of_table(table),
+                    "reasons": reasons or ["hidden"],
+                    "reveal_flags": flags,
+                })
+                continue
+            row["_project"] = db.scope_of_table(table)
+            projection_fields = fields
+            if include_deleted:
+                if projection_fields is None:
+                    projection_fields = list(PUBLIC_FIELDS) + ["deleted_at"]
+                elif "deleted_at" not in projection_fields:
+                    projection_fields = projection_fields + ["deleted_at"]
+            item = project_row(row, projection_fields)
+            if row.get("deleted_at"):
+                item["forgotten"] = True
+                if item.get("superseded_by") == SENTINEL_FORGOTTEN:
+                    item["superseded_by"] = None
+            if _is_expired(row.get("expires_at")) and (
+                    fields is None or "expired" in fields):
+                item["expired"] = True
+            results.append(item)
+        db.commit()
+        return results, missing, hidden, errors
+    finally:
+        db.rollback()
+        db.close()
 
 
 def _get_memory(

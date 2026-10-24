@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from mcp_server import config
 from mcp_server.config import (
-    FTS_LANGUAGE,
     FTS_MIN_COVERAGE,
     FTS_WEIGHT,
     PROJECT_SCOPE_BOOST,
@@ -121,29 +121,45 @@ def _escape_like(value: str) -> str:
 
 def _hidden_exact_matches(cur, tables: list[str], needle: str,
                           include_deleted: bool, include_superseded: bool,
-                          include_expired: bool) -> dict[str, Any] | None:
+                          include_expired: bool,
+                          where: str = "",
+                          where_params: tuple = ()) -> dict[str, Any] | None:
     """Count exact matches that the visibility flags keep out of the results.
 
     A hidden row that contains the exact identifier is the difference between
     "this memory does not exist" and "it is expired/superseded/forgotten".
     The count is reported with the flags that would reveal it, so the caller
     does not have to guess.
+
+    `where`/`where_params` are the *non-visibility* filters of the same search
+    (mem_type, entity, metadata, relation context). They must be applied here
+    too: otherwise a hidden row that the query would never have returned is
+    advertised as a match behind a reveal flag.
     """
     pattern = f"%{_escape_like(needle)}%"
+    where_sql = f" AND {where}" if where else ""
+    params = [pattern, *where_params]
     count = 0
     flags: set[str] = set()
     scopes: dict[str, int] = {}
+    truncated = False
+    names = _project_names(cur)
     for table in tables:
         try:
+            # One extra row tells us whether the LIMIT cut the set, so the
+            # count is not silently wrong for a very common identifier.
             cur.execute(
                 f"SELECT deleted_at, superseded_by, expires_at FROM {table} "
-                f"WHERE content ILIKE %s ESCAPE '\\' LIMIT 100",
-                (pattern,))
+                f"WHERE content ILIKE %s ESCAPE '\\'{where_sql} LIMIT 101",
+                params)
             rows = cur.fetchall()
         except Exception:  # a repair call must not break the search
             logger.debug("hidden exact lookup failed for %s", table,
                          exc_info=True)
             continue
+        if len(rows) > 100:
+            truncated = True
+            rows = rows[:100]
         hidden_here = 0
         for deleted_at, superseded_by, expires_at in rows:
             row_flags: list[str] = []
@@ -164,12 +180,17 @@ def _hidden_exact_matches(cur, tables: list[str], needle: str,
             flags.update(row_flags)
         if hidden_here:
             count += hidden_here
-            scopes[table] = hidden_here
+            scope = ("global" if table == "memories"
+                     else names.get(table[len("mem_"):], table[len("mem_"):]))
+            scopes[scope] = scopes.get(scope, 0) + hidden_here
     if not count:
         return None
-    return {"count": count,
-            "flags": sorted(flags),
-            "scopes": scopes}
+    result = {"count": count,
+              "flags": sorted(flags),
+              "scopes": scopes}
+    if truncated:
+        result["truncated"] = True
+    return result
 
 
 def _note_dropped_candidate(
@@ -201,18 +222,19 @@ def _note_dropped_candidate(
 
 
 def _decorate_best_dropped(cur, dropped: dict[str, Any] | None,
-                           result_ids: set[str] | None = None) -> None:
+                           result_keys: set[tuple[str, str]] | None = None) -> None:
     """Report the project name and drop a candidate that is already visible.
 
     The internal table suffix (`test_project_05f71b6a`) means nothing to a
     caller; the registry name (`test-project`) does. A hit that ended up in
     the result set is not "dropped" and must not be advertised as a rejected
     match, otherwise the hint contradicts the response.
+
+    `result_keys` is keyed by `(project, id)`: a memory id is unique per scope,
+    so the same id in another scope is a different row - dropping the hint just
+    because that other row is visible hid a real near-miss.
     """
     if not dropped:
-        return
-    if result_ids and dropped.get("id") in result_ids:
-        dropped.clear()
         return
     names = _project_names(cur)
     table = dropped.pop("_table", None)
@@ -221,6 +243,8 @@ def _decorate_best_dropped(cur, dropped: dict[str, Any] | None,
         dropped["scope"] = names.get(suffix, dropped.get("scope") or suffix)
     else:
         dropped["scope"] = "global"
+    if result_keys and (dropped["scope"], dropped.get("id")) in result_keys:
+        dropped.clear()
 
 
 
@@ -272,7 +296,7 @@ def _fts_lexemes(cur, query_text: str | None) -> list[str]:
     if not query_text:
         return []
     cur.execute(
-        f"SELECT tsvector_to_array(to_tsvector('{FTS_LANGUAGE}', %s))",
+        f"SELECT tsvector_to_array(to_tsvector('{config.FTS_LANGUAGE}', %s))",
         (query_text,),
     )
     row = cur.fetchone()
@@ -461,15 +485,26 @@ def _rerank_rows(
     for row, probability in zip(candidates, probabilities):
         row["_rerank_score"] = round(probability, 4)
         relevance = probability
+        # The reranker replaces the first-stage relevance, so the guarantees
+        # the first stage made have to be re-applied here: an exact literal
+        # hit keeps its floor, a project row keeps its scope boost and an
+        # intentionally included history row stays penalised.
+        if row.get("_exact_match") == "content":
+            relevance = max(relevance, 0.95)
+        elif row.get("_exact_match") == "substring":
+            relevance = max(relevance, 0.85)
         if row.get("_project") not in (None, "global"):
             boost = round(PROJECT_SCOPE_BOOST * (1.0 - relevance), 4)
             row["_scope_boost"] = boost
             relevance += boost
         row["_relevance_score"] = round(relevance, 4)
+        _apply_history_penalty(row)
 
     candidate_ids = {id(row) for row in candidates}
-    reranked_head = sorted(candidates,
-                           key=lambda row: -row.get("_rerank_score", 0.0))
+    reranked_head = sorted(
+        candidates,
+        key=lambda row: (-row.get("_relevance_score", 0.0),
+                         -row.get("_rrf_score", 0.0)))
     rows[:] = reranked_head + [row for row in rows
                                if id(row) not in candidate_ids]
     if stats is not None:
@@ -526,6 +561,7 @@ def _search_memories_rrf(
     if not tables:
         return []
 
+    candidate_cap = max(50, limit)
     max_distance = None if min_similarity is None else 1.0 - min_similarity
     fts_query = _fts_query(query_text)
     exact_needle = _exact_needle(query_text)
@@ -550,6 +586,20 @@ def _search_memories_rrf(
     dropped_by_similarity = 0
     dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
+    entity_conditions, entity_params = _entity_conditions(
+        entity, include_entity_relation_context)
+    # The same filters *without* the visibility predicate: the hidden-match
+    # hint must describe rows this query would return if the flag were set.
+    hidden_where = " AND ".join(
+        ["TRUE"]
+        + (["mem_type = %s"] if mem_type else [])
+        + entity_conditions
+        + extra_conditions)
+    hidden_params: list[Any] = []
+    if mem_type:
+        hidden_params.append(mem_type)
+    hidden_params.extend(entity_params)
+    hidden_params.extend(extra_params)
 
     for table in tables:
         conditions = ["TRUE"]
@@ -562,8 +612,6 @@ def _search_memories_rrf(
         if mem_type:
             conditions.append("mem_type = %s")
             params.append(mem_type)
-        entity_conditions, entity_params = _entity_conditions(
-            entity, include_entity_relation_context)
         conditions.extend(entity_conditions)
         params.extend(entity_params)
         conditions.extend(extra_conditions)
@@ -579,7 +627,8 @@ def _search_memories_rrf(
             vec_params: list[Any] = [query_embedding] + params
             # The distance filter is applied below, not in SQL: only then the
             # number of rejected candidates can be reported to the caller.
-            sql += " ORDER BY distance ASC LIMIT 50"
+            sql += " ORDER BY distance ASC LIMIT %s"
+            vec_params.append(candidate_cap)
             cur.execute(sql, vec_params)
             for row_id, dist in cur.fetchall():
                 dist = float(dist)
@@ -593,20 +642,20 @@ def _search_memories_rrf(
         # 2. FTS Search (Top 50 per table), OR-joined terms
         if fts_query:
             sql = (
-                f"SELECT id, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
-                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS rank, "
+                f"SELECT id, ts_rank(to_tsvector('{config.FTS_LANGUAGE}', content), "
+                f"websearch_to_tsquery('{config.FTS_LANGUAGE}', %s)) AS rank, "
                 f"(SELECT COUNT(*) FROM unnest(%s::text[]) AS lex "
-                f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
-                f"plainto_tsquery('{FTS_LANGUAGE}', lex)) AS matched "
+                f"WHERE to_tsvector('{config.FTS_LANGUAGE}', content) @@ "
+                f"plainto_tsquery('{config.FTS_LANGUAGE}', lex)) AS matched "
                 f"FROM {table} "
-                f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
-                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)"
+                f"WHERE to_tsvector('{config.FTS_LANGUAGE}', content) @@ "
+                f"websearch_to_tsquery('{config.FTS_LANGUAGE}', %s)"
             )
             fts_params: list[Any] = [fts_query, fts_lexemes, fts_query]
             # No similarity filter here: a full-text hit stays a hit even when
             # the embedding model scores it poorly.
-            sql += f" AND {where} ORDER BY rank DESC LIMIT 50"
-            cur.execute(sql, fts_params + params)
+            sql += f" AND {where} ORDER BY rank DESC LIMIT %s"
+            cur.execute(sql, fts_params + params + [candidate_cap])
             text_candidates.extend(
                 (float(rank), int(matched or 0), row_id, table)
                 for row_id, rank, matched in cur.fetchall()
@@ -622,9 +671,9 @@ def _search_memories_rrf(
                 f"SELECT id, (lower(content) = lower(%s)) AS exact_content "
                 f"FROM {table} "
                 f"WHERE content ILIKE %s ESCAPE '\\' AND {where} "
-                f"ORDER BY exact_content DESC, length(content) ASC LIMIT 50"
+                f"ORDER BY exact_content DESC, length(content) ASC LIMIT %s"
             )
-            cur.execute(sql, [exact_needle, pattern] + params)
+            cur.execute(sql, [exact_needle, pattern] + params + [candidate_cap])
             exact_candidates.extend(
                 (bool(full), row_id, table)
                 for row_id, full in cur.fetchall()
@@ -646,20 +695,20 @@ def _search_memories_rrf(
     text_scores: dict[Key, float] = {}
     coverages: dict[Key, float] = {}
 
-    for rank, (distance, row_id, table) in enumerate(vec_candidates[:50], 1):
+    for rank, (distance, row_id, table) in enumerate(vec_candidates[:candidate_cap], 1):
         key = (table, row_id)
         vector_results[key] = 1.0 / (k + rank)
         similarities[key] = 1.0 - distance
-    for rank, (_, _, row_id, table) in enumerate(text_candidates[:50], 1):
+    for rank, (_, _, row_id, table) in enumerate(text_candidates[:candidate_cap], 1):
         text_results[(table, row_id)] = FTS_WEIGHT / (k + rank)
-    for rank, (full, row_id, table) in enumerate(exact_candidates[:50], 1):
+    for rank, (full, row_id, table) in enumerate(exact_candidates[:candidate_cap], 1):
         key = (table, row_id)
         exact_results[key] = EXACT_MATCH_WEIGHT / (k + rank)
         exact_modes[key] = "content" if full else "substring"
 
-    max_text_rank = max((r for r, _, _, _ in text_candidates[:50]), default=0.0)
+    max_text_rank = max((r for r, _, _, _ in text_candidates[:candidate_cap]), default=0.0)
     lexeme_count = max(1, len(fts_lexemes))
-    for rank, (ts_rank, matched, row_id, table) in enumerate(text_candidates[:50], 1):
+    for rank, (ts_rank, matched, row_id, table) in enumerate(text_candidates[:candidate_cap], 1):
         # Normalized full-text evidence: the best text hit is 1.0, weaker
         # hits fall off with their text rank. Multiply by query coverage so a
         # hit that matched only one word of a multi-word query cannot look
@@ -690,7 +739,8 @@ def _search_memories_rrf(
         dropped_by_coverage = len(weak)
     hidden_exact = (
         _hidden_exact_matches(cur, tables, exact_needle, include_deleted,
-                              include_superseded, include_expired)
+                              include_superseded, include_expired,
+                              hidden_where, tuple(hidden_params))
         if exact_needle else None)
     if not fused_scores:
         if stats is not None:
@@ -793,7 +843,8 @@ def _search_memories_rrf(
                 cur, _table_of_dropped(best_dropped),
                 best_dropped["id"], best_dropped)
             _decorate_best_dropped(cur, best_dropped,
-                                   {r.get("id") for r in rows})
+                                   {(r.get("_project") or "global", r.get("id"))
+                                    for r in rows})
         stats.update({
             "candidates": len(fused_scores),
             "dropped_by_similarity": dropped_by_similarity,
@@ -907,11 +958,11 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
             order = "ORDER BY distance ASC"
             params_vec.append(query_embedding)
         elif fts_query:
-            col = (f"*, ts_rank(to_tsvector('{FTS_LANGUAGE}', content), "
-                   f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)) AS fts_rank, "
+            col = (f"*, ts_rank(to_tsvector('{config.FTS_LANGUAGE}', content), "
+                   f"websearch_to_tsquery('{config.FTS_LANGUAGE}', %s)) AS fts_rank, "
                    f"(SELECT COUNT(*) FROM unnest(%s::text[]) AS lex "
-                   f"WHERE to_tsvector('{FTS_LANGUAGE}', content) @@ "
-                   f"plainto_tsquery('{FTS_LANGUAGE}', lex)) AS matched")
+                   f"WHERE to_tsvector('{config.FTS_LANGUAGE}', content) @@ "
+                   f"plainto_tsquery('{config.FTS_LANGUAGE}', lex)) AS matched")
             params_vec.append(fts_query)
             params_vec.append(fts_lexemes)
             order = "ORDER BY fts_rank DESC"
@@ -922,8 +973,8 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
 
         if fts_query:
             conditions.append(
-                f"to_tsvector('{FTS_LANGUAGE}', content) @@ "
-                f"websearch_to_tsquery('{FTS_LANGUAGE}', %s)"
+                f"to_tsvector('{config.FTS_LANGUAGE}', content) @@ "
+                f"websearch_to_tsquery('{config.FTS_LANGUAGE}', %s)"
             )
             params.append(fts_query)
         if mem_type:
@@ -1023,7 +1074,8 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
                     cur, _table_of_dropped(best_dropped),
                     best_dropped["id"], best_dropped)
             _decorate_best_dropped(cur, best_dropped,
-                                   {r.get("id") for r in rows})
+                                   {(r.get("_project") or "global", r.get("id"))
+                                    for r in rows})
         if best_dropped:
             stats["best_dropped_by_similarity"] = best_dropped
         stats.update({
@@ -1146,7 +1198,10 @@ def _search_memories_graph_boost(
             extra_conditions = extra_conditions + [
                 "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
         extra_sql = "" if not extra_conditions else " AND " + " AND ".join(extra_conditions)
-        existing_ids = {r["id"] for r in existing_results}
+        # A memory id is unique per scope, so the same id in another scope is a
+        # different row and must not suppress a genuine graph hit.
+        existing_keys = {((r.get("_project") or "global"), r["id"])
+                         for r in existing_results}
         project_names = _project_names(cur)
 
         def _collect(entity_name: str, weight: float,
@@ -1165,12 +1220,13 @@ def _search_memories_graph_boost(
                 for row in cur.fetchall():
                     d = dict(zip([desc[0] for desc in cur.description], row))
                     d.pop("embedding", None)
-                    if d["id"] in existing_ids:
+                    scope = ("global" if table == "memories"
+                             else project_names.get(table[4:], table[4:]))
+                    if (scope, d["id"]) in existing_keys:
                         continue
                     # Report the project name (not the scope kind), like every
                     # other read path does.
-                    d["_project"] = ("global" if table == "memories"
-                                     else project_names.get(table[4:], table[4:]))
+                    d["_project"] = scope
                     d["_graph_weight"] = weight
                     d["_graph_source"] = entity_name
                     if relation_context:
@@ -1192,7 +1248,7 @@ def _search_memories_graph_boost(
                             d.get("created_at"), d.get("updated_at"),
                             d.get("access_count", 0), d.get("importance", 1.0),
                         )
-                    existing_ids.add(d["id"])
+                    existing_keys.add((scope, d["id"]))
                     graph_results.append(d)
 
         for entity_name, weight in graph_entities:

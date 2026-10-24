@@ -193,6 +193,21 @@ def _sanitize_batch_fact(value: Any) -> Any:
 BatchFactInput = Annotated[BatchFact, BeforeValidator(_sanitize_batch_fact)]
 
 
+def _as_bool(value: Any, name: str) -> bool:
+    """Coerce a batch flag strictly: only real booleans (or absence) pass.
+
+    A batch entry is raw JSON, so ``bool("false")`` would silently turn a
+    string into ``True``. A flag that is not a boolean is an argument error
+    for that entry instead of an unintended write.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"{name} must be a boolean (true or false), got {type(value).__name__}")
+
+
 def _hidden_state_reason(db: MemoryStore, memory_id: str,
                          tables: list[str]) -> str | None:
     """Why an existing row cannot be updated or touched.
@@ -936,17 +951,40 @@ def remember_batch(
             if per_link_errors:
                 prepared.append((None, "; ".join(per_link_errors)))
                 continue
-        ft = fact.get("fuzzy_threshold", fuzzy_threshold)
+        try:
+            ft = fact.get("fuzzy_threshold", fuzzy_threshold)
+            if ft is not None:
+                ft = float(ft)
+        except (TypeError, ValueError):
+            prepared.append((None,
+                             ("fuzzy_threshold must be a number between 0.0 "
+                              "and 1.0")))
+            continue
         if ft is not None and not 0.0 <= ft <= 1.0:
             prepared.append((None, "fuzzy_threshold must be between 0.0 and 1.0"))
+            continue
+        fact_dedupe = fact.get("dedupe") or dedupe
+        if fact_dedupe not in DEDUPE_MODES:
+            prepared.append((None,
+                             (f"invalid dedupe {fact_dedupe!r}; choose from "
+                              f"{', '.join(sorted(DEDUPE_MODES))}")))
             continue
         fact_near = fact.get("on_near_duplicate") or on_near_duplicate
         if fact_near not in ("warn", "supersede", "reject"):
             prepared.append((None,
-                             "on_near_duplicate must be 'warn', 'supersede' "
-                             "or 'reject'"))
+                             ("on_near_duplicate must be 'warn', 'supersede' "
+                              "or 'reject'")))
             continue
-        if fact.get("auto_supersede_near_duplicate") and fact_near == "warn":
+        try:
+            fact_auto_near = _as_bool(
+                fact.get("auto_supersede_near_duplicate"),
+                "auto_supersede_near_duplicate")
+            fact_supersede_last = _as_bool(
+                fact.get("supersede_last"), "supersede_last")
+        except ValueError as e:
+            prepared.append((None, str(e)))
+            continue
+        if fact_auto_near and fact_near == "warn":
             fact_near = "supersede"
         fact_mode = fact.get("contradiction_mode") or contradiction_mode
         if fact_mode not in ("supersede", "warn"):
@@ -1000,11 +1038,11 @@ def remember_batch(
             "scope": fscope,
             "entity": fentity,
             "fuzzy_threshold": ft,
-            "dedupe": fact.get("dedupe"),
+            "dedupe": fact_dedupe,
             "metadata": meta,
             "supersede": fact.get("supersede"),
             "supersede_content": fact.get("supersede_content"),
-            "supersede_last": bool(fact.get("supersede_last")),
+            "supersede_last": fact_supersede_last,
             "on_near_duplicate": fact_near,
             "contradiction_mode": fact_mode,
             "contradiction_min_confidence": float(fact_min_conf),
@@ -1747,7 +1785,14 @@ def update_batch(
                 if not 0.0 <= entry_fuzzy <= 1.0:
                     error = "fuzzy_threshold must be between 0.0 and 1.0"
         entry_expires = entry.get("expires_at")
-        entry_clear = bool(entry.get("clear_expires_at"))
+        try:
+            entry_clear = _as_bool(entry.get("clear_expires_at"),
+                                   "clear_expires_at")
+            entry_restore = _as_bool(entry.get("restore"), "restore")
+            entry_touch = _as_bool(entry.get("touch"), "touch")
+        except ValueError as exc:
+            error = str(exc)
+            entry_clear = entry_restore = entry_touch = False
         if error is None and entry_expires is not None and entry_clear:
             error = "pass either expires_at or clear_expires_at, not both"
         elif error is None and entry_expires is not None:
@@ -1760,8 +1805,6 @@ def update_batch(
         entry_ttl_warning = (_ttl_past_warning(entry_expires)
                              if entry_expires is not None and error is None
                              else None)
-        entry_restore = bool(entry.get("restore"))
-        entry_touch = bool(entry.get("touch"))
         if error is None and entry_restore and (
                 fields or entry_touch or entry_clear_keys):
             error = ("restore=true cannot be combined with other update "
@@ -1801,6 +1844,13 @@ def update_batch(
     results: list[dict] = []
     try:
         cur = db.cur
+
+        def _undo(savepoint: str) -> None:
+            # ROLLBACK TO leaves the savepoint on the stack; without the
+            # release a long batch accumulates one savepoint per failed entry.
+            db.rollback_to(savepoint)
+            db.release(savepoint)
+
         for i, (spec, err) in enumerate(prepared):
             if spec is None:
                 raw = updates[i]
@@ -1816,7 +1866,7 @@ def update_batch(
                     if entry_project:
                         restore_tables = [_mem_table(entry_project)]
                         if not _table_exists(cur, restore_tables[0]):
-                            db.rollback_to(savepoint)
+                            _undo(savepoint)
                             results.append({
                                 "id": memory_id, "status": "not_found",
                                 "error": f"NOT FOUND: {memory_id}"})
@@ -1824,7 +1874,7 @@ def update_batch(
                     else:
                         scopes = _memory_scopes(cur, memory_id)
                         if len(scopes) > 1:
-                            db.rollback_to(savepoint)
+                            _undo(savepoint)
                             results.append({
                                 "id": memory_id, "status": "error",
                                 "error": (f"ambiguous memory id {memory_id}: "
@@ -1839,7 +1889,7 @@ def update_batch(
                     if not restored:
                         blocked = _restore_blocked_reason(
                             db, memory_id, restore_tables)
-                        db.rollback_to(savepoint)
+                        _undo(savepoint)
                         results.append({
                             "id": memory_id,
                             "status": blocked[0] if blocked else "not_found",
@@ -1876,7 +1926,7 @@ def update_batch(
                 else:
                     scopes = _memory_scopes(cur, memory_id)
                     if len(scopes) > 1:
-                        db.rollback_to(savepoint)
+                        _undo(savepoint)
                         results.append({
                             "id": memory_id, "status": "error",
                             "error": (f"ambiguous memory id {memory_id}: it "
@@ -1896,7 +1946,7 @@ def update_batch(
                     db, memory_id, tables, revive_expired=revive_expired)
                 if active_table is None:
                     reason = _hidden_state_reason(db, memory_id, tables)
-                    db.rollback_to(savepoint)
+                    _undo(savepoint)
                     error = (f"memory {memory_id} exists but cannot be "
                              f"updated: {reason}" if reason
                              else f"NOT FOUND: {memory_id}")
@@ -1959,13 +2009,13 @@ def update_batch(
                         near_dup.get("content") or ""))
                 if not apply_fields(db, active_table, memory_id, sets,
                                     params):
-                    db.rollback_to(savepoint)
+                    _undo(savepoint)
                     results.append({"id": memory_id, "status": "not_found",
                                     "error": f"NOT FOUND: {memory_id}"})
                     continue
                 db.release(savepoint)
             except Exception as exc:
-                db.rollback_to(savepoint)
+                _undo(savepoint)
                 results.append({"id": memory_id, "status": "error",
                                 "error": str(exc)})
                 continue
