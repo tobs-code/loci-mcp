@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
@@ -9,15 +9,12 @@ from mcp_server.config import (
     DEDUPE_MODES,
     MEMORY_TYPE_HELP,
     MEMORY_TYPES,
-    NEAR_DUPLICATE_THRESHOLD,
     SENTINEL_FORGOTTEN,
-    SUPERSEDE_SIMILARITY_MIN,
     VALID_SCOPES,
 )
-from mcp_server.store import MemoryStore
 from mcp_server.duplicates import (
     content_conflict as _content_conflict,
-    same_topic as _shares_subject,
+    same_topic as _shares_subject,  # noqa: F401 - re-exported for tests
 )
 from mcp_server.envelope import (
     STATUS_CONFLICT,
@@ -34,46 +31,42 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
-from mcp_server.graph import _relate_edges, _validate_weight
 from mcp_server.graph_store import (
     delete_entity_everywhere,
     delete_node,
     delete_scope_nodes,
 )
-from mcp_server.inference_gateway import embed, nli_configured
+from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
-    counts as lifecycle_counts,
     is_expired as _is_past,
+)
+from mcp_server.lifecycle import (
     parse_expires_at,
 )
 from mcp_server.scopes import (
     _all_mem_tables,
-    _ensure_project_table,
     _mem_table,
     _memory_scopes,
     _norm_entity,
     _norm_project,
-    _project_exists,
-    _safe_ident,
     _scope_key,
     _scope_of_table,
     _table_exists,
 )
 from mcp_server.scoring import _content_hash
 from mcp_server.storage import (
-    ACTIVE_ROW_SQL,
-    clear_dangling_supersede,
-    _by_content_hash,
-    _check_contradictions,
     _deduplicate,
-    _find_by_content,
-    _find_by_id,
-    _find_last_for_entity,
-    _find_last_in_scope,
     _find_near_duplicate,
-    _find_superseded_match,
-    _scope_of_id,
-    _supersede,
+    clear_dangling_supersede,
+)
+from mcp_server.store import MemoryStore
+from mcp_server.write_pipeline import (
+    WriteIntent,
+    _coerce_metadata,
+    _near_duplicate_warning,
+    _ttl_past_warning,
+    _validate_links,
+    write_one,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,174 +168,6 @@ def _sanitize_batch_fact(value: Any) -> Any:
 BatchFactInput = Annotated[BatchFact, BeforeValidator(_sanitize_batch_fact)]
 
 
-def _same_subject_entity(near_dup: dict, entity: str | None) -> bool:
-    """Whether the near-duplicate match and the new fact share an entity.
-
-    Entity tagging is the only reliable subject signal available before an
-    NLI call: two memories about staging and production are often nearly
-    identical in wording but describe different systems. An untagged write
-    and an untagged match count as the same subject (the historical
-    behaviour); one tagged and one untagged does not.
-    """
-    return _norm_str(near_dup.get("entity")) == _norm_str(entity)
-
-
-def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
-                            conflict: bool = False,
-                            update: bool = False,
-                            new_content: str | None = None) -> str:
-    """Warning for a write that dedupe did not match but that still reads
-    like a reworded copy of an active memory (remember + remember_batch).
-
-    `entity` is the entity of the new write. When it differs from the matched
-    memory's entity, the warning must NOT suggest `supersede`: following that
-    advice would replace a fact about a different subject merely because the
-    sentences look alike.
-
-    `update=True` marks the update paths (update_memory/update_batch): the
-    edit already applied to one row and the warning names ANOTHER active
-    row. An update call has no `supersede` parameter, so the advice must
-    point at a separate supersede (remember call) or an edit of that row -
-    "pass supersede=<id>" on the tool that is running would be advice the
-    caller cannot execute.
-    """
-    if not _same_subject_entity(near_dup, entity):
-        old_entity = near_dup.get("entity")
-        new_entity = entity if entity is not None else "untagged"
-        preview = (near_dup.get("content") or "").strip()
-        if len(preview) > 120:
-            preview = preview[:117] + "..."
-        if update:
-            return (
-                f"near-duplicate across entities: active memory "
-                f"{near_dup['id']} (entity {old_entity!r}) matches the "
-                f"updated content with similarity {near_dup['similarity']}, "
-                f"but this memory belongs to entity {new_entity!r} - the "
-                f"update did not touch that fact. If both describe the same "
-                f"subject, tag them with the same entity; replace the other "
-                f"fact in a separate remember call (supersede="
-                f"{near_dup['id']}) only if you are sure it must be "
-                f"replaced. Matched content: {preview!r}"
-            )
-        return (
-            f"near-duplicate across entities: active memory {near_dup['id']} "
-            f"(entity {old_entity!r}) matches this content with similarity "
-            f"{near_dup['similarity']}, but this write belongs to entity "
-            f"{new_entity!r} - stored as a separate fact. If both describe the "
-            f"same subject, tag them with the same entity; only pass "
-            f"supersede={near_dup['id']} if you are sure the other fact must "
-            f"be replaced. Matched content: {preview!r}"
-        )
-    if (new_content is not None and near_dup.get("content")
-            and not _shares_subject(
-                new_content, near_dup["content"], entity,
-                near_dup.get("similarity"))):
-        # Same entity tag, but the saved fact is about another attribute
-        # (primary vs legacy region). The shared template alone is no reason
-        # to retire a different subject's fact.
-        preview = (near_dup.get("content") or "").strip()
-        if len(preview) > 120:
-            preview = preview[:117] + "..."
-        if update:
-            return (
-                f"near-duplicate with a different subject: active memory "
-                f"{near_dup['id']} matches the updated content with similarity "
-                f"{near_dup['similarity']}, but the two share no subject term "
-                f"- they describe different subjects/attributes. This update "
-                f"did not touch that memory; only supersede it in a separate "
-                f"remember call (supersede={near_dup['id']}) if you are sure "
-                f"it must be replaced. Matched content: {preview!r}"
-            )
-        return (
-            f"near-duplicate with a different subject: active memory "
-            f"{near_dup['id']} matches this content with similarity "
-            f"{near_dup['similarity']}, but the two share no subject term - "
-            f"they describe different subjects/attributes and were stored as "
-            f"separate facts. Do not pass supersede={near_dup['id']} merely "
-            f"because the wording is close. Matched content: {preview!r}"
-        )
-    if conflict:
-        if update:
-            return (
-                f"near-duplicate: active memory {near_dup['id']} matches the "
-                f"updated content with similarity {near_dup['similarity']}, "
-                f"but the two differ in a number or a negation - that is an "
-                f"attribute update or a contradiction, not a reworded copy. "
-                f"This update applied without replacing that memory; to "
-                f"retire it, supersede it in a separate remember call "
-                f"(supersede={near_dup['id']}), or rerun this update with "
-                f"dedupe='off' to skip this warning"
-            )
-        return (
-            f"near-duplicate: active memory {near_dup['id']} matches this "
-            f"content with similarity {near_dup['similarity']}, but the two "
-            f"differ in a number or a negation - that is an attribute update "
-            f"or a contradiction, not a reworded copy. Pass "
-            f"check_contradictions=true to let NLI decide, "
-            f"supersede={near_dup['id']} to replace the old fact, or "
-            f"dedupe='off' to store without this warning"
-        )
-    if update:
-        return (
-            f"near-duplicate: active memory {near_dup['id']} matches the "
-            f"updated content with similarity {near_dup['similarity']} - the "
-            f"edit looks like a reworded copy and that memory is still "
-            f"active. To retire it, supersede it in a separate remember "
-            f"call (supersede={near_dup['id']}); rerun this update with "
-            f"dedupe='off' to skip this warning"
-        )
-    return (
-        f"near-duplicate: active memory {near_dup['id']} matches this content "
-        f"with similarity {near_dup['similarity']} - the write looks like a "
-        f"reworded copy; pass supersede={near_dup['id']} to replace it, or "
-        f"dedupe='off' to store without this warning"
-    )
-
-
-def _ttl_past_warning(value: Any) -> str | None:
-    """Warn when an accepted TTL is already in the past.
-
-    A past timestamp is valid input (imports restore expired rows), but a
-    write that stores an immediately invisible fact must say so instead of
-    answering "stored" and letting the caller search for it.
-    """
-    if value is None:
-        return None
-    try:
-        stamp = parse_expires_at(value)
-    except (TypeError, ValueError):
-        return None
-    if stamp <= datetime.now(timezone.utc):
-        return (
-            "expires_at is in the past: the memory was stored but is "
-            "immediately inactive - it is hidden from every active read "
-            "(use include_expired=true to see it)")
-    return None
-
-
-def _read_metadata(cur, store_project: str | None, memory_id: str) -> dict:
-    """Metadata of a row that is about to be replaced (project, then global)."""
-    table = _mem_table(store_project)
-    cur.execute(
-        f"SELECT metadata FROM {table} WHERE id = %s AND deleted_at IS NULL",
-        (memory_id,))
-    row = cur.fetchone()
-    if not row and store_project:
-        # A cross-scope supersede replaced a shared fact: its metadata lives
-        # in the global table, not in the project one.
-        cur.execute(
-            "SELECT metadata FROM memories WHERE id = %s AND deleted_at IS NULL",
-            (memory_id,))
-        row = cur.fetchone()
-    if not row:
-        return {}
-    try:
-        meta = row[0] if isinstance(row[0], dict) else json.loads(row[0] or "{}")
-    except (TypeError, ValueError):
-        return {}
-    return meta if isinstance(meta, dict) else {}
-
-
 def _hidden_state_reason(cur, memory_id: str,
                          tables: list[str]) -> str | None:
     """Why an existing row cannot be updated or touched.
@@ -375,83 +200,6 @@ def _hidden_state_reason(cur, memory_id: str,
                 "expires_at)")
         return "; ".join(reasons) if reasons else None
     return None
-
-
-def _coerce_metadata(value: Any) -> tuple[dict | None, str | None]:
-    """Accept a metadata argument as an object or as a JSON-encoded string.
-
-    LLM callers sometimes send `metadata` as a string instead of a dict.
-    `remember_batch` already parsed that (and `metadata_filter` accepts both
-    shapes too), so the write tools do the same: an object passes through, a
-    JSON string of an object is parsed, anything else fails with a message
-    that names the expected shape.
-    """
-    if isinstance(value, dict):
-        return value, None
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return None, ("metadata is neither an object nor valid JSON - "
-                          "pass an object like {\"env\": \"test\"}")
-        if isinstance(parsed, dict):
-            return parsed, None
-        return None, (f"metadata must be a JSON object, e.g. "
-                      f"{{\"env\": \"test\"}} (got {type(parsed).__name__})")
-    if isinstance(value, str):
-        return None, ("metadata must not be a blank string: pass a JSON object "
-                      "like {\"env\": \"test\"}, or a JSON-encoded object "
-                      "string")
-    return None, (f"metadata must be a JSON object, e.g. "
-                  f"{{\"env\": \"test\"}} (got {type(value).__name__})")
-
-
-def _cross_scope_warning(ids: list[str]) -> str:
-    """Warning for a project write that invalidated shared (global) facts:
-    they are hidden in EVERY scope now, not only in the project."""
-    return (
-        f"cross-scope supersede: {len(ids)} shared (global) "
-        f"memory/memories invalidated by this project write: "
-        + ", ".join(ids)
-        + " - a global fact is hidden in EVERY scope now, not only in this "
-        "project"
-    )
-
-
-def _cross_scope_duplicates(cur, content: str,
-                            store_project: str | None) -> list[dict[str, Any]]:
-    """Active copies of exactly this content in scopes other than the target.
-
-    Dedupe only looks at the table the fact is written to, so the same content
-    stored in a project and in the shared scope was accepted silently. Reads
-    then hide one copy as a cross-scope duplicate, which looks like a lost
-    write. The caller gets this list as a warning (the fact is still stored:
-    a deliberate copy is allowed, it just must not be invisible).
-    """
-    c_hash = _content_hash(content)
-    target = _mem_table(store_project)
-    found: list[dict[str, Any]] = []
-    for table in _all_mem_tables(cur):
-        if table == target:
-            continue
-        cur.execute(
-            f"SELECT id FROM {table} WHERE content_hash = %s "
-            f"AND {ACTIVE_ROW_SQL} LIMIT 1",
-            (c_hash,))
-        row = cur.fetchone()
-        if row:
-            found.append({"id": row[0],
-                          "project": _scope_of_table(cur, table)})
-    return found
-
-
-def _cross_scope_duplicate_warning(found: list[dict[str, Any]]) -> str:
-    detail = ", ".join(f"{d['project']} ({d['id']})" for d in found)
-    return (
-        f"identical content already exists in another scope: {detail}; "
-        f"recall and list_memories hide cross-scope copies by default - pass "
-        f"include_duplicates=true (list_memories) to see every copy"
-    )
 
 
 class BatchUpdate(BaseModel):
@@ -730,322 +478,142 @@ def remember(
     store_project = project if effective_scope == "project" else None
 
     meta = metadata or {}
-    ttl_warning = _ttl_past_warning(expires_at)
     emb = embed([content])[0]
     db = MemoryStore()
     try:
-        cur = db.cur
-        created_scope = bool(store_project) and not _project_exists(
-            cur, store_project)
-        if store_project:
-            _ensure_project_table(cur, store_project)
-        scope_warning = (
-            f"created a new project scope {store_project!r}; it did not exist "
-            f"before this write (check the name if this was a typo, otherwise "
-            f"the scope now appears in init_context(project='*'))"
-            if created_scope else None)
-
-        existing = _deduplicate(cur, content, store_project, emb, fuzzy_threshold,
-                                dedupe=dedupe)
-        if existing:
-            existing_id, mode, similarity = existing
-            detail = ("exact content hash" if mode == "exact"
-                      else f"semantic match (similarity {similarity})")
-            if mode == "exact" and dedupe == "semantic":
-                detail += "; the content hash short-circuits the semantic check"
-            warnings = [f"memory already exists; nothing stored ({detail})"]
-            if scope_warning:
-                warnings.append(scope_warning)
-            superseded_now: list[str] = []
-            cross_now: list[str] = []
-            # A duplicate must not swallow a supersede instruction: the fact is
-            # already stored, but the caller still asked to invalidate a memory.
-            # Apply the replacement through the existing id and say so.
-            if supersede or supersede_content or supersede_last:
-                try:
-                    (superseded_now, _self_targets, extra_warnings,
-                     cross_now) = _apply_duplicate_supersede(
-                        cur, store_project, existing_id, entity, supersede,
-                        supersede_content, supersede_last, emb, content)
-                except ValueError as e:
-                    db.rollback()
-                    return fail(STATUS_ERROR, str(e))
-                warnings.extend(extra_warnings)
-                if superseded_now:
-                    db.commit()
-            payload: dict[str, Any] = {
-                "duplicate_mode": mode, "similarity": similarity,
-                "scope": effective_scope,
-                "project": (store_project or "global"),
-            }
-            if superseded_now:
-                payload["superseded"] = superseded_now
-                if cross_now:
-                    payload["cross_scope_superseded"] = cross_now
-                    warnings.append(_cross_scope_warning(cross_now))
-            link_results, link_warnings = _apply_remember_links(
-                cur, links, entity, store_project)
-            warnings.extend(link_warnings)
-            if link_results:
-                payload["links"] = link_results
+        outcome = write_one(db, WriteIntent(
+            content=content,
+            project=store_project,
+            scope=effective_scope,
+            entity=entity,
+            mem_type=mem_type,
+            importance=importance,
+            metadata=meta,
+            metadata_mode=metadata_mode,
+            expires_at=expires_at,
+            dedupe=dedupe,
+            fuzzy_threshold=fuzzy_threshold,
+            supersede=supersede,
+            supersede_content=supersede_content,
+            supersede_last=supersede_last,
+            on_near_duplicate=near_policy,
+            check_contradictions=check_contradictions,
+            links=links,
+            embedding=emb,
+        ))
+        if outcome.status == STATUS_DUPLICATE:
+            if not outcome.persist:
+                db.rollback()
+                return ok(
+                    STATUS_DUPLICATE, id=outcome.id,
+                    duplicate_of=outcome.duplicate_of,
+                    duplicate_mode=outcome.duplicate_mode,
+                    similarity=outcome.similarity,
+                    scope=outcome.scope,
+                    project=outcome.project,
+                    warnings=[_near_rejected_warning(outcome)])
             db.commit()
-            return ok(STATUS_DUPLICATE, id=existing_id,
-                      warnings=warnings, **payload)
-        # Dedupe only covers the target table. The same content may already be
-        # active in another scope; reads then hide the copy, so the write has
-        # to say that it forked the fact across scopes. (Filled after the
-        # supersede targets are known, so a copy this write replaces is not
-        # reported as a fork.)
-        cross_duplicates: list[dict[str, Any]] = []
+            warnings = [(f"memory already exists; nothing stored "
+                         f"({outcome.duplicate_detail})")]
+            if outcome.created_scope:
+                warnings.append(_remember_scope_warning(store_project))
+            warnings.extend(outcome.duplicate_supersede_warnings)
+            if outcome.cross_scope_warning:
+                warnings.append(outcome.cross_scope_warning)
+            warnings.extend(outcome.link_warnings)
+            payload: dict[str, Any] = {
+                "duplicate_mode": outcome.duplicate_mode,
+                "similarity": outcome.similarity,
+                "scope": outcome.scope,
+                "project": outcome.project,
+            }
+            if outcome.superseded:
+                payload["superseded"] = outcome.superseded
+                if outcome.cross_scope_superseded:
+                    payload["cross_scope_superseded"] = (
+                        outcome.cross_scope_superseded)
+            if outcome.links:
+                payload["links"] = outcome.links
+            return ok(STATUS_DUPLICATE, id=outcome.id, warnings=warnings,
+                      **payload)
 
-        # No active duplicate, but the content may match a memory that was
-        # superseded earlier. Storing it would silently re-activate an
-        # outdated fact, so report the match (without blocking the write).
-        superseded_match = _find_superseded_match(
-            cur, content, store_project, emb, fuzzy_threshold, dedupe=dedupe)
-
-        # Also no dedupe match - but possibly still a reworded copy. The
-        # thresholds above call it a different fact; this check only reports
-        # the nearest active memory above the near-duplicate floor so the
-        # response can warn. dedupe='off' means "store everything", so it
-        # also skips this warning.
-        near_dup = (_find_near_duplicate(cur, content, store_project, emb)
-                    if (dedupe != "off" or near_policy != "warn")
-                    else None)
-
-        contradictions = []
-        contradiction_skip: str | None = None
-        nli_unavailable = check_contradictions and nli_configured() is False
-        if check_contradictions and not nli_unavailable:
-            try:
-                contradictions = _check_contradictions(
-                    cur, content, entity, store_project, emb
-                )
-            except Exception as e:
-                # A failed NLI must not kill the write: the fact is stored
-                # unencumbered, but the skipped check is surfaced loudly so
-                # the caller does not mistake it for a clean scan.
-                logger.warning("contradiction check failed: %s", e)
-                contradictions = []
-                contradiction_skip = f"NLI unavailable: {e}"
-
-        # Resolve the replaced memories before storing: "supersede_last" must
-        # see the state before this fact exists.
-        superseded: list[str] = []
-        guard_warnings: list[str] = []
-        try:
-            superseded, guard_warnings = _supersede_targets(
-                cur, store_project, entity, supersede, supersede_content,
-                supersede_last, emb, content
-            )
-        except ValueError as e:
-            db.rollback()
-            return fail(STATUS_ERROR, str(e))
-
-        mem_type = _resolve_mem_type(cur, mem_type, superseded, store_project)
-
-        cross_duplicates = [
-            dup for dup in _cross_scope_duplicates(cur, content, store_project)
-            if dup["id"] not in superseded
-        ]
-
-        # The near-duplicate policy turns the warning into an action. `reject`
-        # writes nothing at all - the caller explicitly asked not to fork a
-        # reworded copy and expects a duplicate answer instead.
-        auto_near: dict | None = None
-        same_subject = (near_dup is not None
-                        and _same_subject_entity(near_dup, entity))
-        near_conflict = bool(
-            same_subject
-            and _content_conflict(content, near_dup.get("content") or ""))
-        if near_dup and same_subject and near_policy == "reject" \
-                and near_dup["id"] not in superseded:
-            db.rollback()
-            return ok(
-                STATUS_DUPLICATE, id=near_dup["id"],
-                duplicate_of=near_dup["id"], duplicate_mode="near",
-                similarity=near_dup["similarity"],
-                scope=effective_scope,
-                project=(store_project or "global"),
-                warnings=[
-                    f"near-duplicate rejected: active memory {near_dup['id']} "
-                    f"matches this content with similarity "
-                    f"{near_dup['similarity']}"
-                    + (", and a number or negation differs - this may be a "
-                       "contradiction rather than a reworded copy"
-                       if near_conflict else "")
-                    + "; nothing was stored (pass on_near_duplicate="
-                      "'supersede' to replace it or 'warn' to store it "
-                      "anyway)"])
-        if near_dup and same_subject and near_policy == "supersede" \
-                and near_dup["id"] not in superseded:
-            auto_near = near_dup
-            superseded.append(near_dup["id"])
-
-        mem_id = db.insert(content, emb, mem_type, entity,
-                           importance, meta, project=store_project,
-                           scope=effective_scope, expires_at=expires_at)
-
-        for old_id in superseded:
-            db.mark_superseded(old_id, mem_id, project=store_project)
-
-        for c in contradictions:
-            eid = c["existing_id"]
-            if eid not in superseded:
-                db.mark_superseded(eid, mem_id, project=store_project)
-                superseded.append(eid)
-
-        # A project write that invalidates a SHARED (global) fact hides that
-        # fact in every scope, not only in this project. Without this check
-        # the response reads like a project-local change, and the agent keeps
-        # trusting a global fact this write just invalidated.
-        cross_scope_superseded = (
-            [old for old in superseded
-             if _scope_of_id(cur, old, store_project) == "global"]
-            if store_project else [])
-
-        # Keep context when a replaced fact is superseded: keys of the old
-        # metadata that the new memory does not set are merged into it, so a
-        # superseding fact does not silently drop provenance (tickets, ...)
-        # on the previous fact. Keys set explicitly by the caller win.
-        carried_keys: list[str] = []
-        if superseded and metadata_mode == "merge":
-            table = _mem_table(store_project)
-            for old_id in superseded:
-                cur.execute(
-                    f"SELECT metadata FROM {table} "
-                    f"WHERE id = %s AND deleted_at IS NULL",
-                    (old_id,))
-                row = cur.fetchone()
-                if not row and store_project:
-                    # A cross-scope supersede replaced a shared fact: its
-                    # metadata lives in the global table, not in the project
-                    # one. The promised merge must not stop at the scope
-                    # boundary either.
-                    cur.execute(
-                        "SELECT metadata FROM memories "
-                        "WHERE id = %s AND deleted_at IS NULL",
-                        (old_id,))
-                    row = cur.fetchone()
-                if not row:
-                    continue
-                try:
-                    old_meta = (row[0] if isinstance(row[0], dict)
-                                else json.loads(row[0] or "{}"))
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(old_meta, dict):
-                    continue
-                for key, value in old_meta.items():
-                    if key not in meta and key not in carried_keys:
-                        meta[key] = value
-                        carried_keys.append(key)
-            if carried_keys:
-                cur.execute(
-                    f"UPDATE {table} SET metadata = %s::jsonb WHERE id = %s",
-                    (json.dumps(meta), mem_id))
-
-        # The graph edges belong to the SAME transaction as the memory: one
-        # commit stores the fact and its links together, and a savepoint
-        # keeps an edge failure from losing the fact.
-        link_results, link_warnings = _apply_remember_links(
-            cur, links, entity, store_project)
         db.commit()
+        # remember reports every invalidated row in one list; remember_batch
+        # keeps NLI supersedes separate. Render the merged view here.
+        superseded = outcome.superseded + [
+            c["existing_id"] for c in outcome.auto_superseded
+            if c["existing_id"] not in outcome.superseded]
 
-        warnings: list[str] = []
-        warnings.extend(guard_warnings)
-        warnings.extend(link_warnings)
-        if scope_warning:
-            warnings.append(scope_warning)
-        if ttl_warning:
-            warnings.append(ttl_warning)
-        if superseded_match:
-            mode = superseded_match["mode"]
-            detail = ("the same content" if mode == "exact"
+        warnings = list(outcome.guard_warnings)
+        warnings.extend(outcome.link_warnings)
+        if outcome.created_scope:
+            warnings.append(_remember_scope_warning(store_project))
+        if outcome.ttl_warning:
+            warnings.append(outcome.ttl_warning)
+        if outcome.superseded_match:
+            match = outcome.superseded_match
+            detail = ("the same content" if match["mode"] == "exact"
                       else f"a similar content (similarity "
-                           f"{superseded_match['similarity']})")
+                           f"{match['similarity']})")
             warnings.append(
                 f"this fact matches a superseded memory "
-                f"({superseded_match['id']}) that was replaced by "
-                f"{superseded_match['superseded_by']} ({detail} was already "
+                f"({match['id']}) that was replaced by "
+                f"{match['superseded_by']} ({detail} was already "
                 f"invalidated). The new fact was stored as active, so both "
                 f"versions are reachable now; verify this revert is intended"
             )
-        if auto_near:
-            warnings.append(
-                f"auto-supersede: replaced near-duplicate "
-                f"{near_dup['id']} (similarity {near_dup['similarity']}) "
-                f"instead of storing a reworded copy"
-                + ("; a number or negation differs, so verify this was an "
-                   "intended update and not a contradiction"
-                   if near_conflict else ""))
-        elif near_dup and near_dup["id"] not in superseded:
-            # A near-duplicate that some other part of this write already
-            # replaced (explicit supersede or the contradiction check) needs
-            # no extra advice: the `superseded` list already names it.
-            warnings.append(
-                _near_duplicate_warning(near_dup, entity, near_conflict,
-                                        new_content=content))
-        if cross_scope_superseded:
-            warnings.append(_cross_scope_warning(cross_scope_superseded))
-        if cross_duplicates:
-            warnings.append(_cross_scope_duplicate_warning(cross_duplicates))
+        if outcome.auto_near:
+            warnings.append(_auto_supersede_warning(
+                outcome.near_duplicate, outcome.near_conflict))
+        elif (outcome.near_duplicate
+              and outcome.near_duplicate["id"] not in superseded):
+            warnings.append(_near_duplicate_warning(
+                outcome.near_duplicate, entity, outcome.near_conflict,
+                new_content=content))
+        if outcome.cross_scope_warning:
+            warnings.append(outcome.cross_scope_warning)
+        if outcome.cross_duplicate_warning:
+            warnings.append(outcome.cross_duplicate_warning)
+        contradictions = (outcome.contradictions or {}).get("superseded", [])
         if contradictions:
             warnings.append(
                 f"superseded {len(contradictions)} contradicting memory/facts")
-        elif nli_unavailable:
+        elif outcome.nli_unavailable:
             warnings.append("contradiction check skipped: NLI provider is not configured")
-        elif contradiction_skip:
-            warnings.append(f"contradiction check skipped: {contradiction_skip}")
-        if check_contradictions and not entity and not nli_unavailable \
-                and not contradiction_skip:
-            # Independent of the outcome: even a scan that found something
-            # compared the fact against nearest memories across all entities
-            # when no entity was set. Hiding it behind `elif` made the
-            # broader comparison silent exactly when it had consequences.
+        elif outcome.contradiction_skip:
+            warnings.append(
+                f"contradiction check skipped: {outcome.contradiction_skip}")
+        if check_contradictions and not entity and not outcome.nli_unavailable \
+                and not outcome.contradiction_skip:
             warnings.append(
                 "no entity set: the contradiction check compared the fact "
                 "against the nearest memories across all entities")
         if superseded and not check_contradictions:
             warnings.append(f"superseded {len(superseded)} memory/facts")
-        if carried_keys:
+        if outcome.metadata_carried:
             carried_detail = ", ".join(
-                f"{key}={meta.get(key)!r}" for key in sorted(carried_keys))
+                f"{key}={outcome.metadata.get(key)!r}"
+                for key in sorted(outcome.metadata_carried))
             warnings.append(
                 "metadata carried over from the replaced memories (these "
                 "values come from the old fact; verify they still apply): "
                 + carried_detail)
-        payload: dict[str, Any] = {"superseded": superseded,
-                                   # The scope the fact really landed in. An
-                                   # agent that asked for a project but wrote
-                                   # to the shared scope has to know that:
-                                   # later reads and deletes need that name.
-                                    "scope": effective_scope,
-                                    "project": (store_project or "global")}
-        if cross_scope_superseded:
-            # Machine-readable: which shared facts this project write hid.
-            payload["cross_scope_superseded"] = cross_scope_superseded
-        if cross_duplicates:
-            # Machine-readable: other scopes already hold this exact content.
-            payload["cross_scope_duplicates"] = cross_duplicates
-        if check_contradictions:
-            contradictions_payload: dict[str, Any] = {
-                "found": bool(contradictions),
-                "superseded": contradictions,
-            }
-            skip = (contradiction_skip
-                    or ("NLI provider is not configured"
-                        if nli_unavailable
-                        else None))
-            if skip:
-                contradictions_payload["skipped"] = skip
-            if not entity and not skip:
-                # Transparency: the check ran, but beyond the entity tag.
-                contradictions_payload["cross_entity"] = True
-            payload["contradictions"] = contradictions_payload
-        if link_results:
-            payload["links"] = link_results
-        return ok(STATUS_STORED, id=mem_id, warnings=warnings, **payload)
+
+        payload = {"superseded": superseded,
+                   # The scope the fact really landed in. An agent that asked
+                   # for a project but wrote to the shared scope has to know
+                   # that: later reads and deletes need that name.
+                   "scope": outcome.scope,
+                   "project": outcome.project}
+        if outcome.cross_scope_superseded:
+            payload["cross_scope_superseded"] = outcome.cross_scope_superseded
+        if outcome.cross_scope_duplicates:
+            payload["cross_scope_duplicates"] = outcome.cross_scope_duplicates
+        if outcome.contradictions is not None:
+            payload["contradictions"] = outcome.contradictions
+        if outcome.links:
+            payload["links"] = outcome.links
+        return ok(STATUS_STORED, id=outcome.id, warnings=warnings, **payload)
     except Exception as e:
         db.rollback()
         logger.exception("remember failed")
@@ -1054,312 +622,54 @@ def remember(
         db.close()
 
 
-def _norm_str(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    return value or None
+def _remember_scope_warning(store_project: str | None) -> str:
+    return (
+        f"created a new project scope {store_project!r}; it did not exist "
+        f"before this write (check the name if this was a typo, otherwise "
+        f"the scope now appears in init_context(project='*'))")
 
 
-def _get_field(link: dict, key: str) -> Any:
-    return link.get(key)
+def _batch_scope_warning(store_project: str | None) -> str:
+    return (
+        f"created a new project scope {store_project!r}; it did not exist "
+        f"before this write (check the name if this was a typo)")
 
 
-def _validate_links(links: Any, default_entity: str | None) -> list[str]:
-    """Validate `remember(links=[...])` before anything is stored.
+def _near_rejected_warning(outcome: Any) -> str:
+    near_dup = outcome.near_duplicate
+    return (
+        f"near-duplicate rejected: active memory {near_dup['id']} "
+        f"matches this content with similarity "
+        f"{near_dup['similarity']}"
+        + (", and a number or negation differs - this may be a "
+           "contradiction rather than a reworded copy"
+           if outcome.near_conflict else "")
+        + "; nothing was stored (pass on_near_duplicate="
+          "'supersede' to replace it or 'warn' to store it "
+          "anyway)")
 
-    A malformed link is an argument error, not a warning: the caller built
-    the call around memory + edges, and a silent half-result would need a
-    second discovery round trip. The per-item errors name the index, and the
-    item keys and ranges match the `relate` tool exactly.
+
+def _auto_supersede_warning(near_dup: dict, conflict: bool) -> str:
+    return (
+        f"auto-supersede: replaced near-duplicate "
+        f"{near_dup['id']} (similarity {near_dup['similarity']}) "
+        f"instead of storing a reworded copy"
+        + ("; a number or negation differs, so verify this was an "
+           "intended update and not a contradiction"
+           if conflict else ""))
+
+
+class _EntryRejected(Exception):
+    """A batch entry the pipeline refused without an error (near-reject).
+
+    Raising inside `db.attempt` rolls the entry's savepoint back, exactly
+    like the hand-written ROLLBACK in the old loop, and carries the outcome
+    to the entry renderer.
     """
-    if links is None:
-        return []
-    if not isinstance(links, list):
-        return ["links must be a list of edge objects ({to_entity, "
-                "relation_type, weight?, context?, from_entity?})"]
-    errors: list[str] = []
-    for i, link in enumerate(links):
-        if not isinstance(link, dict):
-            errors.append(f"links[{i}] must be an object")
-            continue
-        to_entity = _norm_str(_get_field(link, "to_entity"))
-        from_entity = _norm_str(_get_field(link, "from_entity"))
-        if not to_entity:
-            errors.append(f"links[{i}]: 'to_entity' is required")
-        if not from_entity and not default_entity:
-            errors.append(
-                f"links[{i}]: 'from_entity' is required when the memory "
-                f"has no entity")
-        relation_type = _norm_str(_get_field(link, "relation_type"))
-        if not relation_type:
-            errors.append(f"links[{i}]: 'relation_type' is required")
-        else:
-            try:
-                _safe_ident(relation_type, "relation_type")
-            except ValueError as e:
-                errors.append(f"links[{i}]: {e}")
-        weight = link.get("weight", 1.0)
-        try:
-            _validate_weight(weight)
-        except (TypeError, ValueError) as e:
-            errors.append(f"links[{i}]: weight: {e}")
-        context = link.get("context")
-        if context is not None and not isinstance(context, str):
-            errors.append(f"links[{i}]: 'context' must be a string")
-    return errors
 
-
-def _prepare_links(links: list[dict], default_entity: str | None) -> list[dict]:
-    """Normalize `links` items into `_relate_edges` edge dicts."""
-    edges: list[dict] = []
-    for link in links:
-        edges.append({
-            "from_entity": (_norm_str(link.get("from_entity"))
-                            or default_entity),
-            "to_entity": link.get("to_entity").strip()
-            if isinstance(link.get("to_entity"), str) else "",
-            "relation_type": link.get("relation_type"),
-            "weight": _validate_weight(link.get("weight", 1.0)),
-            "context": link.get("context"),
-        })
-    return edges
-
-
-def _apply_remember_links(
-    cur,
-    links: list[dict] | None,
-    default_entity: str | None,
-    store_project: str | None,
-) -> tuple[list[dict], list[str]]:
-    """Apply `remember(links=[...])` inside the caller's transaction.
-
-    The edges live in the SAME transaction as the memory: a second
-    connection would block on the locks this connection already holds
-    (registry/graph), turning a combined write into a deadlock. An AGE
-    failure rolls back to the savepoint only - the stored fact survives and
-    the failure is a warning, never a lost fact.
-    """
-    results: list[dict] = []
-    warnings: list[str] = []
-    if not links:
-        return results, warnings
-    edges_added = False
-    try:
-        cur.execute("SAVEPOINT remember_links")
-        cur.execute("SET search_path TO ag_catalog, public")
-        edges_added = True
-        for edge in _prepare_links(links, default_entity):
-            for lr in _relate_edges(cur, [edge], store_project):
-                entry = dict(lr)
-                if lr.get("self_loop"):
-                    warnings.append(
-                        f"links: self-loop {entry['from_entity']!r} ->["
-                        f"{entry['relation_type']!r}]-> itself; graph "
-                        "traversal cannot leave that node through this edge")
-                    entry.pop("self_loop", None)
-                results.append(entry)
-        cur.execute("RELEASE SAVEPOINT remember_links")
-    except Exception as e:
-        if edges_added:
-            cur.execute("ROLLBACK TO SAVEPOINT remember_links")
-            cur.execute("RELEASE SAVEPOINT remember_links")
-        warnings.append(f"links failed: {e}")
-    return results, warnings
-
-
-def _mem_type_of(cur, memory_id: str,
-                 store_project: str | None) -> str | None:
-    """The mem_type of one stored memory (project first, then global)."""
-    cur.execute(
-        f"SELECT mem_type FROM {_mem_table(store_project)} WHERE id = %s",
-        (memory_id,))
-    row = cur.fetchone()
-    if not row and store_project:
-        cur.execute("SELECT mem_type FROM memories WHERE id = %s", (memory_id,))
-        row = cur.fetchone()
-    value = row[0] if row else None
-    return value if value in MEMORY_TYPES else None
-
-
-def _resolve_mem_type(cur, requested: str | None, targets: list[str],
-                      store_project: str | None) -> str:
-    """Resolve the type of a new fact.
-
-    An explicitly passed type always wins. Without one, the type of the
-    replaced memory is carried over: turning a `decision` into a plain
-    `fact` just because the caller omitted `mem_type` lost the kind of the
-    memory on every update.
-    """
-    if requested is not None:
-        return requested
-    for target_id in targets:
-        inherited = _mem_type_of(cur, target_id, store_project)
-        if inherited:
-            return inherited
-    return "fact"
-
-
-def _supersede_targets(cur, store_project: str | None, entity: str | None,
-                       supersede: str | None, supersede_content: str | None,
-                       supersede_last: bool,
-                       embedding: list[float] | None = None,
-                       content: str | None = None
-                       ) -> tuple[list[str], list[str]]:
-    """Resolve which existing memories a new fact replaces.
-
-    Returns the list of target ids and a list of warnings. `supersede_last`
-    only replaces the most similar memory of the entity when the new fact is
-    about the same topic: replacing an unrelated fact would destroy it
-    silently.
-    """
-    targets: list[str] = []
-    warnings: list[str] = []
-    if supersede:
-        # The id is used as given, but it must exist: reporting a
-        # replacement of a memory that is not there is a lie the caller
-        # would act on.
-        found = _find_by_id(cur, supersede, store_project)
-        if found:
-            targets.append(found)
-        else:
-            warnings.append(
-                f"supersede skipped: no memory with id {supersede!r} in the "
-                f"target scope; nothing was replaced"
-            )
-    if supersede_content:
-        found = _find_by_content(cur, supersede_content, store_project, entity)
-        if not found and store_project:
-            # A global fact is replaced by its exact content from inside a
-            # project too (like `supersede=<id>` already does with ids); the
-            # replacement hides the global fact in every scope, which the
-            # response names. The exact content is the identity of the
-            # target, so an entity tag must not block the fallback: the same
-            # text without (or with another) tag is still the intended fact.
-            c_hash = _content_hash((supersede_content or "").strip())
-            found = _by_content_hash(cur, "memories", c_hash, entity)
-        if found:
-            targets.append(found)
-        else:
-            warnings.append(
-                f"supersede_content skipped: no active memory with exactly "
-                f"this content ({supersede_content[:80]!r}) in the target "
-                f"scope; nothing was replaced"
-            )
-    if supersede_last:
-        found_entity: str | None = None
-        if entity:
-            found = _find_last_for_entity(cur, entity, store_project, embedding)
-        else:
-            # No entity: the best match across the whole scope. The
-            # similarity guard still decides - a scope-wide fallback must
-            # not replace an unrelated memory either.
-            found = _find_last_in_scope(cur, store_project, embedding)
-            if found:
-                found_entity = found[3] if len(found) > 3 else None
-                warnings.append(
-                    "supersede_last without an entity: resolved the "
-                    "best-matching memory across the scope instead of one "
-                    "entity")
-        if not found and not entity:
-            warnings.append(
-                "supersede_last skipped: no embedding available, so the "
-                "same-topic match without an entity cannot be resolved; "
-                "nothing was replaced")
-        elif not found:
-            warnings.append(
-                f"supersede_last skipped: no memory of entity {entity!r} "
-                f"is active; nothing was replaced")
-        if found:
-            # The scope-wide lookup returns an entity; the entity-scoped one
-            # necessarily matched the requested entity.
-            target_id, old_content, similarity = found[:3]
-            topic_floor = (SUPERSEDE_SIMILARITY_MIN if entity
-                           else max(SUPERSEDE_SIMILARITY_MIN,
-                                    NEAR_DUPLICATE_THRESHOLD))
-            if not entity and found_entity is not None:
-                # An untagged write must not replace a fact that belongs to a
-                # tagged entity just because the vectors are close. The caller
-                # has to name the entity (or the id) to make that choice.
-                warnings.append(
-                    f"supersede_last skipped: the best scope-wide match "
-                    f"{target_id} belongs to entity {found_entity!r}, but the "
-                    f"new fact has no entity; pass entity={found_entity!r} or "
-                    f"supersede={target_id} to replace it explicitly. The new "
-                    f"fact was stored as an additional memory"
-                )
-            elif similarity is not None and similarity < topic_floor:
-                pool = repr(entity) if entity else "the scope"
-                warnings.append(
-                    f"supersede_last skipped: no memory of "
-                    f"{pool}"
-                    f" is about the same topic (best match {old_content!r} "
-                    f"with similarity {similarity} < {topic_floor}); the new "
-                    f"fact was stored as an additional memory"
-                )
-            elif content is not None and not _shares_subject(
-                    content, old_content,
-                    entity or found_entity, similarity):
-                # Similarity is dominated by the shared sentence template
-                # ("the QA service ..."), so a fact about another attribute
-                # still scores high. Requiring a shared content word after
-                # removing the entity makes the topic check real.
-                pool = repr(entity) if entity else "the scope"
-                warnings.append(
-                    f"supersede_last skipped: the best match in {pool} "
-                    f"({old_content!r}, similarity {similarity}) shares no "
-                    f"subject term with the new fact - it is a different "
-                    f"topic; the new fact was stored as an additional memory"
-                )
-            else:
-                targets.append(target_id)
-                if not entity:
-                    warnings.append(
-                        f"supersede_last: replaced the best-matching memory "
-                        f"of the scope (similarity {similarity}); an entity "
-                        f"tag would make this targeting explicit")
-    # Keep order, drop duplicates.
-    return list(dict.fromkeys(targets)), warnings
-
-
-def _apply_duplicate_supersede(cur, store_project: str | None,
-                               existing_id: str, entity: str | None,
-                               supersede: str | None,
-                               supersede_content: str | None,
-                               supersede_last: bool,
-                               embedding: list[float] | None,
-                               content: str | None = None
-                               ) -> tuple[list[str], list[str], list[str],
-                                          list[str]]:
-    """Apply `supersede` even when the write itself is a duplicate.
-
-    The fact is already stored under `existing_id`; the caller still asked to
-    invalidate another memory. Resolving the targets and superseding them with
-    the existing id keeps that instruction from being silently dropped. A
-    target that *is* the duplicate is not superseded by itself (that would
-    create a bogus self-link) and is reported instead.
-
-    Returns (applied, self_targets, warnings, cross_scope_ids).
-    """
-    targets, warnings = _supersede_targets(
-        cur, store_project, entity, supersede, supersede_content,
-        supersede_last, embedding, content)
-    applied = [t for t in targets if t != existing_id]
-    self_targets = [t for t in targets if t == existing_id]
-    for old_id in applied:
-        _supersede(cur, store_project, existing_id, old_id)
-    if self_targets:
-        warnings.append(
-            f"supersede target is the existing duplicate {existing_id} "
-            f"itself; nothing was replaced")
-    if applied:
-        warnings.append(
-            f"supersede applied via the existing duplicate {existing_id}: "
-            f"replaced {len(applied)} memory/facts")
-    cross_scope = ([old for old in applied
-                    if _scope_of_id(cur, old, store_project) == "global"]
-                   if store_project else [])
-    return applied, self_targets, warnings, cross_scope
+    def __init__(self, outcome: Any):
+        super().__init__("entry rejected")
+        self.outcome = outcome
 
 
 def remember_batch(
@@ -1566,9 +876,7 @@ def remember_batch(
 
     db = MemoryStore()
     results: list[dict] = []
-    ensured: set[str] = set()
     try:
-        cur = db.cur
         for i, (spec, err) in enumerate(prepared):
             if spec is None:
                 raw = facts[i].get("content", "") if isinstance(facts[i], dict) else ""
@@ -1576,277 +884,138 @@ def remember_batch(
                                 "error": err})
                 continue
             store_project = spec["project"]
-            savepoint = f"fact_{i}"
-            cur.execute(f"SAVEPOINT {savepoint}")
             try:
-                scope_warning = None
-                if store_project and store_project not in ensured:
-                    if not _project_exists(cur, store_project):
-                        scope_warning = (
-                            f"created a new project scope {store_project!r}; "
-                            f"it did not exist before this write (check the "
-                            f"name if this was a typo)")
-                    _ensure_project_table(cur, store_project)
-                    ensured.add(store_project)
-
-                near_dup = None
-                exact_copy: str | None = None
-                fact_dedupe = spec.get("dedupe") or dedupe
-                if not skip_duplicates and fact_dedupe != "off":
-                    # skip_duplicates=false means "store it anyway", but the
-                    # caller still has to learn that an identical active row
-                    # already exists. _find_near_duplicate excludes exact
-                    # hashes, so only this explicit check can report it.
-                    existing_exact = _deduplicate(
-                        cur, spec["content"], store_project, None,
-                        dedupe="exact")
-                    if existing_exact:
-                        exact_copy = existing_exact[0]
-                if skip_duplicates:
-                    existing = _deduplicate(cur, spec["content"], store_project,
-                                            embeddings[i], spec["fuzzy_threshold"],
-                                            dedupe=fact_dedupe)
-                    if existing:
-                        existing_id, mode, similarity = existing
-                        entry: dict[str, Any] = {
-                            "id": existing_id, "content": spec["content"],
-                            "status": "duplicate",
-                            "duplicate_mode": mode,
-                            "similarity": similarity,
-                            "scope": spec["scope"],
-                            "project": (store_project or "global"),
-                        }
-                        if scope_warning:
-                            entry["warnings"] = [scope_warning]
-                        if (spec.get("supersede") or spec.get("supersede_content")
-                                or spec.get("supersede_last")):
-                            try:
-                                (superseded_now, _self_targets,
-                                 extra_warnings, cross_now) = (
-                                    _apply_duplicate_supersede(
-                                        cur, store_project, existing_id,
-                                        spec["entity"], spec.get("supersede"),
-                                        spec.get("supersede_content"),
-                                        spec.get("supersede_last"),
-                                        embeddings[i], spec["content"]))
-                            except ValueError as exc:
-                                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                                results.append({
-                                    "id": existing_id,
-                                    "content": spec["content"],
-                                    "status": "error", "error": str(exc),
-                                    "scope": spec["scope"],
-                                    "project": (store_project or "global"),
-                                })
-                                continue
-                            entry.setdefault("warnings", []).extend(
-                                extra_warnings)
-                            if superseded_now:
-                                entry["superseded"] = superseded_now
-                                if cross_now:
-                                    entry["cross_scope_superseded"] = cross_now
-                                    entry["warnings"].append(
-                                        _cross_scope_warning(cross_now))
-                        cur.execute(f"RELEASE SAVEPOINT {savepoint}")
-                        results.append(entry)
-                        continue
-                    # No duplicate, but maybe a reworded copy: report it in
-                    # the entry so a batch write cannot fork silently either.
-                    # skip_duplicates=False means "store duplicates anyway",
-                    # so the whole check (and its warning) is skipped then.
-                    if fact_dedupe != "off" \
-                            or spec["on_near_duplicate"] != "warn":
-                        near_dup = _find_near_duplicate(
-                            cur, spec["content"], store_project, embeddings[i])
-                elif spec["on_near_duplicate"] != "warn":
-                    near_dup = _find_near_duplicate(
-                        cur, spec["content"], store_project, embeddings[i])
-
-                contradictions = []
-                contradiction_skip: str | None = None
-                if check_contradictions:
-                    try:
-                        contradictions = _check_contradictions(
-                            cur, spec["content"], spec["entity"], store_project,
-                            embeddings[i],
-                        )
-                    except Exception as exc:
-                        # A failed NLI must not roll the fact back: report the
-                        # skipped check instead of a wrong "clean" result.
-                        logger.warning("contradiction check failed: %s", exc)
-                        contradiction_skip = f"NLI unavailable: {exc}"
-
-                # Resolve replaced memories before this fact is stored.
-                superseded, guard_warnings = _supersede_targets(
-                    cur, store_project, spec["entity"], spec["supersede"],
-                    spec["supersede_content"], spec["supersede_last"],
-                    embeddings[i], spec["content"],
-                )
-                # Per-fact near-duplicate policy (same semantics as in
-                # `remember`): reject stores nothing, supersede replaces.
-                # A high similarity across different entities is not a
-                # duplicate; the policy must not delete the other subject.
-                fact_near_policy = spec["on_near_duplicate"]
-                same_fact_subject = (near_dup is not None
-                                     and _same_subject_entity(
-                                         near_dup, spec["entity"]))
-                fact_near_conflict = bool(
-                    same_fact_subject
-                    and _content_conflict(spec["content"],
-                                          near_dup.get("content") or ""))
-                if near_dup and same_fact_subject \
-                        and fact_near_policy == "reject" \
-                        and near_dup["id"] not in superseded:
-                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                    results.append({
-                        "id": near_dup["id"],
-                        "content": spec["content"],
-                        "status": "duplicate",
-                        "duplicate_of": near_dup["id"],
-                        "duplicate_mode": "near",
-                        "similarity": near_dup["similarity"],
-                        "scope": spec["scope"],
-                        "project": (store_project or "global"),
-                        "warnings": [
-                            f"near-duplicate rejected: active memory "
-                            f"{near_dup['id']} matches this content with "
-                            f"similarity {near_dup['similarity']}"
-                            + (", and a number or negation differs - this "
-                               "may be a contradiction rather than a "
-                               "reworded copy" if fact_near_conflict else "")
-                            + "; nothing was stored"],
-                    })
-                    continue
-                if near_dup and same_fact_subject \
-                        and fact_near_policy == "supersede" \
-                        and near_dup["id"] not in superseded:
-                    superseded.append(near_dup["id"])
-
-                cross_duplicates = [
-                    dup for dup in _cross_scope_duplicates(
-                        cur, spec["content"], store_project)
-                    if dup["id"] not in superseded
-                ]
-
-                fact_mem_type = _resolve_mem_type(
-                    cur, spec["mem_type"], superseded, store_project)
-                mid = db.insert(
-                    spec["content"], embeddings[i], fact_mem_type,
-                    spec["entity"], spec["importance"], spec["metadata"],
-                    project=store_project, scope=spec["scope"],
-                    expires_at=spec.get("expires_at"),
-                )
-
-                for old_id in superseded:
-                    db.mark_superseded(old_id, mid, project=store_project)
-
-                auto_superseded = []
-                for c in contradictions:
-                    if c["existing_id"] in superseded:
-                        continue
-                    db.mark_superseded(c["existing_id"], mid,
-                                       project=store_project)
-                    auto_superseded.append(c)
-
-                # Carry metadata over from every replaced fact (same contract
-                # as `remember`): a batch write must not drop provenance that
-                # a single write preserves.
-                replaced_ids = list(dict.fromkeys(
-                    superseded + [c["existing_id"] for c in auto_superseded]))
-                carried: list[str] = []
-                if replaced_ids:
-                    merged_meta = dict(spec["metadata"])
-                    for old_id in replaced_ids:
-                        for key, value in _read_metadata(
-                                cur, store_project, old_id).items():
-                            if key not in merged_meta:
-                                merged_meta[key] = value
-                                carried.append(key)
-                    if carried:
-                        cur.execute(
-                            f"UPDATE {_mem_table(store_project)} "
-                            "SET metadata = %s::jsonb WHERE id = %s",
-                            (json.dumps(merged_meta), mid))
-                # Shared facts this entry invalidated: a project write hides
-                # them in every scope, so the entry has to name them.
-                cross_scope_superseded = (
-                    [old for old in dict.fromkeys(
-                        superseded + [c["existing_id"]
-                                      for c in auto_superseded])
-                     if _scope_of_id(cur, old, store_project) == "global"]
-                    if store_project else [])
-                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                with db.attempt(f"fact_{i}"):
+                    outcome = write_one(db, WriteIntent(
+                        content=spec["content"],
+                        project=store_project,
+                        scope=spec["scope"],
+                        entity=spec["entity"],
+                        mem_type=spec["mem_type"],
+                        importance=spec["importance"],
+                        metadata=spec["metadata"],
+                        expires_at=spec.get("expires_at"),
+                        dedupe=spec.get("dedupe") or dedupe,
+                        fuzzy_threshold=spec["fuzzy_threshold"],
+                        supersede=spec.get("supersede"),
+                        supersede_content=spec.get("supersede_content"),
+                        supersede_last=spec.get("supersede_last"),
+                        on_near_duplicate=spec["on_near_duplicate"],
+                        check_contradictions=check_contradictions,
+                        embedding=embeddings[i],
+                        skip_duplicates=skip_duplicates,
+                        probe_nli_config=False,
+                        report_superseded_match=False,
+                    ))
+                    if not outcome.persist:
+                        raise _EntryRejected(outcome)
+            except _EntryRejected as rejected:
+                outcome = rejected.outcome
             except Exception as exc:
-                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 results.append({"id": None, "content": spec["content"],
                                 "status": "error", "error": str(exc),
                                 "scope": spec["scope"],
                                 "project": (store_project or "global")})
                 continue
 
-            entry = {"id": mid, "content": spec["content"], "status": "stored",
-                     "superseded": superseded,
-                     # Where the fact really landed: a batch can mix scopes,
-                     # so the caller has to be able to see it per fact.
-                     "scope": spec["scope"],
-                     "project": (store_project or "global"),
-                     # Stable shape: a caller can read entry["warnings"]
-                     # without a key check, also when there is nothing to say.
-                     "warnings": []}
-            if guard_warnings:
-                entry["warnings"] = guard_warnings
-            if exact_copy:
-                entry.setdefault("warnings", []).append(
-                    f"identical content is already active as {exact_copy}; "
+            if outcome.status == STATUS_DUPLICATE:
+                entry: dict[str, Any] = {
+                    "id": outcome.id, "content": spec["content"],
+                    "status": "duplicate",
+                    "duplicate_mode": outcome.duplicate_mode,
+                    "similarity": outcome.similarity,
+                    "scope": outcome.scope,
+                    "project": outcome.project,
+                }
+                warnings: list[str] = []
+                if outcome.created_scope:
+                    warnings.append(_batch_scope_warning(store_project))
+                if not outcome.persist:
+                    warnings.append(
+                        f"near-duplicate rejected: active memory "
+                        f"{outcome.near_duplicate['id']} matches this content "
+                        f"with similarity {outcome.near_duplicate['similarity']}"
+                        + (", and a number or negation differs - this may be a "
+                           "contradiction rather than a reworded copy"
+                           if outcome.near_conflict else "")
+                        + "; nothing was stored")
+                else:
+                    warnings.extend(outcome.duplicate_supersede_warnings)
+                    if outcome.cross_scope_warning:
+                        warnings.append(outcome.cross_scope_warning)
+                if warnings:
+                    entry["warnings"] = warnings
+                if outcome.superseded:
+                    entry["superseded"] = outcome.superseded
+                    if outcome.cross_scope_superseded:
+                        entry["cross_scope_superseded"] = (
+                            outcome.cross_scope_superseded)
+                if outcome.duplicate_of:
+                    entry["duplicate_of"] = outcome.duplicate_of
+                results.append(entry)
+                continue
+
+            entry = {
+                "id": outcome.id,
+                "content": spec["content"],
+                "status": "stored",
+                "superseded": outcome.superseded,
+                # Where the fact really landed: a batch can mix scopes, so
+                # the caller has to be able to see it per fact.
+                "scope": outcome.scope,
+                "project": outcome.project,
+                # Stable shape: a caller can read entry["warnings"] without a
+                # key check, also when there is nothing to say.
+                "warnings": [],
+            }
+            if outcome.guard_warnings:
+                entry["warnings"] = list(outcome.guard_warnings)
+            if outcome.exact_copy:
+                entry["warnings"].append(
+                    f"identical content is already active as {outcome.exact_copy}; "
                     f"another copy was stored because skip_duplicates=false")
-            if scope_warning:
-                entry.setdefault("warnings", []).append(scope_warning)
-            if spec.get("ttl_warning"):
-                entry.setdefault("warnings", []).append(spec["ttl_warning"])
-            if carried:
-                entry.setdefault("warnings", []).append(
+            if outcome.created_scope:
+                entry["warnings"].append(_batch_scope_warning(store_project))
+            if outcome.ttl_warning:
+                entry["warnings"].append(outcome.ttl_warning)
+            if outcome.metadata_carried:
+                entry["warnings"].append(
                     "metadata carried over from the replaced memories (these "
                     "values come from the old fact; verify they still apply): "
-                    + ", ".join(sorted(set(carried))))
-            if near_dup and same_fact_subject \
-                    and spec["on_near_duplicate"] == "supersede" \
-                    and near_dup["id"] in superseded:
-                entry.setdefault("warnings", []).append(
-                    f"auto-supersede: replaced near-duplicate "
-                    f"{near_dup['id']} (similarity {near_dup['similarity']}) "
-                    f"instead of storing a reworded copy"
-                    + ("; a number or negation differs, so verify this was "
-                       "an intended update and not a contradiction"
-                       if fact_near_conflict else ""))
-            elif near_dup and near_dup["id"] not in superseded:
+                    + ", ".join(sorted(set(outcome.metadata_carried))))
+            if outcome.auto_near:
+                entry["warnings"].append(_auto_supersede_warning(
+                    outcome.near_duplicate, outcome.near_conflict))
+            elif (outcome.near_duplicate
+                  and outcome.near_duplicate["id"] not in outcome.superseded):
                 # Already replaced through the explicit supersede path: the
                 # entry's `superseded` list already names it, so no extra
                 # advice is needed.
-                entry.setdefault("warnings", []).append(
-                    _near_duplicate_warning(near_dup, spec["entity"],
-                                            fact_near_conflict,
-                                            new_content=spec["content"]))
-            if cross_scope_superseded:
-                entry["cross_scope_superseded"] = cross_scope_superseded
-                entry.setdefault("warnings", []).append(
-                    _cross_scope_warning(cross_scope_superseded))
-            if cross_duplicates:
-                entry["cross_scope_duplicates"] = cross_duplicates
-                entry.setdefault("warnings", []).append(
-                    _cross_scope_duplicate_warning(cross_duplicates))
+                entry["warnings"].append(_near_duplicate_warning(
+                    outcome.near_duplicate, spec["entity"],
+                    outcome.near_conflict, new_content=spec["content"]))
+            if outcome.cross_scope_superseded:
+                entry["cross_scope_superseded"] = (
+                    outcome.cross_scope_superseded)
+                entry["warnings"].append(outcome.cross_scope_warning)
+            if outcome.cross_scope_duplicates:
+                entry["cross_scope_duplicates"] = outcome.cross_scope_duplicates
+                entry["warnings"].append(outcome.cross_duplicate_warning)
             if check_contradictions:
                 entry["contradictions"] = {
-                    "found": bool(auto_superseded),
-                    "superseded": auto_superseded,
+                    "found": bool(outcome.auto_superseded),
+                    "superseded": outcome.auto_superseded,
                 }
-                if contradiction_skip:
-                    entry["contradictions"]["skipped"] = contradiction_skip
-                    entry.setdefault("warnings", []).append(
-                        f"contradiction check skipped: {contradiction_skip}")
+                if outcome.contradiction_skip:
+                    entry["contradictions"]["skipped"] = (
+                        outcome.contradiction_skip)
+                    entry["warnings"].append(
+                        f"contradiction check skipped: "
+                        f"{outcome.contradiction_skip}")
                 elif not spec["entity"]:
                     # Transparency: the check ran, but across all entities.
                     entry["contradictions"]["cross_entity"] = True
-                    entry.setdefault("warnings", []).append(
+                    entry["warnings"].append(
                         "no entity set: the contradiction check compared the "
                         "fact against the nearest memories across all entities")
             results.append(entry)
@@ -1867,7 +1036,6 @@ def remember_batch(
     warnings = [f"{len(failed)} fact(s) failed"] if failed else []
     return ok(status, count=len(results), succeeded=succeeded,
               failed=len(failed), results=results, warnings=warnings)
-
 
 def _restore_blocked_reason(cur, memory_id: str,
                             tables: list[str]) -> tuple[str, str] | None:
