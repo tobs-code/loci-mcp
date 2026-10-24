@@ -150,6 +150,23 @@ class BatchFact(BaseModel):
                            "enum": ["warn", "supersede", "reject", None]},
         description="'warn' stores and warns, 'supersede' replaces the "
                     "near-duplicate, 'reject' stores nothing.")
+    contradiction_mode: Any = Field(
+        default=None,
+        json_schema_extra={"type": ["string", "null"],
+                           "enum": ["supersede", "warn", None]},
+        description="Overrides the batch contradiction policy for this fact: "
+                    "'supersede' replaces the old memory, 'warn' only reports "
+                    "it.")
+    contradiction_min_confidence: Any = Field(
+        default=None,
+        json_schema_extra={"type": ["number", "null"]},
+        description="Minimum NLI confidence (0.0-1.0) for an automatic "
+                    "supersede of this fact; overrides the batch default.")
+    max_contradiction_supersedes: Any = Field(
+        default=None,
+        json_schema_extra={"type": ["integer", "null"]},
+        description="Maximum number of memories this fact may invalidate; "
+                    "overrides the batch default.")
     expires_at: Any = Field(default=None, json_schema_extra={
         "type": ["string", "null"]},
         description="Optional ISO 8601 timestamp when this memory stops "
@@ -991,16 +1008,18 @@ def remember_batch(
                              ("contradiction_mode must be 'supersede' or "
                               "'warn'")))
             continue
-        fact_min_conf = fact.get(
-            "contradiction_min_confidence", contradiction_min_confidence)
+        fact_min_conf = fact.get("contradiction_min_confidence")
+        if fact_min_conf is None:
+            fact_min_conf = contradiction_min_confidence
         if not isinstance(fact_min_conf, (int, float)) \
                 or not 0.0 <= float(fact_min_conf) <= 1.0:
             prepared.append((None,
                              ("contradiction_min_confidence must be between "
                               "0.0 and 1.0")))
             continue
-        fact_max_supersedes = fact.get(
-            "max_contradiction_supersedes", max_contradiction_supersedes)
+        fact_max_supersedes = fact.get("max_contradiction_supersedes")
+        if fact_max_supersedes is None:
+            fact_max_supersedes = max_contradiction_supersedes
         if not isinstance(fact_max_supersedes, int) or fact_max_supersedes < 0:
             prepared.append((None,
                              "max_contradiction_supersedes must be >= 0"))
