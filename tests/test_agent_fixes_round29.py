@@ -11,6 +11,7 @@ from mcp_server.app import EnvelopeTool
 from mcp_server.backup import import_memories
 from mcp_server.db import get_conn
 from mcp_server.graph import list_relations, relate
+from mcp_server.lifecycle import ACTIVE_ROW_SQL
 from mcp_server.scope_catalog import _mem_table, _norm_entity
 from mcp_server.storage import clear_dangling_supersede
 from mcp_server.store import MemoryStore
@@ -65,7 +66,7 @@ def test_mark_superseded_only_touches_the_resolved_table():
     assert statements == [
         ("UPDATE memories SET superseded_by = %s, "
          "valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
-         "WHERE id = %s")
+         f"WHERE id = %s AND {ACTIVE_ROW_SQL}")
     ]
 
     store = MemoryStore(conn=Conn())
@@ -74,7 +75,7 @@ def test_mark_superseded_only_touches_the_resolved_table():
     assert statements == [
         ("UPDATE mem_api SET superseded_by = %s, "
          "valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
-         "WHERE id = %s")
+         f"WHERE id = %s AND {ACTIVE_ROW_SQL}")
     ]
 
 

@@ -56,8 +56,8 @@ from mcp_server.storage import (
     _find_last_in_scope,
     _find_near_duplicate,
     _find_superseded_match,
+    _id_active_in_both_scopes,
     _scope_of_id,
-    _supersede,
 )
 from mcp_server.store import MemoryStore
 
@@ -270,7 +270,7 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
             # memory. Apply the replacement through the existing id.
             (superseded_now, _self_targets, extra_warnings,
              cross_now) = _apply_duplicate_supersede(
-                cur, store_project, existing_id, entity, intent.supersede,
+                db, cur, store_project, existing_id, entity, intent.supersede,
                 intent.supersede_content, intent.supersede_last, emb, content)
         link_results, link_warnings = _apply_remember_links(
             cur, intent.links, entity, store_project)
@@ -417,10 +417,19 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
     else:
         mem_id = _insert(None)
 
+    # Resolve every target before marking anything: the UPDATE hides the row,
+    # so a lookup afterwards could no longer tell which scope owned the id.
+    # An inactive copy in the write scope must not hide the active target.
+    target_scopes = {
+        old_id: _scope_of_id(cur, old_id, store_project, active_only=True)
+        for old_id in superseded
+    }
+    guard_warnings.extend(
+        _ambiguous_target_warnings(cur, store_project, superseded))
     for old_id in superseded:
         db.mark_superseded(
             old_id, mem_id, project=store_project,
-            target=_scope_of_id(cur, old_id, store_project))
+            target=target_scopes[old_id])
 
     auto_superseded: list[dict] = []
     contradiction_kept: list[dict] = []
@@ -454,9 +463,16 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
             contradiction_kept.extend(
                 eligible[max_contradiction_supersedes:])
             for c in auto_superseded:
+                existing_id = c["existing_id"]
+                target_scopes.setdefault(
+                    existing_id,
+                    _scope_of_id(cur, existing_id, store_project,
+                                 active_only=True))
+                guard_warnings.extend(_ambiguous_target_warnings(
+                    cur, store_project, [existing_id]))
                 db.mark_superseded(
-                    c["existing_id"], mem_id, project=store_project,
-                    target=_scope_of_id(cur, c["existing_id"], store_project))
+                    existing_id, mem_id, project=store_project,
+                    target=target_scopes[existing_id])
             cross_replaced = [c for c in auto_superseded
                               if c.get("cross_entity")]
             if cross_replaced:
@@ -469,7 +485,7 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         superseded + [c["existing_id"] for c in auto_superseded]))
     cross_scope_superseded = (
         [old for old in replaced_ids
-         if _scope_of_id(cur, old, store_project) == "global"]
+         if target_scopes.get(old) == "global"]
         if store_project else [])
 
     # Keep context when a replaced fact is superseded: keys of the old
@@ -478,7 +494,9 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
     carried_keys: list[str] = []
     if replaced_ids and intent.metadata_mode == "merge":
         for old_id in replaced_ids:
-            for key, value in _read_metadata(cur, store_project, old_id).items():
+            for key, value in _read_metadata(
+                    cur, store_project, old_id,
+                    target_scopes.get(old_id)).items():
                 if key in _GRAPH_METADATA_KEYS:
                     continue
                 if key not in meta and key not in carried_keys:
@@ -795,8 +813,8 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
             targets.append(found)
         else:
             warnings.append(
-                f"supersede skipped: no memory with id {supersede!r} in the "
-                f"target scope; nothing was replaced"
+                f"supersede skipped: no active memory with id {supersede!r} "
+                f"in the target scope; nothing was replaced"
             )
     if supersede_content:
         found = _find_by_content(cur, supersede_content, store_project, entity)
@@ -893,7 +911,30 @@ def _supersede_targets(cur, store_project: str | None, entity: str | None,
     return list(dict.fromkeys(targets)), warnings
 
 
-def _apply_duplicate_supersede(cur, store_project: str | None,
+def _ambiguous_target_warnings(cur, store_project: str | None,
+                               target_ids: list[str]) -> list[str]:
+    """Warn when an id to be replaced is active in both scopes.
+
+    Ids are normally unique per scope, but an import can create an active copy
+    in both. The write scope wins (the same precedence as `_find_by_id`); say
+    so instead of silently leaving the other scope's fact active. The caller
+    runs this for every supersede path, including automatic near-duplicate and
+    contradiction replacements.
+    """
+    warnings: list[str] = []
+    for target_id in dict.fromkeys(target_ids):
+        if not _id_active_in_both_scopes(cur, target_id, store_project):
+            continue
+        warnings.append(
+            f"supersede target id {target_id!r} is active in both "
+            f"scope {store_project!r} and 'global'; the "
+            f"{store_project!r} row took precedence and the global row "
+            f"was left untouched"
+        )
+    return warnings
+
+
+def _apply_duplicate_supersede(db: MemoryStore, cur, store_project: str | None,
                                existing_id: str, entity: str | None,
                                supersede: str | None,
                                supersede_content: str | None,
@@ -917,8 +958,23 @@ def _apply_duplicate_supersede(cur, store_project: str | None,
         supersede_last, embedding, content)
     applied = [t for t in targets if t != existing_id]
     self_targets = [t for t in targets if t == existing_id]
+    # Resolve the target scope BEFORE marking: once the row is superseded it
+    # is inactive, and an inactive copy with the same id in the project table
+    # could otherwise hide the real (global) target. `active_only` keeps the
+    # helper aligned with `_find_by_id`, which also only returns active rows.
+    scopes = {old_id: _scope_of_id(cur, old_id, store_project,
+                                   active_only=True)
+              for old_id in applied}
+    warnings.extend(
+        _ambiguous_target_warnings(cur, store_project, applied))
     for old_id in applied:
-        _supersede(cur, store_project, existing_id, old_id)
+        # Use the same scope-aware helper as the regular supersede path. The
+        # legacy `_supersede` updated the project table AND the global table
+        # by id, so a project write could invalidate an unrelated global row
+        # that merely shared the id (e.g. after an import).
+        db.mark_superseded(
+            old_id, existing_id, project=store_project,
+            target=scopes[old_id])
     if self_targets:
         warnings.append(
             f"supersede target is the existing duplicate {existing_id} "
@@ -928,7 +984,7 @@ def _apply_duplicate_supersede(cur, store_project: str | None,
             f"supersede applied via the existing duplicate {existing_id}: "
             f"replaced {len(applied)} memory/facts")
     cross_scope = ([old for old in applied
-                    if _scope_of_id(cur, old, store_project) == "global"]
+                    if scopes[old] == "global"]
                    if store_project else [])
     return applied, self_targets, warnings, cross_scope
 
@@ -1140,20 +1196,33 @@ def _ttl_past_warning(value: Any) -> str | None:
     return None
 
 
-def _read_metadata(cur, store_project: str | None, memory_id: str) -> dict:
-    """Metadata of a row that is about to be replaced (project, then global)."""
-    table = _mem_table(store_project)
-    cur.execute(
-        f"SELECT metadata FROM {table} WHERE id = %s AND deleted_at IS NULL",
-        (memory_id,))
-    row = cur.fetchone()
-    if not row and store_project:
-        # A cross-scope supersede replaced a shared fact: its metadata lives
-        # in the global table, not in the project one.
+def _read_metadata(cur, store_project: str | None, memory_id: str,
+                   target_scope: str | None = None) -> dict:
+    """Metadata of a row that was replaced, from the scope that owned it.
+
+    The row is already marked superseded, so this cannot filter on "active";
+    `deleted_at` is the only marker still usable. `target_scope` comes from
+    the scope resolution done before the update: falling back to the write
+    scope first could otherwise read an expired/inactive copy that merely
+    shares the id.
+    """
+    if target_scope == "global":
+        tables = ["memories"]
+    elif target_scope == "project":
+        tables = [_mem_table(store_project)]
+    else:
+        tables = [_mem_table(store_project)]
+        if store_project:
+            tables.append("memories")
+    row = None
+    for table in dict.fromkeys(tables):
         cur.execute(
-            "SELECT metadata FROM memories WHERE id = %s AND deleted_at IS NULL",
+            f"SELECT metadata FROM {table} WHERE id = %s "
+            f"AND deleted_at IS NULL",
             (memory_id,))
         row = cur.fetchone()
+        if row:
+            break
     if not row:
         return {}
     try:

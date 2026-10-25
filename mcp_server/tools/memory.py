@@ -1518,18 +1518,19 @@ def _restore_blocked_reason(db: MemoryStore, memory_id: str,
         f"restorable soft delete")
 
 
-def _restore_memory(memory_id: str, project: str | None) -> dict[str, Any]:
+def _restore_memory(memory_id: str, project: str | None,
+                    explicit_global: bool = False) -> dict[str, Any]:
     """Clear the soft delete of one memory (inverse of `forget(soft=True)`).
 
     A real `superseded_by` id is kept: a restored memory cannot resurrect
-    next to the fact that replaced it. With a project only that project's
-    table is searched (the explicit scope); without one every scope is
-    searched and an ambiguous id is refused.
+    next to the fact that replaced it. An explicit project (including the
+    reserved name "global") searches only that one table; without one every
+    scope is searched and an ambiguous id is refused.
     """
     db = MemoryStore()
     try:
         cur = db.cur
-        if project:
+        if project or explicit_global:
             tables = [_mem_table(project)]
             if not _table_exists(cur, tables[0]):
                 return fail(STATUS_NOT_FOUND, f"NOT FOUND: {memory_id}")
@@ -1697,6 +1698,8 @@ def update_memory(
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
                 memory_id, content is not None, importance is not None, metadata is not None)
+    explicit_global = (project is not None
+                       and str(project).strip().lower() == "global")
     try:
         project = _norm_project(project)
         entity = _norm_entity(entity)
@@ -1764,7 +1767,8 @@ def update_memory(
             return fail(STATUS_ERROR,
                         "restore=true cannot be combined with other update "
                         "fields; it only clears the soft delete")
-        return _restore_memory(memory_id, project)
+        return _restore_memory(memory_id, project,
+                               explicit_global=explicit_global)
 
     sets: list[str] = []
     params: list[Any] = []
@@ -1845,6 +1849,11 @@ def update_memory(
             # Prefer the project copy over the shared one; only the first
             # active match is updated.
             tables = [_mem_table(project), "memories"]
+        elif explicit_global:
+            # "global" is the reserved shared scope, not "no scope given":
+            # an all-scope lookup would update a project copy with the same
+            # id first and leave the requested global row untouched.
+            tables = ["memories"]
         else:
             # A memory id is unique per scope, not globally: an import can
             # copy a memory into another project. Without a project an id
@@ -2049,8 +2058,10 @@ def update_batch(
         if not memory_id:
             prepared.append((None, "memory_id is required"))
             continue
+        entry_scope_explicit = entry.get("project", project) is not None
         try:
-            entry_project = _norm_project(entry.get("project", default_project))
+            entry_project = _norm_project(
+                entry.get("project", default_project))
         except ValueError as e:
             prepared.append((None, str(e)))
             continue
@@ -2213,6 +2224,7 @@ def update_batch(
         else:
             prepared.append(({"memory_id": memory_id,
                               "project": entry_project,
+                              "project_explicit": entry_scope_explicit,
                               "fields": fields,
                               "restore": entry_restore,
                               "dedupe": entry_dedupe,
@@ -2261,7 +2273,7 @@ def update_batch(
             db.open_savepoint(savepoint)
             try:
                 if spec.get("restore"):
-                    if entry_project:
+                    if entry_project or spec["project_explicit"]:
                         restore_tables = [_mem_table(entry_project)]
                         if not _table_exists(cur, restore_tables[0]):
                             _undo(savepoint)
@@ -2323,6 +2335,8 @@ def update_batch(
 
                 if entry_project:
                     tables = [_mem_table(entry_project), "memories"]
+                elif spec["project_explicit"]:
+                    tables = ["memories"]
                 else:
                     scopes = _memory_scopes(cur, memory_id)
                     if len(scopes) > 1:
@@ -2998,17 +3012,23 @@ def forget(
             # project the entity is removed from *every* scope, so the preview
             # has to count every scope as well. Otherwise `dry_run` reports
             # "NOT FOUND" for a graph node that the real call deletes.
-            preview = graph.entity_delete_preview(entity_name, project)
+            # `project="global"` normalizes to None, so pass `every_scope`
+            # explicitly: an all-scope graph delete would remove the same
+            # entity node from unrelated project scopes too.
+            preview = graph.entity_delete_preview(
+                entity_name, project, every_scope=not explicit_scope)
             counts["entities"] = preview["entities"]
             counts["relations"] = preview["relations"]
             affected_scopes = preview["scopes"]
             if not dry_run:
-                graph.delete_entity(entity_name, project)
+                graph.delete_entity(entity_name, project,
+                                    every_scope=not explicit_scope)
 
             # Only the selected scope's memories: forgetting an entity in one
-            # project must not wipe the global facts of the same entity.
-            tables = (_all_mem_tables(cur) if not project
-                      else [_mem_table(project)])
+            # project (or in the shared scope) must not wipe the same entity's
+            # facts in another scope.
+            tables = ([_mem_table(project)] if explicit_scope
+                      else _all_mem_tables(cur))
             for tbl in dict.fromkeys(tables):
                 if not _table_exists(cur, tbl):
                     continue
@@ -3066,7 +3086,7 @@ def forget(
     if memory_ids:
         extra["bulk_results"] = bulk_results
     warnings: list[str] = []
-    if entity_name and not project:
+    if entity_name and not explicit_scope:
         extra["scopes_affected"] = affected_scopes
         if len(affected_scopes) > 1:
             warnings.append(

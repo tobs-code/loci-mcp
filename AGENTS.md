@@ -91,7 +91,10 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
   the scopes; pass `project` to select one. An explicit `project` — including
   the reserved `"global"` — bounds the lookup. `forget(memory_ids=[...])` is
   the bulk exception: without `project` it applies each id to every scope and
-  reports each in `bulk_results`.
+  reports each in `bulk_results`. A supersede target is the other exception:
+  when the id is active in both the write scope and global, the write-scope
+  row is replaced, the global row stays active, and a warning names the
+  precedence and the untouched row; `cross_scope_superseded` is not set.
 - `forget(entity=...)` removes the entity's graph node and memories from every
   scope unless `project` is given; with `project`, only that scope is touched.
   `forget(entity="*", project=...)` only empties that scope. `drop_project`
@@ -392,9 +395,11 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
   `contradictions.kept` with an executable directive.
 - `contradictions_report(resolve="newest")` supersedes the older memory of each
   same-entity pair by creation time (`touch` does not change the winner).
-  Cross-entity pairs, pairs below `resolve_min_confidence` (0.80) and pairs
-  without a shared content word stay active with a warning; `dry_run` reports
-  `would_resolve` without writing.
+  Cross-entity pairs, cross-scope pairs, pairs below `resolve_min_confidence`
+  (0.80) and pairs without a shared content word stay active with a warning
+  (`cross_scope: true` names a project/global pair); a same-scope resolve
+  updates only that pair's table through the scope-aware supersede helper, so
+  it closes `valid_to` too. `dry_run` reports `would_resolve` without writing.
 - The whole report scan runs on `budget_seconds` (default 40s), covering
   candidate loading and NLI. On exhaustion it stops, sets `budget_exhausted`
   and lists unjudged pairs in `nli_failures`; `nli_failures_count`/

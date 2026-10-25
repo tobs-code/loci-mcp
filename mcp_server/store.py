@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.db import get_conn
-from mcp_server.lifecycle import counts as lifecycle_counts
+from mcp_server.lifecycle import ACTIVE_ROW_SQL, counts as lifecycle_counts
 from mcp_server.scope_catalog import (
     _all_mem_tables,
     _mem_table,
@@ -312,6 +312,11 @@ class MemoryStore:
         fact stopped being true when it was replaced, and an `as_of` query for
         a later moment must not match it anymore. An existing `valid_to` is
         kept (COALESCE), so a deliberately backdated window is not widened.
+
+        Only ACTIVE rows are marked. This is the helper every ID-based
+        supersede path funnels through, so the active check belongs in the
+        statement as well as in the caller's lookup: a row forgotten or
+        invalidated between the two keeps its sentinel and stays restorable.
         """
         if target == "global":
             tables = ["memories"]
@@ -326,7 +331,7 @@ class MemoryStore:
             touched += self.execute(
                 f"UPDATE {table} SET superseded_by = %s, "
                 f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
-                f"WHERE id = %s",
+                f"WHERE id = %s AND {ACTIVE_ROW_SQL}",
                 (superseded_by, memory_id),
             )
         return touched
@@ -346,14 +351,19 @@ class MemoryStore:
     def supersede_many(self, memory_ids: list[str], superseded_by: str, *,
                        table: str | None = None,
                        project: str | None = None) -> int:
-        """Mark several rows of ONE table as replaced by the same id."""
+        """Mark ACTIVE rows of ONE table as replaced by the same id.
+
+        An inactive source is never rewritten: the merge caller validates the
+        whole set first, and the predicate keeps that promise if a row is
+        forgotten before this statement runs.
+        """
         target = table or _mem_table(project)
         if not memory_ids:
             return 0
         return self.execute(
             f"UPDATE {target} SET superseded_by = %s, "
             f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
-            f"WHERE id = ANY(%s)",
+            f"WHERE id = ANY(%s) AND {ACTIVE_ROW_SQL}",
             (superseded_by, list(memory_ids)),
         )
 

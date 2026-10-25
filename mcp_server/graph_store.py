@@ -950,11 +950,20 @@ class GraphStore:
     # -- mirror bookkeeping -------------------------------------------------
 
     def entity_delete_preview(self, name: str,
-                              project: str | None = None) -> dict:
-        """What a delete would touch: entity rows, scopes and relation rows."""
-        scope_clause = " AND project = %s" if project else ""
-        params: tuple[Any, ...] = ((name, _scope_key(project)) if project
-                                   else (name,))
+                              project: str | None = None, *,
+                              every_scope: bool | None = None) -> dict:
+        """What a delete would touch: entity rows, scopes and relation rows.
+
+        An explicit `project="global"` normalizes to `None`, so `project`
+        alone cannot distinguish "global only" from "no scope given"; the
+        caller passes `every_scope=False` to keep the preview on the shared
+        graph. The default keeps the historical all-scopes behaviour.
+        """
+        if every_scope is None:
+            every_scope = project is None
+        scope_clause = "" if every_scope else " AND project = %s"
+        params: tuple[Any, ...] = ((name,) if every_scope
+                                   else (name, _scope_key(project)))
         self.cur.execute(
             f"SELECT id, project FROM entities WHERE name = %s{scope_clause}",
             params,

@@ -100,6 +100,14 @@ the entity from every scope. `forget(query=...)` is a selector, not a sweep: it
 needs an explicit `project` (`"global"` for the shared table) and searches only
 that one table.
 
+A `supersede` target is the other exception. When the same id is active in the
+write scope **and** in global, the write-scope row is replaced and the global
+row stays active; the answer warns that the id was active in both scopes and
+that the write-scope row took precedence, and it does not set
+`cross_scope_superseded`. Only active rows are valid targets, so an inactive
+copy in the write scope does not hide an active row with the same id in the
+other scope. Pass an explicit `project` if you need the other row instead.
+
 ## The lifecycle of a project
 
 | Tool | Effect |

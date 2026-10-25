@@ -106,19 +106,22 @@ def _store_memory(
 
 
 def _supersede(cur, project: str | None, new_id: str, old_id: str) -> None:
-    """Mark old_id as superseded by new_id in the scoped and the global table."""
+    """Mark an ACTIVE old_id in the table that owns it.
+
+    The caller resolved old_id in that table (`project` is None for the shared
+    one). Ids are unique per scope, so updating both tables by id would
+    invalidate an unrelated row that merely shares the id (e.g. after an
+    import). The active predicate is part of the statement, not only of the
+    caller's lookup: a row forgotten between resolution and this update keeps
+    its sentinel and stays restorable.
+    """
     table = _mem_table(project)
     cur.execute(
         f"UPDATE {table} SET superseded_by = %s, "
-        f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() WHERE id = %s",
+        f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
+        f"WHERE id = %s AND {ACTIVE_ROW_SQL}",
         (new_id, old_id),
     )
-    if project:
-        cur.execute(
-            "UPDATE memories SET superseded_by = %s, "
-            "valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() WHERE id = %s",
-            (new_id, old_id),
-        )
 
 
 def _deduplicate(cur, content: str, project: str | None,
@@ -137,7 +140,8 @@ def _find_near_duplicate(cur, content: str, project: str | None,
                                exclude_id)
 
 
-def _scope_of_id(cur, memory_id: str, store_project: str | None) -> str | None:
+def _scope_of_id(cur, memory_id: str, store_project: str | None,
+                 *, active_only: bool = False) -> str | None:
     """Which scope holds `memory_id`: "project", "global" or None (nowhere).
 
     `supersede=<id>` and a contradiction candidate can name a memory of a
@@ -145,13 +149,21 @@ def _scope_of_id(cur, memory_id: str, store_project: str | None) -> str | None:
     that invalidates a shared (global) fact hides that fact in EVERY scope,
     which the response has to say - this function tells the caller when that
     happened. Ids are unique per scope, so the store table is checked first.
+
+    `active_only` is for target selection: an inactive row with the same id
+    must not hide the active row in the other table. Every supersede target is
+    resolved BEFORE the row is marked, with this flag on, and the same answer
+    drives both the UPDATE and the cross-scope report. Without it the check is
+    an existence probe ("which table still holds the row").
     """
+    active = f" AND {ACTIVE_ROW_SQL}" if active_only else ""
     if store_project:
-        cur.execute(f"SELECT 1 FROM {_mem_table(store_project)} WHERE id = %s",
-                    (memory_id,))
+        cur.execute(
+            f"SELECT 1 FROM {_mem_table(store_project)} WHERE id = %s{active}",
+            (memory_id,))
         if cur.fetchone():
             return "project"
-    cur.execute("SELECT 1 FROM memories WHERE id = %s", (memory_id,))
+    cur.execute(f"SELECT 1 FROM memories WHERE id = %s{active}", (memory_id,))
     return "global" if cur.fetchone() else None
 
 
@@ -207,23 +219,48 @@ def _find_superseded_match(
 
 
 def _find_by_id(cur, memory_id: str, project: str | None) -> str | None:
-    """Id of an existing memory, in the target scope or in the global one.
+    """Id of an ACTIVE memory, in the target scope or in the global one.
 
-    `supersede=<id>` names a memory directly. Without this check the id is
-    accepted blindly and the response reports a replacement that never
-    happened.
+    `supersede=<id>` names a memory directly. Only an active row may be
+    replaced: a soft-forgotten, superseded or expired row is already hidden,
+    and writing a real supersede id over its forgotten sentinel would make a
+    later restore report success while the row stays invalidated.
     """
     if not memory_id:
         return None
     table = _mem_table(project)
-    cur.execute(f"SELECT id FROM {table} WHERE id = %s", (memory_id,))
+    cur.execute(f"SELECT id FROM {table} WHERE id = %s AND {ACTIVE_ROW_SQL}",
+                (memory_id,))
     if cur.fetchone():
         return memory_id
     if project:
-        cur.execute("SELECT id FROM memories WHERE id = %s", (memory_id,))
+        cur.execute(f"SELECT id FROM memories WHERE id = %s "
+                    f"AND {ACTIVE_ROW_SQL}", (memory_id,))
         if cur.fetchone():
             return memory_id
     return None
+
+
+def _id_active_in_both_scopes(cur, memory_id: str,
+                              project: str | None) -> bool:
+    """True when an active project row and an active global row share the id.
+
+    `_find_by_id` resolves the project row first. That precedence is fine for
+    an inactive shadow copy, but two ACTIVE rows are genuinely ambiguous: a
+    supersede would silently leave the other scope's fact active.
+    """
+    if not project or not memory_id:
+        return False
+    cur.execute(
+        f"SELECT 1 FROM {_mem_table(project)} WHERE id = %s "
+        f"AND {ACTIVE_ROW_SQL}",
+        (memory_id,))
+    if not cur.fetchone():
+        return False
+    cur.execute(
+        f"SELECT 1 FROM memories WHERE id = %s AND {ACTIVE_ROW_SQL}",
+        (memory_id,))
+    return cur.fetchone() is not None
 
 
 def _find_by_content(cur, content: str, project: str | None,

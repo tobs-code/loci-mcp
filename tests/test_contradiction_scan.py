@@ -13,6 +13,8 @@ from mcp_server.contradiction_scan import (
     ContradictionScan,
     Judgement,
     Neighbour,
+    ResolutionDecision,
+    ResolutionPlan,
     ScanReport,
     apply_resolution,
     judge_candidates,
@@ -110,13 +112,16 @@ def test_scores_below_the_threshold_are_not_pairs():
 
 
 def _pair(a: str, b: str, *, confidence: float = 0.95,
-          cross_entity: bool = False,
+          cross_entity: bool = False, cross_scope: bool = False,
           a_content: str = "relay is enabled",
           b_content: str = "relay is not enabled") -> dict:
     return {
-        "a": {"id": a, "content": a_content, "entity": "Relay"},
-        "b": {"id": b, "content": b_content, "entity": "Relay"},
+        "a": {"id": a, "content": a_content, "entity": "Relay",
+              "project": "global"},
+        "b": {"id": b, "content": b_content, "entity": "Relay",
+              "project": "other" if cross_scope else "global"},
         "cross_entity": cross_entity,
+        "cross_scope": cross_scope,
         "confidence": confidence,
     }
 
@@ -163,8 +168,8 @@ def test_real_resolution_updates_only_the_older_row():
     class _Db:
         cur = None
 
-        def execute(self, sql, params):
-            calls.append((sql, params))
+        def mark_superseded(self, older, newer, *, project, target):
+            calls.append((older, newer, project, target))
             return 1
 
     report = ScanReport(pairs=[_pair("a", "b")],
@@ -175,19 +180,37 @@ def test_real_resolution_updates_only_the_older_row():
     resolved, would_resolve = apply_resolution(plan, _Db(), None)
 
     assert (resolved, would_resolve) == (1, 0)
-    assert _updates_only_older(calls, older="a", newer="b")
+    assert calls == [("a", "b", None, "global")]
     assert report.pairs[0]["resolution"] == {"superseded": "a", "kept": "b"}
 
 
-def _updates_only_older(calls, *, older: str, newer: str) -> bool:
-    if not calls:
-        return False
-    for sql, params in calls:
-        if "superseded_by = %s" not in sql:
-            return False
-        if params != (newer, older):
-            return False
-    return True
+def test_apply_defensively_refuses_a_manual_cross_scope_decision():
+    calls: list[tuple] = []
+
+    class _Db:
+        cur = None
+
+        def mark_superseded(self, older, newer, *, project, target):
+            calls.append((older, newer, project, target))
+            return 1
+
+    pair = _pair("a", "b", cross_scope=True)
+    plan = ResolutionPlan(decisions=[ResolutionDecision(pair, "a", "b")])
+    resolved, would_resolve = apply_resolution(plan, _Db(), None)
+
+    assert (resolved, would_resolve) == (0, 0)
+    assert calls == []
+    assert pair["resolution"]["skipped"] == "cross_scope"
+
+
+def test_cross_scope_pairs_are_reported_but_never_resolved():
+    report = ScanReport(pairs=[_pair("a", "b", cross_scope=True)],
+                        timestamps={"a": 1, "b": 2})
+    plan = plan_resolution(
+        report, resolve="newest", min_confidence=0.8, dry_run=False)
+
+    assert plan.decisions == []
+    assert any("cross-scope" in w for w in plan.warnings)
 
 
 def test_already_invalidated_older_row_is_skipped_twice_in_one_plan():

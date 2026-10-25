@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from mcp_server.duplicates import shared_content_word as _shares_subject
 from mcp_server.lifecycle import ACTIVE_ROW_SQL, NOT_RELATION_CONTEXT_SQL
-from mcp_server.scope_catalog import _retrieval_tables
+from mcp_server.scope_catalog import _retrieval_tables, _scope_of_table
 
 if TYPE_CHECKING:
     from mcp_server.store import MemoryStore
@@ -96,6 +96,7 @@ class Neighbour:
     distance: float | None
     created_at: Any = None
     updated_at: Any = None
+    project: str | None = None
 
 
 @dataclass
@@ -191,6 +192,7 @@ def nearest_active(
         remaining = limit if per_table else limit - len(rows)
         if remaining <= 0:
             break
+        table_scope = _scope_of_table(cur, table)
 
         conditions: list[str] = []
         params: list[Any] = []
@@ -238,6 +240,7 @@ def nearest_active(
                 distance=None if distance is None else float(distance),
                 created_at=created_at,
                 updated_at=updated_at,
+                project=table_scope,
             ))
             if not per_table and len(rows) >= limit:
                 break
@@ -482,14 +485,19 @@ def _entities_differ(a: str | None, b: str | None) -> bool:
 
 def _contradiction_pair(fact: dict, neighbour: Neighbour,
                         judge: Judge) -> dict:
+    a_scope = fact.get("_project") or "global"
+    b_scope = neighbour.project or "global"
     return {
         "a": {"id": fact["id"], "content": fact["content"],
-              "entity": fact.get("entity")},
+              "entity": fact.get("entity"), "project": a_scope},
         "b": {"id": neighbour.id, "content": neighbour.content,
-              "entity": neighbour.entity},
+              "entity": neighbour.entity, "project": b_scope},
         # Same entity (or both untagged) -> a recency-based resolution is
         # meaningful. Different entities -> two different subjects.
         "cross_entity": _entities_differ(fact.get("entity"), neighbour.entity),
+        # A report can read both a project and the shared scope, but recency
+        # alone does not say that one scope may invalidate the other.
+        "cross_scope": a_scope != b_scope,
         "confidence": round(judge.score, 3),
     }
 
@@ -621,11 +629,19 @@ def plan_resolution(
 
     resolvable: list[dict] = []
     skipped_cross = 0
+    skipped_scope = 0
     skipped_subject = 0
     skipped_weak = 0
     for pair in report.pairs:
         if pair.get("cross_entity"):
             skipped_cross += 1
+            continue
+        if pair.get("cross_scope"):
+            # The report reads a project plus the shared scope, but neither
+            # scope owns the other: invalidating a global fact from a
+            # project-wide maintenance pass (or vice versa) needs a write
+            # that names the cross-scope intent explicitly.
+            skipped_scope += 1
             continue
         if pair.get("confidence", 0.0) < min_confidence:
             skipped_weak += 1
@@ -645,6 +661,12 @@ def plan_resolution(
             f"the two facts belong to different entities, so recency does "
             f"not decide which one survives - inspect them manually or "
             f"re-run with an entity filter")
+    if skipped_scope:
+        warnings.append(
+            f"resolve skipped for {skipped_scope} cross-scope pair(s): the "
+            f"two facts live in different scopes, so this report does not "
+            f"invalidate one scope from another - inspect them manually and "
+            f"supersede the intended fact with an explicit write")
     if skipped_subject:
         warnings.append(
             f"resolve skipped for {skipped_subject} pair(s) without a "
@@ -684,8 +706,10 @@ def apply_resolution(
     """Execute a decided plan; return (resolved, would_resolve).
 
     A dry run touches no database at all. A real run updates only the older
-    row of each decision and reports a decision whose row was already
-    invalidated as skipped.
+    row, in the table the pair came from, through `mark_superseded` so the
+    validity window closes exactly like an explicit write. A pair from two
+    different scopes is never resolved here; `plan_resolution` already marks
+    it skipped.
     """
     resolved = 0
     would_resolve = 0
@@ -704,18 +728,33 @@ def apply_resolution(
                 would_resolve += 1
         return resolved, would_resolve
 
-    tables = _retrieval_tables(db.cur, project)
     for decision in plan.decisions:
         if decision.skip_reason:
             decision.pair["resolution"] = _skipped_resolution(decision)
             continue
-        changed = 0
-        for table in tables:
-            changed += db.execute(
-                f"UPDATE {table} SET superseded_by = %s, "
-                "updated_at = NOW() WHERE id = %s "
-                "AND superseded_by IS NULL AND deleted_at IS NULL",
-                (decision.newer, decision.older))
+        pair = decision.pair
+        older_side = (pair["a"] if decision.older == pair["a"]["id"]
+                      else pair["b"])
+        newer_side = (pair["b"] if older_side is pair["a"] else pair["a"])
+        older_scope = older_side.get("project")
+        newer_scope = newer_side.get("project")
+        if older_scope and newer_scope and older_scope != newer_scope:
+            # Defense in depth: a manually assembled plan must not bypass the
+            # scope rule either. `plan_resolution` already skips such pairs.
+            decision.skip_reason = "cross_scope"
+            pair["resolution"] = _skipped_resolution(decision, plan.dry_run)
+            continue
+        if older_scope:
+            scope_project = None if older_scope == "global" else older_scope
+            target = "global" if older_scope == "global" else "project"
+        else:
+            # A manually built plan may predate the scope annotation. Fall
+            # back to the scope the scan was asked for, never to every table.
+            scope_project = project
+            target = "global" if project is None else "project"
+        changed = db.mark_superseded(
+            decision.older, decision.newer,
+            project=scope_project, target=target)
         if changed:
             resolved += 1
             decision.pair["resolution"] = {

@@ -391,7 +391,8 @@ and warns about the broader comparison, so it is never silent.
    visible and machine readable. Narrow the scan (`entity`, lower `limit`)
    or raise the budget to check more.
 5. Pairs with a confidence of 0.7 or higher count as a contradiction. Each pair names
-   the entity of both facts and a `cross_entity` flag.
+   the entity and scope (`project`) of both facts plus the `cross_entity` and
+   `cross_scope` flags.
 6. `resolve="newest"` (opt-in) keeps the most recently **created** memory of
    each pair of the **same entity** active and supersedes the older one (a
    decay `touch` does not change the decision); the
@@ -404,6 +405,15 @@ and warns about the broader comparison, so it is never silent.
    resolve destroyed the innocent Inference fact). Cross-entity pairs stay
    active, carry `cross_entity: true` and the scan warns
    `resolve skipped for N cross-entity pair(s) ...`.
+
+   **Cross-scope pairs are never auto-resolved either.** A project scan also
+   reads the shared scope, but neither scope owns the other, so recency is not
+   authority to invalidate one from a maintenance pass. Such pairs carry
+   `cross_scope: true`, stay active and the scan warns
+   `resolve skipped for N cross-scope pair(s) ...`; use an explicit write
+   naming the intended supersede target instead. A same-scope resolution
+   updates only that pair's table through `mark_superseded`, so it also closes
+   `valid_to` and cannot touch a same-id copy in another scope.
 
 The quality of the detection depends on the embedding model
 (`jina-embeddings-v5`), which provides good similarity values for semantically
