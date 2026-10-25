@@ -1,7 +1,7 @@
 # Loci — Memory Server for AI Agents
 
 An MCP server that gives an agent a **persistent memory**: vector search over
-PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 28 tools to write,
+PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 29 tools to write,
 read, connect and forget.
 
 - **Hybrid retrieval** — vector similarity *and* full-text search, so both
@@ -123,8 +123,8 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 | `drop_project` | Remove a project scope completely |
 | `server_health` | Check Postgres and the inference API |
 
-`MCP_TOOLSET=core` exposes only the 16 daily read/write/graph tools; the
-default `full` exposes all 28.
+`MCP_TOOLSET=core` exposes only the 17 daily read/write/graph tools; the
+default `full` exposes all 29.
 
 There is also one resource, `memory://stats`, with the memory, entity and
 relation counts plus the health of the services.

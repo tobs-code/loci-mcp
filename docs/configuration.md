@@ -14,7 +14,7 @@
 | `MCP_AUTH_TOKEN` | - (required for HTTP) | Shared bearer token; every HTTP request must send `Authorization: Bearer <token>` |
 | `MCP_ALLOW_INSECURE_HTTP` | `false` | Allow an unauthenticated non-loopback HTTP bind. Sandbox only; never in production |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary; invalid names fall back to `english` |
-| `MCP_TOOLSET` | `full` | `full` (28 tools) or `core` (16 daily read/write/graph tools); an unknown value warns and falls back to `full` |
+| `MCP_TOOLSET` | `full` | `full` (29 tools) or `core` (17 daily read/write/graph tools); an unknown value warns and falls back to `full` |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu` or `cuda`; `cuda` still falls back if no device is visible |
 | `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | Build arg for the inference image; use `https://download.pytorch.org/whl/cpu` for a CPU-only image |
 | `RERANK_ENABLED` | `true` | Local cross-encoder reranking of ambiguous first-stage results |
@@ -65,8 +65,9 @@ start while it is empty.
 
 ## LLM providers
 
-`/nli` uses one provider at a time. The default is Groq; the legacy
-`GROQ_API_KEY`/`GROQ_MODEL` variables keep working.
+`/nli` uses one provider at a time. The default is `none`; the legacy
+`GROQ_API_KEY`/`GROQ_MODEL` variables keep working and still select Groq when
+`LLM_PROVIDER` is omitted.
 
 | Provider | Default model | Default endpoint |
 |----------|---------------|------------------|

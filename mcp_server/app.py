@@ -176,8 +176,8 @@ TOOLS BY TASK
   `export_memories`, `import_memories`, `verify_integrity`, `prune_memories`,
   `drop_project`.
 
-`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (16 tools);
-the default `full` exposes all 28 (batch, backup and repair included).
+`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (17 tools);
+the default `full` exposes all 29 (batch, backup and repair included).
 
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.
