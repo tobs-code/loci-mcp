@@ -31,7 +31,8 @@ unchanged.
 The JSON format (version `0.4`, `"type": "memory_export"`) contains IDs,
 `superseded_by`, TTL (`expires_at`), the validity window (`valid_from`,
 `valid_to`), provenance (`source`, `agent_id`, `confidence`), `tags`,
-`deleted_at`, timestamps, `access_count`, the project of every record and the
+`deleted_at`, `hard_deleted_at` (the purge deadline of a staged hard delete),
+timestamps, `access_count`, the project of every record and the
 complete graph (entities with scope plus relations with weight, scope and —
 when one was stored — the relation's `context` sentence). The memory type is
 written only as `mem_type`; the duplicate `type` key of version 0.3 is gone, so

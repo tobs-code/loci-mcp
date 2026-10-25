@@ -53,17 +53,19 @@ Graph tools use the global graph when `project` is omitted.
 ## Which tools accept `project`
 
 `remember`, `remember_batch`, `update_memory`, `update_batch`,
-`get_entity`, `list_entities`, `list_memories`, `recall`,
+`get_entity`, `get_entities`, `list_entities`, `list_memories`, `recall`,
 `init_context`,
-`relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
-`list_relations`, `forget`, `contradictions_report`, `export_memories`,
-`import_memories`, `drop_project`.
+`relate`, `relate_batch`, `unrelate`, `delete_entity`, `find_connections`,
+`find_paths`, `list_relations`, `forget`, `contradictions_report`,
+`export_memories`, `import_memories`, `drop_project`, `prune_memories`.
 
 The read defaults differ per tool and are listed in
 [Retrieval & Scoring](retrieval.md#read-scope-defaults). For `init_context`,
 `recall`, `list_memories` and `list_entities`, `project="*"` selects every
-scope at once. `get_entity` rejects `"*"`: its answer describes exactly one
-entity.
+scope at once. `get_entity`, `get_entities` and `delete_entity` reject `"*"`:
+their answers describe exactly one entity (or one graph node). `get_entities`
+can still span scopes in one call: each entry is either a name (tool-level
+`project`) or `{"entity": ..., "project": ...}`.
 
 A project that does not exist is never silently ignored: `recall`,
 `list_memories`, `list_entities` and `init_context` fall back to the global
@@ -94,7 +96,9 @@ With `project` the call is unambiguous, and the answer reports the scope that
 was changed. The bulk form `forget(memory_ids=[...])` is different: each id is
 validated individually and, without `project`, applied to every scope; the
 answer reports every id in `bulk_results`. `forget(entity=...)` keeps removing
-the entity from every scope.
+the entity from every scope. `forget(query=...)` is a selector, not a sweep: it
+needs an explicit `project` (`"global"` for the shared table) and searches only
+that one table.
 
 ## The lifecycle of a project
 
@@ -102,6 +106,7 @@ the entity from every scope.
 |------|--------|
 | `init_context(project="*")` | Lists every scope with its own `project_stats` entry (`memories`, `total_memories`, `superseded_memories`, `forgotten_memories`, `entities` and `relations`). |
 | `forget(entity="*", project=…)` | **Empties** the scope: memories, graph nodes and mirror rows are removed, the scope itself survives. The shared scope is addressed with `project="global"`. |
+| `prune_memories(project=…)` | Permanently removes only inactive rows of that one scope; pass `all_scopes=true` to cover every table. It no longer prunes every scope implicitly. |
 | `drop_project(project=…)` | **Removes** the scope completely: memory table, registry entry, graph nodes and mirror rows. `dry_run=true` previews the counts. `global` is refused. |
 
 `forget(entity="*", project="global")` empties the shared global scope the
