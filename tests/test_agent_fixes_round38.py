@@ -29,8 +29,10 @@ def test_compile_context_respects_a_tight_budget():
         remember(f"Round38 long fact {index}: " + "detail " * 400,
                  project=PROJECT)
 
+    # truncation test, diversity intentionally off: MMR would reorder/collapse
+    # and change which hits reach the budget.
     result = compile_context("Round38 long fact", project=PROJECT,
-                             max_tokens=256)
+                             max_tokens=256, diversity=0.0)
 
     assert result["ok"] is True
     assert result["used_tokens"] <= 256

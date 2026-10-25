@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -65,6 +66,7 @@ from mcp_server.scope import (
 from mcp_server.scope_catalog import (
     _all_mem_tables,
     _count_entities,
+    _mem_table,
     _norm_entity,
     _project_names,
     _scope_key,
@@ -2329,6 +2331,113 @@ def init_context(project: Annotated[
     )
 
 
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two vectors; 0.0 when either is degenerate."""
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def _diversify_context(
+    hits: list[dict],
+    *,
+    diversity: float,
+    max_per_entity: int | None,
+) -> tuple[list[dict], int, int]:
+    """Apply the entity cap and MMR diversity to the ranked hits.
+
+    Pins are an always-include promise: they are never dropped by the entity
+    cap nor by MMR (they still count toward the cap). Returns
+    (ordered_hits, dropped_by_entity_cap, dropped_by_diversity); a near
+    duplicate (identical content hash or cosine >= 0.95) of an already kept
+    row is collapsed and counted as diversity.
+    """
+    dropped_cap = 0
+    entity_counts: dict[str, int] = {}
+    kept: list[dict] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        is_pin = bool(hit.get("_pinned"))
+        entity = hit.get("entity")
+        if (max_per_entity is not None and entity is not None and not is_pin
+                and entity_counts.get(entity, 0) >= max_per_entity):
+            dropped_cap += 1
+            continue
+        if entity is not None:
+            entity_counts[entity] = entity_counts.get(entity, 0) + 1
+        kept.append(hit)
+
+    # `diversity=0` must be a strict no-op: the hash collapse below is part of
+    # the diversity feature, so it only runs when diversity is on.
+    if diversity <= 0:
+        return kept, dropped_cap, 0
+
+    dropped_div = 0
+    collapsed: list[dict] = []
+    seen_hashes: set[str] = set()
+    for hit in kept:
+        content_hash = hit.get("content_hash")
+        if (content_hash and content_hash in seen_hashes
+                and not hit.get("_pinned")):
+            dropped_div += 1
+            continue
+        if content_hash:
+            seen_hashes.add(content_hash)
+        collapsed.append(hit)
+
+    pins = [h for h in collapsed if h.get("_pinned")]
+    rest = [h for h in collapsed if not h.get("_pinned")]
+    vectors: dict[str, list[float]] = {}
+    ids = [h.get("id") for h in rest if h.get("id")]
+    if ids:
+        tables: list[str] = []
+        for hit in rest:
+            table = _mem_table(hit.get("_project") or hit.get("project"))
+            if table not in tables:
+                tables.append(table)
+        store = MemoryStore()
+        try:
+            vectors = fetch_embeddings(store.cur, tables, ids)
+        except Exception:
+            vectors = {}
+        finally:
+            store.close()
+
+    ordered: list[dict] = []
+    chosen: list[list[float]] = []
+    remaining = list(rest)
+    while remaining:
+        best_idx = 0
+        best_score: float | None = None
+        for i, row in enumerate(remaining):
+            relevance = float(row.get("_relevance_score") or 0.0)
+            vec = vectors.get(str(row.get("id")))
+            penalty = 0.0
+            if vec is not None and chosen:
+                penalty = max(_cosine(vec, cv) for cv in chosen)
+            score = (1.0 - diversity) * relevance - diversity * penalty
+            if best_score is None or score > best_score:
+                best_score = score
+                best_idx = i
+        hit = remaining.pop(best_idx)
+        vec = vectors.get(str(hit.get("id")))
+        if vec is not None and any(_cosine(vec, cv) >= 0.95 for cv in chosen):
+            dropped_div += 1
+            continue
+        ordered.append(hit)
+        if vec is not None:
+            chosen.append(vec)
+    return pins + ordered, dropped_cap, dropped_div
+
+
 def compile_context(
     query: Annotated[
         str,
@@ -2400,12 +2509,44 @@ def compile_context(
         float | None,
         Field(description="Only memories with a confidence at or above this "
                           "value (0.0-1.0).")] = None,
+    include_pinned: Annotated[
+        bool,
+        Field(description="True (default) puts the scope's pinned memories at "
+                          "the top of the context (they satisfy the structural "
+                          "filters but no relevance or decay floor). Items "
+                          "carry `pinned: true` and the answer adds "
+                          "`pinned_included`.")] = True,
+    min_relevance: Annotated[
+        float | None,
+        Field(description="Drop matches below this combined `_relevance_score` "
+                          "(0.0-1.0) before packing. Pins are never dropped. "
+                          "Null (default) keeps every hit the search returned.")] = None,
+    min_similarity: Annotated[
+        float | None,
+        Field(description="Vector similarity floor passed to the internal "
+                          "search (default 0.30, just above the embedding "
+                          "noise floor). Null disables it.")] = 0.30,
+    diversity: Annotated[
+        float,
+        Field(description="MMR diversity weight (0.0-1.0, default 0.3: the "
+                          "block prefers results unlike the ones already "
+                          "chosen, and near-duplicates (identical content hash "
+                          "or cosine >= 0.95) are collapsed). 0.0 is a strict "
+                          "no-op that reproduces the plain ranking.")] = 0.3,
+    max_per_entity: Annotated[
+        int | None,
+        Field(description="Cap on how many memories one entity may contribute "
+                          "(default None = no cap). Pins count toward the cap "
+                          "but are never evicted by it.")] = None,
 ) -> dict[str, Any]:
     """Assemble a token-bounded context block from ranked memories.
 
     Runs the same hybrid search as `recall` (same scope, filter and dedupe
     semantics), then packs the hits in ranking order into one text block that
-    never exceeds `max_tokens`. The estimate is conservative (about four
+    never exceeds `max_tokens`. With `include_pinned` (default) the pinned
+    facts go first. With `diversity` (default 0.3) near-duplicates collapse and
+    the block prefers hits unlike the ones already chosen; `max_per_entity`
+    caps one entity's contribution. The estimate is conservative (about four
     characters per token plus a fixed per-item overhead), so callers get a
     context they can paste into a prompt without blowing its budget.
     """
@@ -2419,6 +2560,23 @@ def compile_context(
                         "max_tokens must be between 256 and 32000")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             return fail(STATUS_ERROR, "limit must be a positive integer")
+        for name, value in (("min_relevance", min_relevance),
+                            ("min_similarity", min_similarity)):
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, (int, float))
+                                      or not 0.0 <= value <= 1.0):
+                return fail(STATUS_ERROR,
+                            f"{name} must be between 0.0 and 1.0")
+        if (isinstance(diversity, bool)
+                or not isinstance(diversity, (int, float))
+                or not 0.0 <= diversity <= 1.0):
+            return fail(STATUS_ERROR, "diversity must be between 0.0 and 1.0")
+        if max_per_entity is not None and (
+                isinstance(max_per_entity, bool)
+                or not isinstance(max_per_entity, int)
+                or max_per_entity < 1):
+            return fail(STATUS_ERROR,
+                        "max_per_entity must be a positive integer")
         search = recall(
             query=query,
             project=project,
@@ -2438,6 +2596,9 @@ def compile_context(
             source=source,
             agent_id=agent_id,
             min_confidence=min_confidence,
+            include_pinned=include_pinned,
+            min_relevance=min_relevance,
+            min_similarity=min_similarity,
             detail="full",
         )
         if not search.get("ok"):
@@ -2446,6 +2607,18 @@ def compile_context(
         return fail(STATUS_ERROR, str(e))
 
     hits = search.get("results") or []
+    if include_pinned:
+        # Pins are an always-include promise: they lead the context block so a
+        # token cut can never drop them behind a ranked hit.
+        hits = ([h for h in hits if isinstance(h, dict) and h.get("_pinned")]
+                + [h for h in hits
+                   if not (isinstance(h, dict) and h.get("_pinned"))])
+
+    dropped_by_entity_cap = 0
+    dropped_by_diversity = 0
+    if diversity > 0 or max_per_entity is not None or include_pinned:
+        hits, dropped_by_entity_cap, dropped_by_diversity = _diversify_context(
+            hits, diversity=diversity, max_per_entity=max_per_entity)
     # A fixed overhead covers the header line, separators and the tokenizer's
     # per-message cost; the content estimate stays deliberately pessimistic so
     # the block never overruns max_tokens.
@@ -2483,6 +2656,7 @@ def compile_context(
             "entity": hit.get("entity"),
             "mem_type": hit.get("mem_type"),
             "project": hit.get("project"),
+            "pinned": bool(hit.get("_pinned")),
             "_relevance_score": hit.get("_relevance_score"),
             "_final_score": hit.get("_final_score"),
         })
@@ -2499,6 +2673,19 @@ def compile_context(
         warnings.append(
             f"context truncated at {max_tokens} tokens; "
             f"{len(hits) - len(items)} memory/memories did not fit")
+    pinned_included = sum(1 for item in items if item.get("pinned"))
+    dropped_pins = (sum(1 for h in hits
+                        if isinstance(h, dict) and h.get("_pinned"))
+                    - pinned_included)
+    if dropped_pins > 0:
+        truncated = True
+        warnings.append(
+            f"{dropped_pins} pinned memory/memories did not fit the "
+            f"{max_tokens}-token budget; raise max_tokens to include them")
+    if any(hit.get("_pinned") for hit in hits) and not include_pinned:
+        warnings.append(
+            "pinned memories exist in the scope but include_pinned=false "
+            "was requested; they are not forced into the context")
     context = "\n\n".join(blocks)
     return ok(
         STATUS_OK,
@@ -2508,6 +2695,12 @@ def compile_context(
         used_tokens=used,
         max_tokens=max_tokens,
         truncated=truncated,
+        pinned_included=pinned_included,
+        dropped_by_relevance=search.get("dropped_by_relevance"),
+        dropped_by_similarity=search.get("dropped_by_similarity"),
+        dropped_by_diversity=dropped_by_diversity,
+        dropped_by_entity_cap=dropped_by_entity_cap,
+        diversity=diversity,
         candidates=search.get("candidates"),
         scopes_searched=search.get("scopes_searched"),
         warnings=warnings,

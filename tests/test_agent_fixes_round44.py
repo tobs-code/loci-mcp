@@ -182,6 +182,38 @@ def test_list_memories_rejects_unknown_order():
 # compile_context: pins lead the block
 # ---------------------------------------------------------------------------
 
+def test_compile_context_leads_with_pins_and_reports_them():
+    forget(entity="*", project="round44-compile", soft=False, dry_run=False)
+    pin = remember("Round44 compile pin: the runbook is RB-9",
+                   project="round44-compile", pinned=True)
+    remember("Round44 compile ranked: the runbook is RB-1",
+             project="round44-compile")
+    assert pin["ok"]
+
+    compiled = compile_context("Round44 compile runbook", project="round44-compile")
+    assert compiled["ok"] is True
+    assert compiled["items"][0]["id"] == pin["id"]
+    assert compiled["items"][0]["pinned"] is True
+    assert compiled["pinned_included"] >= 1
+
+
+def test_compile_context_can_disable_pins():
+    forget(entity="*", project="round44-compile", soft=False, dry_run=False)
+    pin = remember("Zeppelin backup window is 03:00 daily",
+                   project="round44-compile", pinned=True)
+    remember("Round44 compile off: the secret is S-2",
+             project="round44-compile")
+
+    compiled = compile_context("Round44 compile off secret",
+                               project="round44-compile", include_pinned=False)
+    assert pin["id"] not in [i["id"] for i in compiled["items"]]
+    assert compiled["pinned_included"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Backup round-trip
+# ---------------------------------------------------------------------------
+
 def test_export_import_preserves_pinned():
     forget(entity="*", project="round44-export", soft=False, dry_run=False)
     forget(entity="*", project="round44-import", soft=False, dry_run=False)
@@ -201,3 +233,76 @@ def test_export_import_preserves_pinned():
 # Bug 3: the exact-match path must not flatten `_relevance_score`
 # ---------------------------------------------------------------------------
 
+def test_diversity_is_on_by_default_and_collapses_near_duplicates():
+    forget(entity="*", project="round44-div", soft=False, dry_run=False)
+    # Identical content with exact dedupe disabled: the rows must survive the
+    # write, then the DEFAULT diversity step collapses the copies.
+    for _ in range(5):
+        remember("Round44 div probe: the value is 42", project="round44-div",
+                 dedupe="off")
+    remember("Round44 div probe sibling: the value is 7",
+             project="round44-div")
+
+    compiled = compile_context("Round44 div probe value",
+                               project="round44-div")
+    assert compiled["ok"] is True
+    assert compiled["diversity"] == 0.3
+    assert compiled["dropped_by_diversity"] >= 1
+    assert compiled["count"] < 6
+
+
+def test_diversity_zero_is_a_strict_noop():
+    forget(entity="*", project="round44-div", soft=False, dry_run=False)
+    for _ in range(4):
+        remember("Round44 div off probe: the value is 42",
+                 project="round44-div", dedupe="off")
+
+    compiled = compile_context("Round44 div off probe value",
+                               project="round44-div", diversity=0.0)
+    assert compiled["ok"] is True
+    assert compiled["dropped_by_diversity"] == 0
+    assert compiled["count"] == 4
+
+
+def test_max_per_entity_caps_one_entity_but_not_another():
+    forget(entity="*", project="round44-cap", soft=False, dry_run=False)
+    for index in range(3):
+        remember(f"Round44 cap probe alpha {index}", project="round44-cap",
+                 entity="Round44-CapA")
+    remember("Round44 cap probe beta", project="round44-cap",
+             entity="Round44-CapB")
+
+    compiled = compile_context("Round44 cap probe", project="round44-cap",
+                               max_per_entity=1)
+    assert compiled["ok"] is True
+    assert compiled["dropped_by_entity_cap"] >= 1
+    entities = [item["entity"] for item in compiled["items"]]
+    assert entities.count("Round44-CapA") <= 1
+
+
+def test_context_pins_are_never_evicted_by_the_entity_cap():
+    forget(entity="*", project="round44-cap", soft=False, dry_run=False)
+    for index in range(3):
+        remember(f"Round44 cap pin probe {index}", project="round44-cap",
+                 entity="Round44-PinA", pinned=(index == 0))
+    remember("Round44 cap pin probe plain", project="round44-cap",
+             entity="Round44-PinA")
+
+    compiled = compile_context("Round44 cap pin probe", project="round44-cap",
+                               max_per_entity=1)
+    ids = [item["id"] for item in compiled["items"]]
+    assert compiled["pinned_included"] >= 1
+    assert any(item["pinned"] for item in compiled["items"])
+    assert ids  # the pin survived the cap
+
+
+def test_context_rejects_bad_diversity_and_cap():
+    bad_div = compile_context("Round44 validation", project=PROJECT,
+                              diversity=1.5)
+    assert bad_div["ok"] is False
+    assert "diversity" in bad_div["error"]
+
+    bad_cap = compile_context("Round44 validation", project=PROJECT,
+                              max_per_entity=0)
+    assert bad_cap["ok"] is False
+    assert "max_per_entity" in bad_cap["error"]

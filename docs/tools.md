@@ -277,9 +277,9 @@ nothing.
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `min_relevance`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `min_relevance`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `metadata_filter`, `offset`, `include_pinned`; hidden hits carry `forgotten`/`expired` markers |
 | `recall_batch` | Run 1-25 independent searches in one call; `queries`, shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `as_of`/`tags`/`tags_any`/`source`/`agent_id`/`min_confidence`, `fields`, `detail`; each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched` |
-| `compile_context` | Ranked, token-bounded context block for a prompt: `query`, `project`, `include_global`, `max_tokens` (256-32000), `limit`, `entity`, `metadata_filter`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `hybrid`, `include_decay`, `graph_boost`/`graph_entity`; reports `context`, `items`, `used_tokens`, `truncated` |
+| `compile_context` | Ranked, token-bounded context block for a prompt: `query`, `project`, `include_global`, `max_tokens` (256-32000), `limit`, `entity`, `metadata_filter`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `hybrid`, `include_decay`, `graph_boost`/`graph_entity`, `include_pinned` (default true), `min_relevance`/`min_similarity`, `diversity` (MMR, default 0), `max_per_entity` (default none); reports `context`, `items`, `used_tokens`, `truncated`, `pinned_included`, `dropped_by_relevance`/`dropped_by_similarity`/`dropped_by_diversity`/`dropped_by_entity_cap`, `diversity` |
 | `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `memory_ids` (bulk direct lookup, max 200; `missing` and a warning, mutually exclusive with `memory_id`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
 | `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `as_of`/`tags`/`tags_any`/`source`/`agent_id`/`min_confidence`, `fields`, `limit`, `offset`; reports `total`, `relation_context_count` and `duplicates_hidden` (identical content in several scopes is listed once); an unknown project is named in `warnings` like `recall` |
 | `get_entities` | Batch `get_entity` for 1-25 names (duplicates removed, blank names rejected); per-entry `details`/`memories`/`total`/`has_more`/`duplicates_hidden`, `succeeded`/`failed`; an unknown name is a `not_found` entry, not an abort; `project="*"` rejected |
@@ -385,15 +385,25 @@ other intents of the batch.
 
 `query`, `project`, `include_global`, `max_tokens` (256-32000, default 4000),
 `limit` (default 50), `entity`, `metadata_filter`, `updated_after`, `hybrid`,
-`include_decay` (default true), `graph_boost`/`graph_entity`, and the `as_of` /
+`include_decay` (default true), `graph_boost`/`graph_entity`, `include_pinned`
+(default true), `min_relevance` / `min_similarity`, `diversity` (MMR weight,
+default 0.3, `0.0` = strict no-op) and `max_per_entity` (default none), plus the `as_of` /
 `tags` / `tags_any` / `source` / `agent_id` / `min_confidence` filters. Runs
 the same hybrid search as `recall` (same scope, filter and dedupe semantics) and
 packs
-the ranked hits into one `context` string in ranking order. The estimate is
+the ranked hits into one `context` string in ranking order; with `include_pinned`
+the pinned facts lead the block and no relevance/decay floor drops them. With
+`diversity > 0` near-duplicates (identical content hash or cosine >= 0.95)
+collapse and the block prefers hits unlike those already chosen;
+`max_per_entity` caps one entity's contribution but never evicts a pin. The
+estimate is
 conservative (about four characters per token plus a fixed per-item overhead),
-so `used_tokens` never exceeds `max_tokens`; a hit that does not fit stops the
-block and sets `truncated`. Each `items` entry carries `id`, `content`,
-`entity`, `mem_type`, `project`, `_relevance_score` and `_final_score`. An
+so `used_tokens` never exceeds `max_tokens`; a hit or pin that does not fit
+stops the block and sets `truncated`. Each `items` entry carries `id`,
+`content`, `entity`, `mem_type`, `project`, `pinned`, `_relevance_score` and
+`_final_score`; the answer reports `pinned_included`, `diversity` and the
+`dropped_by_relevance` / `dropped_by_similarity` / `dropped_by_diversity` /
+`dropped_by_entity_cap` counters. An
 empty result answers `ok` with `count: 0`, an empty `context` and a warning.
 
 ### `list_memories`
