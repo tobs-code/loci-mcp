@@ -250,7 +250,7 @@ mutually exclusive.
   `would_delete` without writing, and a selector that matches nothing answers
   `ok` with a "no memories matched" warning rather than `not_found`.
 - `query` is the semantic form of a selector: `limit` (default 20) and
-  `min_similarity` (default 0.85) bound the search, it needs an explicit
+  `min_similarity` (default 0.80) bound the search, it needs an explicit
   `project`, searches only active rows and does not bump `access_count`. Only
   vector matches are selected: a row needs a real vector score at or above
   `min_similarity`, so a keyword-only full-text hit is never removed (even with

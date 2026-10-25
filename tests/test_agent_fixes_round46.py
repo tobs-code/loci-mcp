@@ -8,6 +8,7 @@ Bug B: `prune_memories` must never purge a hard-deleted row through the
 expired/forgotten branches. Only the hard-delete grace branch may remove it.
 """
 
+from mcp_server.app import app
 from mcp_server.db import get_conn
 from mcp_server.server import forget, prune_memories, remember
 from mcp_server.tools.memory import _mem_table
@@ -104,3 +105,11 @@ def test_prune_memories_still_removes_soft_forgotten_rows():
     assert pruned["ok"] is True
     assert pruned["counts"]["memories"] == 1
     assert pruned["counts"]["pending_purge"] == 0
+
+
+def test_forget_query_default_min_similarity_is_080():
+    schema = app._tool_manager.get_tool("forget").parameters
+    prop = schema["properties"]["min_similarity"]
+
+    assert prop["default"] == 0.80
+    assert "0.80" in prop["description"]

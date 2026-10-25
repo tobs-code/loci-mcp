@@ -2801,7 +2801,7 @@ def forget(
     min_similarity: Annotated[
         float | None,
         Field(description="Minimum cosine similarity for a query match "
-                          "(0.0-1.0, default 0.85).")] = 0.85,
+                          "(0.0-1.0, default 0.80).")] = 0.80,
 ) -> dict[str, Any]:
     """Remove memories by id(s), entity, `metadata_filter`, `contains` or `query`.
 
