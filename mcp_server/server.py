@@ -12,6 +12,7 @@ from mcp_server.db import ensure_schema, get_conn
 from mcp_server.http_auth import BearerAuthMiddleware, resolve_http_auth
 from mcp_server.startup_status import record_warning
 from mcp_server.graph import (
+    delete_entity,
     find_connections,
     find_paths,
     list_relations,
@@ -69,6 +70,7 @@ _CORE_TOOL_NAMES = frozenset({
     "init_context",
     "relate",
     "unrelate",
+    "delete_entity",
     "find_connections",
     "find_paths",
     "list_relations",
@@ -93,6 +95,7 @@ _ALL_TOOLS = (
     relate,
     relate_batch,
     unrelate,
+    delete_entity,
     find_connections,
     find_paths,
     list_relations,
@@ -105,8 +108,8 @@ _ALL_TOOLS = (
     drop_project,
 )
 
-# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (16
-# tools); `full` (default) exposes all 28. Maintenance and batch tools are
+# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (17
+# tools); `full` (default) exposes all 29. Maintenance and batch tools are
 # full-only, which keeps the per-turn schema small for interactive agents.
 _toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
 if _toolset == "core":

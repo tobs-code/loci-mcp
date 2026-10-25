@@ -5,6 +5,7 @@ from pydantic import Field
 
 from mcp_server.store import MemoryStore
 from mcp_server.envelope import (
+    STATUS_CONFLICT,
     STATUS_DELETED,
     STATUS_ERROR,
     STATUS_NOT_FOUND,
@@ -14,6 +15,7 @@ from mcp_server.envelope import (
 )
 from mcp_server.graph_store import GraphStore
 from mcp_server.scope_catalog import (
+    _mem_table,
     _norm_entity,
     _norm_project,
     _project_exists,
@@ -21,6 +23,11 @@ from mcp_server.scope_catalog import (
     _safe_ident,
     _scope_key,
     _table_exists,
+)
+from mcp_server.store_rows import entity_present
+from mcp_server.store_updates import (
+    forget_entity_rows,
+    forget_relation_context_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -322,6 +329,123 @@ def unrelate(
               context_memories_removed=result["context_memories_removed"],
               context_kept=keep_context,
               orphan_nodes_removed=result["orphans_removed"])
+
+
+def delete_entity(
+    entity: Annotated[
+        str,
+        Field(description="Entity whose graph node is deleted.")],
+    project: Annotated[
+        str | None,
+        Field(description="Project scope of the graph. Without it the global "
+                          "graph is used; '*' is not supported.")] = None,
+    remove_memories: Annotated[
+        bool,
+        Field(description="Also soft-forget the entity's memories and its "
+                          "relation-context sentences (like "
+                          "`forget(entity=...)`). Off by default: the "
+                          "memories stay.")] = False,
+    remove_relations: Annotated[
+        bool,
+        Field(description="Delete the node's edges too (default true). With "
+                          "false the call is refused while the node still has "
+                          "relations.")] = True,
+    dry_run: Annotated[
+        bool,
+        Field(description="Only report what would be deleted.")] = False,
+) -> dict[str, Any]:
+    """Delete one entity node from a graph scope.
+
+    `DETACH DELETE` removes the node and its edges. `remove_relations=false`
+    only succeeds when the node has no edge at all; otherwise the call answers
+    `conflict` and names the relation count. `remove_memories=true` also
+    soft-forgets the entity's memories (recoverable with
+    `update_memory(restore=true)`). Neighbour nodes are never removed.
+    """
+    logger.info("delete_entity %s project=%s remove_memories=%s dry_run=%s",
+                entity, project, remove_memories, dry_run)
+    if project is not None and str(project).strip() == "*":
+        return fail(STATUS_ERROR,
+                    "project='*' is not supported: pass one project name or "
+                    "omit project for the shared graph")
+    try:
+        project = _norm_project(project)
+        entity = _norm_entity(entity)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    if not entity:
+        return fail(STATUS_ERROR, "entity is required")
+
+    db = MemoryStore()
+    try:
+        graph = GraphStore(db)
+        node = graph.find_entity(project, entity)
+        table = _mem_table(project)
+        has_memories = bool(
+            _table_exists(db.cur, table)
+            and entity_present(db, table, entity))
+        if node is None and not (remove_memories and has_memories):
+            # A graph node is the target of this tool. A name that only
+            # exists on memories is not unknown when the caller explicitly
+            # asked to remove those memories too.
+            db.rollback()
+            return fail(STATUS_NOT_FOUND, f"NOT FOUND: {entity}")
+        relations = graph.edge_count(project, entity) if node else 0
+        if not remove_relations and relations:
+            db.rollback()
+            return fail(
+                STATUS_CONFLICT,
+                f"entity {entity!r} still has {relations} relation(s); pass "
+                f"remove_relations=true to delete the node together with its "
+                f"edges",
+                entity=entity, project=_scope_key(project),
+                relations=relations,
+            )
+        if not dry_run and node is not None:
+            graph.delete_entity_node(
+                entity, project, remove_relations=remove_relations)
+        memories = 0
+        if remove_memories:
+            if _table_exists(db.cur, table):
+                memories += forget_entity_rows(
+                    db, table, entity, soft=True, dry_run=dry_run)
+                memories += forget_relation_context_rows(
+                    db, table, entity, soft=True, dry_run=dry_run)
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        db.close()
+
+    counts: dict[str, Any] = {
+        "entities": 1 if node is not None else 0,
+        "relations": relations,
+        "memories": memories,
+        "orphan_nodes_removed": 0,
+    }
+    if dry_run:
+        counts.update({
+            "would_delete_entities": 1 if node is not None else 0,
+            "would_delete_relations": relations,
+            "would_soft_forget_memories": memories,
+            "would_remove_orphan_nodes": 0,
+        })
+    scope_name = _scope_key(project)
+    return ok(
+        STATUS_OK if dry_run else STATUS_DELETED,
+        entity=entity,
+        project=scope_name,
+        dry_run=dry_run,
+        remove_memories=remove_memories,
+        remove_relations=remove_relations,
+        counts=counts,
+        message=(f"{'Would delete' if dry_run else 'Deleted'} entity "
+                 f"{entity!r} from {scope_name}"),
+    )
 
 
 def find_connections(

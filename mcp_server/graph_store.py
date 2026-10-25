@@ -252,8 +252,9 @@ def _connections(cur, project: str | None, name: str) -> list[dict]:
     _cypher(
         cur,
         f"MATCH (a:{label} {{name: {json.dumps(name)}}})-[r]-(b) "
-        f"RETURN b.name, type(r), coalesce(r.weight, 1.0), "
-        f"startNode(r).name",
+        f"RETURN b.name AS neighbor, type(r) AS rel, "
+        f"coalesce(r.weight, 1.0) AS w, startNode(r).name AS src "
+        f"ORDER BY w DESC, neighbor, rel",
         "neighbor agtype, rel agtype, w agtype, src agtype",
     )
     return [
@@ -660,9 +661,9 @@ class GraphStore:
 
         context_edges = [(e, r) for e, r in zip(prepared, results)
                         if e["context"]]
+        ctx_table = _mem_table(project)
         if context_edges:
             embeddings = embed([e["context"] for e, _ in context_edges])
-            ctx_table = _mem_table(project)
             for (e, r), emb in zip(context_edges, embeddings):
                 ctx_entity = (f"{e['from_entity']}_{e['relation_type']}_"
                               f"{e['to_entity']}")
@@ -704,6 +705,31 @@ class GraphStore:
                     r["context_reused"] = False
                 r["context_memory"] = mem_id
 
+        # A call without a context sentence must not pretend an existing
+        # edge has none: report the stored sentence's id so the caller can
+        # read or replace it without a second lookup.
+        if _table_exists(self.cur, ctx_table):
+            for e, r in zip(prepared, results):
+                if e["context"]:
+                    continue
+                ctx_entity = (f"{e['from_entity']}_{e['relation_type']}_"
+                              f"{e['to_entity']}")
+                self.cur.execute(
+                    f"SELECT id FROM {ctx_table} WHERE entity = %s "
+                    f"AND superseded_by IS NULL AND deleted_at IS NULL "
+                    f"AND (expires_at IS NULL OR expires_at > NOW()) "
+                    f"AND metadata->>'from' = %s "
+                    f"AND metadata->>'to' = %s "
+                    f"AND metadata->>'relation_type' = %s "
+                    f"ORDER BY updated_at DESC LIMIT 1",
+                    (ctx_entity, e["from_entity"], e["to_entity"],
+                     e["relation_type"]),
+                )
+                row = self.cur.fetchone()
+                if row:
+                    r["context_memory"] = row[0]
+                    r["context_reused"] = True
+
         return results
 
     # Backwards-compatible name for callers that describe the edge batch.
@@ -735,6 +761,24 @@ class GraphStore:
             _delete_entity_everywhere(self.cur, name)
         else:
             _delete_node(self.cur, project, name)
+
+    def edge_count(self, project: str | None, name: str) -> int:
+        """Edges touching the entity in one scope (either direction)."""
+        return _edge_count(self.cur, project, name)
+
+    def delete_entity_node(self, name: str, project: str | None = None, *,
+                           remove_relations: bool = True,
+                           dry_run: bool = False) -> int:
+        """Delete one node (DETACH DELETE) and return its edge count.
+
+        With `remove_relations=False` nothing is deleted; the caller must have
+        checked that the node has no edges first.
+        """
+        relations = _edge_count(self.cur, project, name)
+        if dry_run or (relations and not remove_relations):
+            return relations
+        _delete_node(self.cur, project, name)
+        return relations
 
     def delete_scope(self, project: str | None) -> None:
         """Remove a scope's nodes and every mirror row that belongs to it."""
