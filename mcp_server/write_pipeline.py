@@ -83,6 +83,18 @@ class WriteIntent:
     metadata: dict | None = None
     metadata_mode: Literal["merge", "replace"] = "merge"
     expires_at: str | None = None
+    # Temporal validity window. `valid_from` defaults to the database's NOW();
+    # a caller can backdate a fact that became true earlier. `valid_to` is
+    # normally set by a later supersede, never silently here.
+    valid_from: str | None = None
+    valid_to: str | None = None
+    # Provenance of the fact (who said it, how sure they were) and free-form
+    # tags. These describe THIS fact, so they are never carried over from a
+    # superseded row.
+    source: str | None = None
+    agent_id: str | None = None
+    confidence: float | None = None
+    tags: list[str] | None = None
     dedupe: Literal["exact", "semantic", "off"] = "exact"
     fuzzy_threshold: float | None = None
     supersede: str | None = None
@@ -371,6 +383,12 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         return db.insert(content, emb, mem_type, entity,
                          intent.importance, meta, project=store_project,
                          scope=effective_scope, expires_at=intent.expires_at,
+                         valid_from=intent.valid_from,
+                         valid_to=intent.valid_to,
+                         source=intent.source,
+                         agent_id=intent.agent_id,
+                         confidence=intent.confidence,
+                         tags=intent.tags,
                          **extra)
 
     if intent.idempotency_key:

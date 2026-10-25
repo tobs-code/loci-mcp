@@ -103,6 +103,12 @@ def ensure_schema():
                 superseded_by TEXT,
                 deleted_at TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
+                valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                valid_to TIMESTAMPTZ,
+                source TEXT,
+                agent_id TEXT,
+                confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+                tags TEXT[] NOT NULL DEFAULT '{}',
                 idempotency_key TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -182,6 +188,14 @@ def ensure_schema():
             "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(superseded_by) WHERE superseded_by IS NULL AND deleted_at IS NULL",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS agent_id TEXT",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence FLOAT",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}'",
+            "CREATE INDEX IF NOT EXISTS idx_memories_validity ON memories(valid_from, valid_to)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN (tags)",
             # One active row per idempotency key. Expiry cannot be part of the
             # predicate (a partial index needs an IMMUTABLE expression), so an
             # expired row's key is cleared lazily before the next insert.

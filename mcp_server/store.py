@@ -229,7 +229,13 @@ class MemoryStore:
                scope: str | None = None, expires_at: str | None = None,
                superseded_by: str | None = None,
                memory_id: str | None = None,
-               idempotency_key: str | None = None) -> str:
+               idempotency_key: str | None = None,
+               valid_from: str | None = None,
+               valid_to: str | None = None,
+               source: str | None = None,
+               agent_id: str | None = None,
+               confidence: float | None = None,
+               tags: list[str] | None = None) -> str:
         """Insert one active memory and return its id."""
         mem_id = memory_id or _gen_id()
         now = _now()
@@ -250,6 +256,30 @@ class MemoryStore:
             extra_columns += ", idempotency_key"
             extra_values += ", %s"
             params.append(idempotency_key)
+        if valid_from is not None:
+            extra_columns += ", valid_from"
+            extra_values += ", %s::timestamptz"
+            params.append(valid_from)
+        if valid_to is not None:
+            extra_columns += ", valid_to"
+            extra_values += ", %s::timestamptz"
+            params.append(valid_to)
+        if source is not None:
+            extra_columns += ", source"
+            extra_values += ", %s"
+            params.append(source)
+        if agent_id is not None:
+            extra_columns += ", agent_id"
+            extra_values += ", %s"
+            params.append(agent_id)
+        if confidence is not None:
+            extra_columns += ", confidence"
+            extra_values += ", %s"
+            params.append(confidence)
+        if tags is not None:
+            extra_columns += ", tags"
+            extra_values += ", %s::text[]"
+            params.append(list(tags))
         self.cur.execute(
             f"""INSERT INTO {table}
                 (id, content, content_hash, embedding, mem_type, scope, entity,
@@ -272,6 +302,11 @@ class MemoryStore:
         memory: updating it would invalidate an unrelated row. Without a
         resolved target the historical behaviour (project table plus global)
         is kept for callers that cannot know the scope.
+
+        The row's validity window is closed at the current time: a superseded
+        fact stopped being true when it was replaced, and an `as_of` query for
+        a later moment must not match it anymore. An existing `valid_to` is
+        kept (COALESCE), so a deliberately backdated window is not widened.
         """
         if target == "global":
             tables = ["memories"]
@@ -285,7 +320,8 @@ class MemoryStore:
         for table in dict.fromkeys(tables):
             touched += self.execute(
                 f"UPDATE {table} SET superseded_by = %s, "
-                f"updated_at = NOW() WHERE id = %s",
+                f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
+                f"WHERE id = %s",
                 (superseded_by, memory_id),
             )
         return touched
@@ -310,7 +346,8 @@ class MemoryStore:
         if not memory_ids:
             return 0
         return self.execute(
-            f"UPDATE {target} SET superseded_by = %s, updated_at = NOW() "
+            f"UPDATE {target} SET superseded_by = %s, "
+            f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
             f"WHERE id = ANY(%s)",
             (superseded_by, list(memory_ids)),
         )

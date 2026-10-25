@@ -3,7 +3,6 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from mcp_server import config
@@ -21,6 +20,11 @@ from mcp_server.config import (
 )
 from mcp_server.store import MemoryStore
 from mcp_server.duplicates import is_cross_scope_duplicate
+from mcp_server.filters import (
+    feature_conditions,
+    parse_iso_timestamp,
+    validity_condition,
+)
 from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import rerank
 from mcp_server.scope_catalog import (
@@ -74,6 +78,12 @@ class SearchRequest:
     tables: list[str] | None = None
     updated_after: str | None = None
     metadata_filter: dict | None = None
+    as_of: str | None = None
+    tags: list[str] | None = None
+    tags_any: list[str] | None = None
+    source: str | None = None
+    agent_id: str | None = None
+    min_confidence: float | None = None
     recent_first: bool = False
     exclude_relation_context: bool = False
     include_entity_relation_context: bool = False
@@ -339,6 +349,13 @@ def _metadata_conditions(metadata_filter: dict) -> tuple[list[str], list[Any]]:
 def _extra_conditions(
     updated_after: str | None = None,
     metadata_filter: dict | None = None,
+    *,
+    as_of: str | None = None,
+    tags: list[str] | None = None,
+    tags_any: list[str] | None = None,
+    source: str | None = None,
+    agent_id: str | None = None,
+    min_confidence: float | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Build the optional filter conditions shared by all retrieval paths."""
     conditions: list[str] = []
@@ -356,7 +373,46 @@ def _extra_conditions(
         meta_conditions, meta_params = _metadata_conditions(metadata_filter)
         conditions.extend(meta_conditions)
         params.extend(meta_params)
+    feature_sql, feature_params = feature_conditions(
+        as_of=as_of, tags=tags, tags_any=tags_any, source=source,
+        agent_id=agent_id, min_confidence=min_confidence,
+    )
+    conditions.extend(feature_sql)
+    params.extend(feature_params)
     return conditions, params
+
+
+def _count_outside_validity(
+    cur,
+    table: str,
+    base_conditions: list[str],
+    base_params: list[Any],
+    as_of: Any,
+    *,
+    include_deleted: bool,
+    include_superseded: bool,
+    include_expired: bool,
+) -> int:
+    """Count the rows the query would return if the validity window matched.
+
+    The base conditions must NOT already carry the `as_of` predicate: counting
+    `valid AND NOT valid` is always zero and would hide exactly the fact the
+    caller wanted to see ("it exists, but not at your `as_of`").
+    """
+    validity_sql, validity_params = validity_condition(as_of)
+    if not validity_sql:
+        return 0
+    where = " AND ".join(list(base_conditions) + [
+        visibility_condition(
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+        ),
+        f"NOT {validity_sql}",
+    ])
+    cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}",
+                list(base_params) + validity_params)
+    return int(cur.fetchone()[0])
 
 
 def _entity_conditions(
@@ -383,19 +439,11 @@ def _entity_conditions(
 
 
 def _parse_timestamp(value: str):
-    """Parse an ISO-8601 date/datetime into a timezone-aware datetime."""
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
+    """Parse an ISO-8601 date/datetime, or None when it does not parse."""
     try:
-        stamp = datetime.fromisoformat(text)
+        return parse_iso_timestamp(value)
     except ValueError:
         return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    return stamp
 
 
 def _sigmoid_scores(values: list[float]) -> list[float]:
@@ -547,6 +595,12 @@ def _search_memories_rrf(
     exclude_relation_context: bool = False,
     include_entity_relation_context: bool = False,
     stats: dict[str, Any] | None = None,
+    as_of: str | None = None,
+    tags: list[str] | None = None,
+    tags_any: list[str] | None = None,
+    source: str | None = None,
+    agent_id: str | None = None,
+    min_confidence: float | None = None,
 ) -> list[dict]:
     """
     Reciprocal Rank Fusion over vector + FTS results.
@@ -573,8 +627,10 @@ def _search_memories_rrf(
     # how much of the query a full-text hit actually covers: an OR query makes
     # a single common word look like a perfect match otherwise.
     fts_lexemes: list[str] = _fts_lexemes(cur, query_text)
-    extra_conditions, extra_params = _extra_conditions(updated_after,
-                                                        metadata_filter)
+    extra_conditions, extra_params = _extra_conditions(
+        updated_after, metadata_filter, as_of=as_of, tags=tags,
+        tags_any=tags_any, source=source, agent_id=agent_id,
+        min_confidence=min_confidence)
     if exclude_relation_context:
         # The relation-context sentences repeat what the graph edge already
         # says; leave them out of a recall ranking when asked to.
@@ -589,6 +645,7 @@ def _search_memories_rrf(
     exact_candidates: list[tuple[bool, str, str]] = []
     dropped_by_similarity = 0
     dropped_by_expired = 0
+    dropped_by_validity = 0
     dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
     entity_conditions, entity_params = _entity_conditions(
@@ -605,6 +662,23 @@ def _search_memories_rrf(
         hidden_params.append(mem_type)
     hidden_params.extend(entity_params)
     hidden_params.extend(extra_params)
+
+    # The same filters without the `as_of` predicate: the validity counter has
+    # to invert the window, not intersect it with itself.
+    validity_free_extra, validity_free_params = _extra_conditions(
+        updated_after, metadata_filter, as_of=None, tags=tags,
+        tags_any=tags_any, source=source, agent_id=agent_id,
+        min_confidence=min_confidence)
+    if exclude_relation_context:
+        validity_free_extra = validity_free_extra + [
+            "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
+    base_conditions = (["TRUE"] + (["mem_type = %s"] if mem_type else [])
+                       + entity_conditions + validity_free_extra)
+    base_params: list[Any] = []
+    if mem_type:
+        base_params.append(mem_type)
+    base_params.extend(entity_params)
+    base_params.extend(validity_free_params)
 
     for table in tables:
         conditions = ["TRUE"]
@@ -633,6 +707,16 @@ def _search_memories_rrf(
                 params,
             )
             dropped_by_expired += int(cur.fetchone()[0])
+        if as_of is not None:
+            # Rows this query would return except for the point in time: the
+            # same filters, the same visibility, only the validity predicate
+            # inverted. Reported like the expired counter so an empty answer
+            # cannot hide "the fact is newer than your as_of".
+            dropped_by_validity += _count_outside_validity(
+                cur, table, base_conditions, base_params, as_of,
+                include_deleted=include_deleted,
+                include_superseded=include_superseded,
+                include_expired=include_expired)
         conditions.append(visibility_condition(
             include_deleted=include_deleted,
             include_superseded=include_superseded,
@@ -780,6 +864,8 @@ def _search_memories_rrf(
                           "min_coverage": FTS_MIN_COVERAGE,
                           "fulltext_only": 0,
                           "exact_matches": 0})
+            if as_of is not None:
+                stats["dropped_by_validity"] = dropped_by_validity
             if hidden_exact:
                 stats["hidden_exact_match"] = hidden_exact
             if best_dropped:
@@ -881,6 +967,8 @@ def _search_memories_rrf(
             "exact_matches": sum(1 for key in fused_scores
                                  if key in exact_results),
         })
+        if as_of is not None:
+            stats["dropped_by_validity"] = dropped_by_validity
         if hidden_exact:
             stats["hidden_exact_match"] = hidden_exact
         if best_dropped:
@@ -924,6 +1012,12 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
     tables = request.tables
     updated_after = request.updated_after
     metadata_filter = request.metadata_filter
+    as_of = request.as_of
+    tags = request.tags
+    tags_any = request.tags_any
+    source = request.source
+    agent_id = request.agent_id
+    min_confidence = request.min_confidence
     recent_first = request.recent_first
     exclude_relation_context = request.exclude_relation_context
     include_entity_relation_context = request.include_entity_relation_context
@@ -941,6 +1035,8 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
             exclude_relation_context=exclude_relation_context,
             include_entity_relation_context=include_entity_relation_context,
             stats=stats,
+            as_of=as_of, tags=tags, tags_any=tags_any, source=source,
+            agent_id=agent_id, min_confidence=min_confidence,
         )
         _rerank_rows(rows, query_text, stats, include_decay)
         return rows[:limit]
@@ -954,16 +1050,26 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
     has_vec = query_embedding is not None
     fts_query = _fts_query(query_text)
     fts_lexemes: list[str] = _fts_lexemes(cur, query_text)
-    extra_conditions, extra_params = _extra_conditions(updated_after,
-                                                        metadata_filter)
+    extra_conditions, extra_params = _extra_conditions(
+        updated_after, metadata_filter, as_of=as_of, tags=tags,
+        tags_any=tags_any, source=source, agent_id=agent_id,
+        min_confidence=min_confidence)
     if exclude_relation_context:
         extra_conditions = extra_conditions + [
+            "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
+    validity_free_extra, validity_free_params = _extra_conditions(
+        updated_after, metadata_filter, as_of=None, tags=tags,
+        tags_any=tags_any, source=source, agent_id=agent_id,
+        min_confidence=min_confidence)
+    if exclude_relation_context:
+        validity_free_extra = validity_free_extra + [
             "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
 
     rows: list[dict] = []
     seen_active_hashes: dict[str, str] = {}
     dropped_by_similarity = 0
     dropped_by_expired = 0
+    dropped_by_validity = 0
     dropped_by_coverage = 0
     dropped_by_cross_scope_duplicate = 0
     best_dropped: dict[str, Any] | None = {}
@@ -973,13 +1079,13 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
     # in Python, so the limit must not cut the candidates before filtering.
     fetch_limit = max(limit, 50)
     for table in tables:
-        conditions: list[str] = ["TRUE"]
-        params: list[Any] = []
+        filter_conditions: list[str] = ["TRUE"]
+        filter_params: list[Any] = []
         params_vec: list[Any] = []
 
         if has_vec:
             col = "*, embedding <=> %s::vector AS distance"
-            conditions.append("embedding IS NOT NULL")
+            filter_conditions.append("embedding IS NOT NULL")
             order = "ORDER BY distance ASC"
             params_vec.append(query_embedding)
         elif fts_query:
@@ -997,21 +1103,22 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
             order = "ORDER BY updated_at DESC"
 
         if fts_query:
-            conditions.append(
+            filter_conditions.append(
                 f"to_tsvector('{config.FTS_LANGUAGE}', content) @@ "
                 f"websearch_to_tsquery('{config.FTS_LANGUAGE}', %s)"
             )
-            params.append(fts_query)
+            filter_params.append(fts_query)
         if mem_type:
-            conditions.append("mem_type = %s")
-            params.append(mem_type)
+            filter_conditions.append("mem_type = %s")
+            filter_params.append(mem_type)
         entity_conditions, entity_params = _entity_conditions(
             entity, include_entity_relation_context)
-        conditions.extend(entity_conditions)
-        params.extend(entity_params)
-        conditions.extend(extra_conditions)
-        params.extend(extra_params)
-
+        filter_conditions.extend(entity_conditions)
+        filter_params.extend(entity_params)
+        conditions = filter_conditions + extra_conditions
+        params = filter_params + extra_params
+        base_conditions = filter_conditions + validity_free_extra
+        base_params = filter_params + validity_free_params
         if not include_expired:
             expired_where = " AND ".join(conditions + [
                 visibility_condition(
@@ -1026,6 +1133,12 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
                 params,
             )
             dropped_by_expired += int(cur.fetchone()[0])
+        if as_of is not None:
+            dropped_by_validity += _count_outside_validity(
+                cur, table, base_conditions, base_params, as_of,
+                include_deleted=include_deleted,
+                include_superseded=include_superseded,
+                include_expired=include_expired)
 
         conditions.append(visibility_condition(
             include_deleted=include_deleted,
@@ -1128,6 +1241,8 @@ def _search_memories(cur, request: SearchRequest) -> list[dict]:
             "min_coverage": FTS_MIN_COVERAGE,
             "fulltext_only": 0,
         })
+        if as_of is not None:
+            stats["dropped_by_validity"] = dropped_by_validity
     if include_decay:
         for r in rows:
             relevance = r.get("_relevance_score")
@@ -1163,6 +1278,12 @@ def _search_memories_graph_boost(
     include_deleted: bool = False,
     warnings: list[str] | None = None,
     cur=None,
+    as_of: str | None = None,
+    tags: list[str] | None = None,
+    tags_any: list[str] | None = None,
+    source: str | None = None,
+    agent_id: str | None = None,
+    min_confidence: float | None = None,
 ) -> list[dict]:
     """
     Augments search results with memories from connected entities via the graph.
@@ -1216,11 +1337,11 @@ def _search_memories_graph_boost(
         seen_nodes: set[str] = set()
         seen_relation_context: set[str] = set()
         for label in labels:
-            for name, weight, rtype, source in GraphStore(cur=cur).boost(label, entity):
+            for name, weight, rtype, edge_source in GraphStore(cur=cur).boost(label, entity):
                 node = _ag_str(name)
                 weight_value = float(str(weight))
                 relation = _ag_str(rtype)
-                source_name = _ag_str(source)
+                source_name = _ag_str(edge_source)
                 if relation:
                     for ctx_name in (f"{source_name}_{relation}_{node}",
                                      f"{node}_{relation}_{source_name}"):
@@ -1233,8 +1354,10 @@ def _search_memories_graph_boost(
                 graph_entities.append((node, weight_value))
 
         # 2. Fetch memories of connected entities
-        extra_conditions, extra_params = _extra_conditions(updated_after,
-                                                            metadata_filter)
+        extra_conditions, extra_params = _extra_conditions(
+            updated_after, metadata_filter, as_of=as_of, tags=tags,
+            tags_any=tags_any, source=source, agent_id=agent_id,
+            min_confidence=min_confidence)
         if exclude_relation_context:
             extra_conditions = extra_conditions + [
                 "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]

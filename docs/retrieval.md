@@ -140,7 +140,9 @@ stopword noise; exact literal hits (`_exact_match`) are exempt.
 
 `recall` reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
-`dropped_by_expired` (rows hidden because their TTL passed) and
+`dropped_by_expired` (rows hidden because their TTL passed),
+`dropped_by_validity` (rows matched by the other filters whose validity window
+does not contain `as_of`; reported only when `as_of` is passed) and
 `dropped_by_coverage` (the number of full-text hits the coverage filter
 removed). `dropped_by_relevance`, `dropped_by_decay` and
 `dropped_by_superseded` are reported whenever the `min_relevance` (including
@@ -153,6 +155,30 @@ In that warning the strongest rejected vector hit is named explicitly, and the
 payload carries `best_dropped_by_similarity` (`id`, `similarity`, `scope`,
 `content_preview`): a fact that missed the cutoff by a hair is shown instead
 of hiding behind the `dropped_by_similarity` counter.
+
+## Validity, tags and provenance filters
+
+Every memory carries a **validity window**: `valid_from` (default: the write
+time) and `valid_to` (default: open). `as_of` turns any read into a point-in-time
+read — only rows with `valid_from <= as_of` and (`valid_to` absent or
+`valid_to > as_of`) are returned. This is independent of TTL (`expires_at`,
+which hides a row from *every* read) and of the supersede/forget history flags:
+a fact superseded today is still readable at an `as_of` inside its window, and
+its window is closed automatically (`valid_to = NOW()`) when it is superseded.
+`update_memory(valid_to=..., clear_valid_to=true)` edits the window; a window
+with `valid_to <= valid_from` is refused as an argument error. Rows that match
+the query and the other filters but sit outside the window are counted in
+`dropped_by_validity`, so an empty `as_of` result names the time filter instead
+of looking like a missing fact.
+
+`tags` (AND: every tag must be present) and `tags_any` (OR: at least one) narrow
+reads by the stored tag list; they are mutually exclusive, use a GIN index, and
+compare the normalized form (trimmed, lower-cased). `source` and `agent_id`
+filter on the exact stored provenance string and `min_confidence` keeps only
+rows whose `confidence` is set and at least the given value — a row without a
+confidence is never returned by `min_confidence`. The same filters exist on
+`recall_batch`, `compile_context`, `list_memories`, `get_entity` and
+`get_entities`; they narrow the count as well as the page.
 
 ## Cross-encoder reranking
 
@@ -417,6 +443,12 @@ not set are merged into the new memory (explicitly passed metadata always
 wins). The response lists the carried keys in a warning (`metadata carried
 over from the replaced memories: ...`). Pass `metadata_mode="replace"` to drop
 the old keys instead.
+
+Every supersede also closes the validity window of the replaced row
+(`valid_to = COALESCE(valid_to, NOW())`), so a point-in-time read (`as_of`)
+inside the old window still sees the old fact while current reads see only the
+replacement. Soft forgetting does not touch the window — it hides the row from
+every read instead.
 
 `remember` also warns when the new content matches a **superseded** memory: the
 fact is still stored as active (an intentional revert is legitimate), but the

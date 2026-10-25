@@ -22,6 +22,7 @@ from mcp_server.graph import (
 from mcp_server.graph_store import GraphStore
 from mcp_server.schema_migrator import (
     ensure_fts_language,
+    migrate_feature_columns,
     migrate_fts_indexes,
     migrate_idempotency_keys,
 )
@@ -227,6 +228,17 @@ def main() -> None:
             logger.info("Added idempotency_key to %s memory table(s)", changed)
     except Exception as e:
         message = f"idempotency-key migration skipped: {e}"
+        logger.error(message)
+        record_warning(message)
+
+    # Temporal/provenance/tag columns must exist before the first read that
+    # filters on them, not only after a write touched the scope.
+    try:
+        changed = migrate_feature_columns()
+        if changed:
+            logger.info("Added feature columns to %s memory table(s)", changed)
+    except Exception as e:
+        message = f"feature-column migration skipped: {e}"
         logger.error(message)
         record_warning(message)
 

@@ -60,6 +60,12 @@ class BrowseRequest:
     contains: str | None = None
     updated_after: str | None = None
     metadata_filter: dict | None = None
+    as_of: Any = None
+    tags: list[str] | None = None
+    tags_any: list[str] | None = None
+    source: str | None = None
+    agent_id: str | None = None
+    min_confidence: float | None = None
     include_relation_context: bool = True
     fields: list[str] | None = None
     mode: str = MODE_BROWSE
@@ -238,7 +244,10 @@ def visible_where(request: BrowseRequest) -> tuple[str, list[Any], str]:
         conditions.append("content ILIKE %s")
         params.append(f"%{escape_like(request.contains)}%")
     extra_conditions, extra_params = _extra_conditions(
-        request.updated_after, request.metadata_filter)
+        request.updated_after, request.metadata_filter,
+        as_of=request.as_of, tags=request.tags, tags_any=request.tags_any,
+        source=request.source, agent_id=request.agent_id,
+        min_confidence=request.min_confidence)
     conditions.extend(extra_conditions)
     params.extend(extra_params)
     return " AND ".join(conditions), params, entity

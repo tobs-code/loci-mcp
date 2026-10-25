@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from mcp_server.config import SENTINEL_FORGOTTEN
+from mcp_server.filters import normalize_optional_text, normalize_tags
 from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
 from mcp_server.graph_store import GraphStore, _edge_context
@@ -36,6 +37,12 @@ def _export_memories_json(cur, project: str | None,
                           mem_type: str | None = None,
                           updated_after: str | None = None,
                           metadata_filter: dict | None = None,
+                          as_of: Any = None,
+                          tags: Any = None,
+                          tags_any: Any = None,
+                          source: Any = None,
+                          agent_id: Any = None,
+                          min_confidence: Any = None,
                           include_expired: bool = True,
                           include_deleted: bool | None = None) -> list[dict]:
     names = _project_names(cur)
@@ -90,8 +97,10 @@ def _export_memories_json(cur, project: str | None,
     if mem_type:
         conditions.append("mem_type = %s")
         params.append(mem_type)
-    extra_conditions, extra_params = _extra_conditions(updated_after,
-                                                       metadata_filter)
+    extra_conditions, extra_params = _extra_conditions(
+        updated_after, metadata_filter, as_of=as_of, tags=tags,
+        tags_any=tags_any, source=source, agent_id=agent_id,
+        min_confidence=min_confidence)
     conditions.extend(extra_conditions)
     params.extend(extra_params)
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
@@ -100,7 +109,8 @@ def _export_memories_json(cur, project: str | None,
         cur.execute(
             f"SELECT id, content, mem_type, entity, importance, metadata, "
             f"access_count, superseded_by, deleted_at, expires_at, "
-            f"created_at, updated_at{emb_col} "
+            f"created_at, updated_at, confidence, source, agent_id, tags, "
+            f"valid_from, valid_to{emb_col} "
             f"FROM {table} {where}",
             params,
         )
@@ -279,6 +289,29 @@ def export_memories(
         Field(description="Only export memories whose metadata contains these "
                           "key/value pairs (same tolerant comparison as "
                           "`list_memories`).")] = None,
+    as_of: Annotated[
+        str | None,
+        Field(description="Only export memories that were valid at this ISO "
+                          "8601 instant.")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only export memories carrying every one of these "
+                          "tags (AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only export memories carrying at least one of these "
+                          "tags (OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only export memories whose provenance `source` "
+                          "equals this.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only export memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only export memories with a confidence at or above "
+                          "this value (0.0-1.0).")] = None,
 ) -> dict[str, Any]:
     """Export memories (and the graph) as JSON or JSONL.
 
@@ -306,6 +339,12 @@ def export_memories(
         return fail(STATUS_ERROR,
                     f"unsupported format {format!r}; use 'json' or 'jsonl'",
                     count=0, data=None)
+    try:
+        _extra_conditions(None, None, as_of=as_of, tags=tags,
+                          tags_any=tags_any, source=source,
+                          agent_id=agent_id, min_confidence=min_confidence)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e), count=0, data=None)
     db = MemoryStore()
     try:
         cur = db.cur
@@ -315,6 +354,10 @@ def export_memories(
                                      entity=entity, mem_type=mem_type,
                                      updated_after=updated_after,
                                      metadata_filter=metadata_filter,
+                                     as_of=as_of, tags=tags,
+                                     tags_any=tags_any, source=source,
+                                     agent_id=agent_id,
+                                     min_confidence=min_confidence,
                                      include_expired=include_expired,
                                      include_deleted=include_deleted)
         graph = (_export_graph(cur, project, only_global=only_global,
@@ -335,10 +378,10 @@ def export_memories(
         record = {
             "id": r["id"],
             "content": r["content"],
-            # "type" is the historical key, "mem_type" the name every other
-            # tool uses. Both are written so old and new exports stay
-            # readable; imports accept either.
-            "type": r["mem_type"],
+            # "type" was the historical key and duplicated "mem_type"; a
+            # record with two spellings could disagree with itself after a
+            # hand edit. Only `mem_type` is written now, and imports still
+            # accept `type` as a legacy fallback.
             "mem_type": r["mem_type"],
             "entity": r["entity"],
             "project": r["project"],
@@ -357,6 +400,21 @@ def export_memories(
                            if isinstance(r.get("expires_at"), datetime)
                            else (str(r["expires_at"])
                                  if r.get("expires_at") is not None else None)),
+            # Provenance and the validity window are part of the fact, not
+            # derived state: a restore has to keep them.
+            "confidence": (float(r["confidence"])
+                           if r.get("confidence") is not None else None),
+            "source": r.get("source"),
+            "agent_id": r.get("agent_id"),
+            "tags": list(r.get("tags") or []),
+            "valid_from": (r["valid_from"].isoformat()
+                           if isinstance(r.get("valid_from"), datetime)
+                           else (str(r["valid_from"])
+                                 if r.get("valid_from") is not None else None)),
+            "valid_to": (r["valid_to"].isoformat()
+                         if isinstance(r.get("valid_to"), datetime)
+                         else (str(r["valid_to"])
+                               if r.get("valid_to") is not None else None)),
         }
         if r.get("deleted_at") is not None:
             record["deleted_at"] = (r["deleted_at"].isoformat()
@@ -367,9 +425,12 @@ def export_memories(
         records.append(record)
 
     warnings: list[str] = []
-    if graph is not None and (mem_type or updated_after or metadata_filter):
+    if graph is not None and (mem_type or updated_after or metadata_filter
+                              or as_of or tags or tags_any or source
+                              or agent_id or min_confidence is not None):
         warnings.append(
-            "the memory filters (mem_type/updated_after/metadata_filter) do "
+            "the memory filters (mem_type/updated_after/metadata_filter/as_of/"
+            "tags/tags_any/source/agent_id/min_confidence) do "
             "not apply to the graph: entities and relations were exported in "
             "full for the selected scope; pass include_graph=false for a "
             "memory-only backup")
@@ -443,7 +504,7 @@ def export_memories(
         return ok(STATUS_OK, format=format, count=len(records), data=data,
                   data_format="jsonl", graph_included=graph is not None,
                   include_expired=include_expired, warnings=warnings)
-    payload = {"type": "memory_export", "version": "0.3",
+    payload = {"type": "memory_export", "version": "0.4",
                "records": records, "count": len(records)}
     if graph is not None:
         payload["graph"] = graph
@@ -741,6 +802,43 @@ def import_memories(
                     f"deleted_at is not a valid ISO 8601 timestamp")
                 skipped += 1
                 continue
+            valid_from = _parse_dt(rec.get("valid_from"))
+            if rec.get("valid_from") not in (None, "") and valid_from is None:
+                # A broken valid_from would otherwise fall back to NOW() and
+                # silently rewrite the fact's history.
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: "
+                    f"valid_from is not a valid ISO 8601 timestamp")
+                skipped += 1
+                continue
+            valid_to = _parse_dt(rec.get("valid_to"))
+            if rec.get("valid_to") not in (None, "") and valid_to is None:
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: "
+                    f"valid_to is not a valid ISO 8601 timestamp")
+                skipped += 1
+                continue
+            try:
+                confidence = (None if rec.get("confidence") is None
+                              else float(rec["confidence"]))
+                if confidence is not None and not 0.0 <= confidence <= 1.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: "
+                    f"confidence must be a number between 0.0 and 1.0")
+                skipped += 1
+                continue
+            try:
+                source = normalize_optional_text(rec.get("source"), "source")
+                agent_id = normalize_optional_text(
+                    rec.get("agent_id"), "agent_id")
+                tags = normalize_tags(rec.get("tags")) or []
+            except ValueError as exc:
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: {exc}")
+                skipped += 1
+                continue
             table = _mem_table(target)
             if target:
                 ensure_project_table(cur, target)
@@ -811,12 +909,14 @@ def import_memories(
                 cur.execute(
                     f"INSERT INTO {table} (id, content, content_hash, embedding, "
                     f"mem_type, scope, entity, importance, metadata, access_count, "
-                    f"superseded_by, deleted_at, expires_at, created_at, updated_at) "
+                    f"superseded_by, deleted_at, expires_at, created_at, updated_at, "
+                    f"confidence, source, agent_id, tags, valid_from, valid_to) "
                     f"VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb, "
                     f"%s, %s, %s, %s, COALESCE(%s, NOW()), "
-                    f"COALESCE(%s, COALESCE(%s, NOW())))",
+                    f"COALESCE(%s, COALESCE(%s, NOW())), %s, %s, %s, "
+                    f"%s::text[], COALESCE(%s, COALESCE(%s, NOW())), %s)",
                     (mid, content, _content_hash(content), emb,
-                     rec.get("type") or rec.get("mem_type", "fact"),
+                     rec.get("mem_type") or rec.get("type") or "fact",
                      "project" if target else "global",
                      rec.get("entity"),
                      (float(rec["importance"])
@@ -825,7 +925,10 @@ def import_memories(
                      superseded_by, deleted_at,
                      expires, _parse_dt(rec.get("created_at")),
                      _parse_dt(rec.get("updated_at")),
-                     _parse_dt(rec.get("created_at"))),
+                     _parse_dt(rec.get("created_at")),
+                     confidence, source, agent_id, tags,
+                     valid_from, _parse_dt(rec.get("created_at")),
+                     valid_to),
                 )
                 imported += 1
                 cur.execute("RELEASE SAVEPOINT import_record")

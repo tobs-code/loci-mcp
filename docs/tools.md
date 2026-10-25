@@ -52,9 +52,9 @@ Every tool answers with the same shape, so an agent never has to guess:
 | Tool | Description |
 |------|-------------|
 | `remember` | Store a fact/decision/learning (auto-embedding, `dedupe` mode, `supersede`/`supersede_content`/`supersede_last`, `on_near_duplicate`, `metadata_mode`, optional contradiction check, `links` for graph edges in the same write, `scope` global/project) |
-| `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `on_near_duplicate`, `auto_supersede_near_duplicate`, `expires_at`, `idempotency_key`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
-| `update_memory` | Update content (re-embedding), importance, metadata, entity, type or TTL (`expires_at`/`clear_expires_at`); `touch=true` refreshes the decay recency without a content change, `restore=true` undoes a soft delete |
-| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `metadata_mode`, `clear_metadata_keys`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `touch`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
+| `remember_batch` | Store multiple facts (savepoints; top-level `skip_duplicates`; per fact: `project`, `scope`, `supersede`, `supersede_content`, `supersede_last`, `on_near_duplicate`, `auto_supersede_near_duplicate`, `expires_at`, `idempotency_key`, `valid_from`/`valid_to`, `source`/`agent_id`/`confidence`, `tags`, `fuzzy_threshold`, `dedupe`; optional `check_contradictions`) |
+| `update_memory` | Update content (re-embedding), importance, metadata, entity, type, TTL (`expires_at`/`clear_expires_at`), the validity window (`valid_from`/`valid_to`/`clear_valid_to`), provenance (`source`/`agent_id`/`confidence`) or tags (`tags`/`tags_mode`/`clear_tags`); `touch=true` refreshes the decay recency without a content change, `restore=true` undoes a soft delete |
+| `update_batch` | Update many memories in one call (savepoints); per entry `memory_id`, `content`, `importance`, `metadata`, `metadata_mode`, `clear_metadata_keys`, `entity`, `mem_type`, `expires_at`, `clear_expires_at`, `valid_from`, `valid_to`, `clear_valid_to`, `source`, `agent_id`, `confidence`, `tags`, `tags_mode`, `clear_tags`, `touch`, `restore`, `project`; bad entries are reported individually (`partial`), the rest is still applied |
 | `merge_memories` | Fold 2-20 active memories of one scope into a new memory: `memory_ids`, `content`, `project`, `entity`, `importance`, `metadata`/`metadata_mode`, `mem_type`, `dedupe`/`fuzzy_threshold`, `dry_run`; every source is superseded by the new id (`status: merged`) |
 | `forget` | Soft delete (`deleted_at` + sentinel) or hard delete by `memory_id`, `memory_ids`, entity, `metadata_filter` or `contains`; `entity` also removes the graph node and that scope's memories; selectors need an explicit `project` and are mutually exclusive with ids, `entity` and each other; `counts` splits memories/entities/relations, `bulk_results` names selector hits with `content_preview`, `dry_run` reports `would_*` |
 
@@ -83,6 +83,12 @@ Every tool answers with the same shape, so an agent never has to guess:
 | `metadata_mode` | enum | `merge` (default: keys the new fact does not set are carried over from the replaced memory) or `replace` (the old keys are dropped). |
 | `expires_at` | string? | ISO 8601 TTL: the memory leaves the active set after this timestamp (hidden in reads, no duplicate candidate). The row itself stays until it is `forget`-den or superseded; exports keep it. Wrong format = named argument error. |
 | `idempotency_key` | string? | Client token, trimmed, 1-128 characters. A retry with the same key in the same scope writes nothing and answers `duplicate` with `id`/`duplicate_of` naming the stored row, `duplicate_mode: "idempotency_key"` and `idempotent_replay: true`; no dedupe, supersede or near-duplicate side effects run. Keys are per scope, shared by `remember` and `remember_batch`, and a key on an expired, superseded or forgotten row no longer blocks the next write. Non-string, empty or over-long keys are argument errors. |
+| `valid_from` | string? | ISO 8601 start of the validity window (default: now). A fact is visible at `as_of` when `valid_from <= as_of` and `valid_to` is absent or later. Invalid values are argument errors. |
+| `valid_to` | string? | ISO 8601 end of the validity window (default: open-ended). An explicit `valid_to` earlier than `valid_from` is refused. Superseding a memory closes its window (`valid_to = NOW()`) if it was open. |
+| `source` | string? | Where the fact came from, trimmed, max 200 characters; empty means none. Not narrowed by recall, only filtered. |
+| `agent_id` | string? | Which agent/tool wrote the fact, trimmed, max 200 characters; empty means none. |
+| `confidence` | number? | How sure the writer is, 0.0-1.0. Stored as `confidence`; `min_confidence` filters on it. |
+| `tags` | list? | Lower-case, trimmed, deduplicated tags (max 32, each 1-64 characters). A comma-separated string is accepted. `recall(tags=...)` requires all, `tags_any=...` at least one. |
 | `fuzzy_threshold` | number? | Similarity threshold for `dedupe="semantic"` (default 0.85). |
 
 The answer carries `superseded` (the ids that were invalidated) and, with
@@ -137,7 +143,8 @@ copies, so the fork is visible instead of looking like a lost write.
 `facts` is a list of objects; only `content` is required, everything else works
 like in `remember` (including the per-fact `auto_supersede_near_duplicate` flag,
 the per-fact `contradiction_mode`, `contradiction_min_confidence` and
-`max_contradiction_supersedes`, and per-fact `links` like in
+`max_contradiction_supersedes`, per-fact `valid_from`/`valid_to`/`source`/
+`agent_id`/`confidence`/`tags`, and per-fact `links` like in
 [`remember`](#remember)). The top-level `skip_duplicates` flag controls
 content dedupe, and `check_contradictions` applies to every fact; the three
 contradiction options can be set at the top level or per fact. Invalid facts are
@@ -163,7 +170,9 @@ duplicate entry creates no graph edges.
 
 `memory_id`, `content`, `importance`, `metadata` (`metadata_mode`
 `replace`/`merge`, `clear_metadata_keys`), `entity`, `mem_type`,
-`expires_at`, `clear_expires_at`, `touch`, `restore`, `project`, `dedupe`
+`expires_at`, `clear_expires_at`, `valid_from`, `valid_to`, `clear_valid_to`,
+`source`, `agent_id`, `confidence`, `tags` (`tags_mode` `replace`/`merge`,
+`clear_tags`), `touch`, `restore`, `project`, `dedupe`
 (`exact`/`semantic`/`off`), `fuzzy_threshold`.
 Content changes are re-embedded; a change that would duplicate another active
 memory is refused as `ok: false` / `status: duplicate` / `applied: false`,
@@ -175,7 +184,11 @@ without a new object). Without `project` the memory is
 looked up in every scope; a memory id is unique per scope, so an id that
 exists in several scopes is refused and the scopes are named (see
 [Scopes](scopes.md)). `expires_at` sets a new TTL and
-`clear_expires_at=true` removes it; pass only one of the two.
+`clear_expires_at=true` removes it; pass only one of the two. `valid_to` and
+`clear_valid_to` are the same pair for the validity window. `source=""` /
+`agent_id=""` clear the field (`None` leaves it untouched). `tags_mode="merge"`
+unions the new tags with the stored ones (later duplicates removed, still
+capped at 32); `clear_tags=true` empties the list.
 
 `touch=true` only bumps `updated_at`, so the decay recency starts over while
 content, embedding and `access_count` stay untouched; it can be combined with
@@ -264,11 +277,11 @@ nothing.
 
 | Tool | Description |
 |------|-------------|
-| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `min_relevance`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
-| `recall_batch` | Run 1-25 independent searches in one call; `queries`, shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `fields`, `detail`; each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched` |
-| `compile_context` | Ranked, token-bounded context block for a prompt: `query`, `project`, `include_global`, `max_tokens` (256-32000), `limit`, `entity`, `metadata_filter`, `updated_after`, `hybrid`, `include_decay`, `graph_boost`/`graph_entity`; reports `context`, `items`, `used_tokens`, `truncated` |
-| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `memory_ids` (bulk direct lookup, max 200; `missing` and a warning, mutually exclusive with `memory_id`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
-| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `fields`, `limit`, `offset`; reports `total`, `relation_context_count` and `duplicates_hidden` (identical content in several scopes is listed once); an unknown project is named in `warnings` like `recall` |
+| `recall` | Hybrid vector + FTS (RRF fusion, project + global); ambiguous top hits are reranked by a local cross-encoder (`reranked`/`rerank_error`); `project="*"` searches every scope; `hybrid`, `min_similarity`, `min_relevance`, `limit`, `include_decay`/`min_decay_score`, `include_superseded`/`only_superseded`/`include_deleted`/`include_expired`, `include_global`, `graph_boost`/`graph_entity`, `include_relation_context`, `fields`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `metadata_filter`, `offset`; hidden hits carry `forgotten`/`expired` markers |
+| `recall_batch` | Run 1-25 independent searches in one call; `queries`, shared `project`, `include_global`, `limit`, `offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags, `graph_boost`/`entity`, `mem_type`, `as_of`/`tags`/`tags_any`/`source`/`agent_id`/`min_confidence`, `fields`, `detail`; each `results` entry carries its own `query`, `count`, filter counters, `warnings` and `scopes_searched` |
+| `compile_context` | Ranked, token-bounded context block for a prompt: `query`, `project`, `include_global`, `max_tokens` (256-32000), `limit`, `entity`, `metadata_filter`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `hybrid`, `include_decay`, `graph_boost`/`graph_entity`; reports `context`, `items`, `used_tokens`, `truncated` |
+| `list_memories` | Browse memories without a query (newest first); `entity`, `mem_type`, `project` (`"*"` = every scope), `include_global`, `fields`, `updated_after`, `as_of`, `tags`/`tags_any`, `source`, `agent_id`, `min_confidence`, `metadata_filter`, `order_by`, `offset`, `memory_id` (direct lookup, singular `memory`), `memory_ids` (bulk direct lookup, max 200; `missing` and a warning, mutually exclusive with `memory_id`), `include_deleted`, `include_expired`, `include_superseded`, `include_relation_context`, `include_duplicates` (show every cross-scope copy; by default duplicates are hidden and counted in `duplicates_hidden`) |
+| `get_entity` | Entity details (including graph connections) + all linked memories + the relation contexts of its edges; `include_global`, `include_relation_context`, `include_superseded`, `include_expired`, `as_of`/`tags`/`tags_any`/`source`/`agent_id`/`min_confidence`, `fields`, `limit`, `offset`; reports `total`, `relation_context_count` and `duplicates_hidden` (identical content in several scopes is listed once); an unknown project is named in `warnings` like `recall` |
 | `get_entities` | Batch `get_entity` for 1-25 names (duplicates removed, blank names rejected); per-entry `details`/`memories`/`total`/`has_more`/`duplicates_hidden`, `succeeded`/`failed`; an unknown name is a `not_found` entry, not an abort; `project="*"` rejected |
 | `list_entities` | Browse entities (`entity_type`, `project`, `include_global`, `offset`); `type` is 'graph' (raw AGE label in `label`) or 'memory-only'; an unknown `entity_type` is an argument error that names the labels present; synthetic `<from>_<relation>_<to>` entities are hidden |
 | `list_projects` | Discover every scope; `include_empty` (default true), `include_counts` (default true); each row carries `project`, `scope`, `has_table`, `has_graph` and, with counts, the memory/entity/relation counts (without counts those keys are omitted) |
@@ -298,6 +311,12 @@ The search tool. `query` is required and non-empty.
 | `fields` | list? | Only return these columns, e.g. `["id", "content"]`. Score fields include `_rerank_score` for reranked rows and `_graph_relation_context` for relation-context hits. |
 | `detail` | enum | `full` (default) or `slim`. `slim` returns id/content/entity/type/project/importance/timestamps plus the ranking scores, without metadata or history bookkeeping; an explicit `fields` list wins. |
 | `updated_after` | string? | Only memories changed at or after this ISO date. |
+| `as_of` | string? | Read the scope at a point in time: only rows whose validity window contains this ISO timestamp. Out-of-window matches are counted in `dropped_by_validity`. |
+| `tags` | list? | Only memories that carry **all** of these tags (AND). Mutually exclusive with `tags_any`. |
+| `tags_any` | list? | Only memories that carry **at least one** of these tags (OR). Mutually exclusive with `tags`. |
+| `source` | string? | Only memories with this exact `source` (trimmed). |
+| `agent_id` | string? | Only memories with this exact `agent_id` (trimmed). |
+| `min_confidence` | number? | Only memories whose `confidence` is set and at least this value (0..1). |
 | `metadata_filter` | object? | Only memories whose metadata contains these key/value pairs. Scalar values compare tolerantly (the string `"8001"` matches the stored number `8001`); objects and arrays use JSON containment. |
 | `include_relation_context` | bool | True (default) includes the relation-context sentences of graph edges; False hides them. |
 | `offset` | int | Skip this many ranked hits (default 0). The answer reports `has_more` and `next_offset`. |
@@ -313,6 +332,8 @@ order unchanged.
 The answer reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
 `dropped_by_expired` (rows hidden because their TTL passed),
+`dropped_by_validity` (rows the filters matched but whose validity window did
+not contain `as_of`; reported only when `as_of` is passed),
 `dropped_by_coverage` (the number of full-text hits that covered too little of
 the query), plus `fulltext_only` when a hit came only from the full-text leg.
 `dropped_by_relevance`, `dropped_by_decay` and `dropped_by_superseded` are
@@ -348,7 +369,9 @@ Run up to 25 independent `recall` searches in one call. A multi-intent turn
 to concatenate both intents into one diluted embedding or to make several
 round trips. The shared options (`project`, `include_global`, `limit`,
 `offset`, `hybrid`, `min_similarity`, `min_relevance`, decay/history/TTL flags,
-`graph_boost`/`entity`, `mem_type`, `fields`, `detail`) apply to every query;
+`graph_boost`/`entity`, `mem_type`, `fields`, `detail`, plus the `as_of` /
+`tags` / `tags_any` / `source` / `agent_id` / `min_confidence` filters) apply
+to every query;
 `results` contains one entry per query with its own `query`, `count`,
 `results`, filter counters, `warnings` and `scopes_searched`. An empty list is
 an argument error. A query that fails on its own (for example an inference
@@ -361,8 +384,10 @@ other intents of the batch.
 
 `query`, `project`, `include_global`, `max_tokens` (256-32000, default 4000),
 `limit` (default 50), `entity`, `metadata_filter`, `updated_after`, `hybrid`,
-`include_decay` (default true), `graph_boost`/`graph_entity`. Runs the same
-hybrid search as `recall` (same scope, filter and dedupe semantics) and packs
+`include_decay` (default true), `graph_boost`/`graph_entity`, and the `as_of` /
+`tags` / `tags_any` / `source` / `agent_id` / `min_confidence` filters. Runs
+the same hybrid search as `recall` (same scope, filter and dedupe semantics) and
+packs
 the ranked hits into one `context` string in ranking order. The estimate is
 conservative (about four characters per token plus a fixed per-item overhead),
 so `used_tokens` never exceeds `max_tokens`; a hit that does not fit stops the
@@ -395,7 +420,10 @@ machine-readable
 `superseded_by` in those rows (it was overwriting the real value). Superseded
 history stays hidden unless `include_superseded=true` is also passed - the two
 flags are orthogonal. `include_expired=true` lists rows past their TTL with
-`expired: true`; `include_deleted` alone never shows them.
+`expired: true`; `include_deleted` alone never shows them. The `as_of` / `tags`
+/ `tags_any` / `source` / `agent_id` / `min_confidence` filters narrow a browse
+exactly like `recall`; a tags/tags_any pair is refused as mutually exclusive,
+and a direct `memory_id`/`memory_ids` lookup reports them as ignored.
 
 Without `project` (or with `project="*"`) every scope is listed;
 `project="global"` lists only the shared scope. `total` is computed after the
@@ -412,7 +440,9 @@ already says.
 
 `entity` (`name` is kept as alias), `project`, `include_global`,
 `include_relation_context` (default true), `include_superseded`, `fields`,
-`limit` (default 100), `offset`.
+`limit` (default 100), `offset`, and the `as_of` / `tags` / `tags_any` /
+`source` / `agent_id` / `min_confidence` filters (which also narrow `total`, so
+the count describes the same filtered set as the page).
 Memory-only entities have no graph node;
 `details.type` is then `memory-only`; a graph node's `details.type` is `graph`
 with the raw AGE label of its scope in `details.label`. A missing entity
@@ -440,7 +470,8 @@ name one.
 Batch form of `get_entity`: `entities` (1-25 names, duplicates removed, blank
 names are an argument error), `project`, `include_global`, `include_superseded`,
 `include_expired`, `include_relation_context`, `fields`, `limit_per_entity`
-(default 50), `offset_per_entity`. Each `results` entry answers exactly like a
+(default 50), `offset_per_entity`, plus the same `as_of` / `tags` / `tags_any` /
+`source` / `agent_id` / `min_confidence` filters. Each `results` entry answers exactly like a
 single `get_entity` call (`ok`, `status`, `entity`, `details`, `memories`,
 `total`, `has_more`, `duplicates_hidden`, `warnings`, plus
 `relation_context_count` and `scopes_with_entity` when present). An unknown name

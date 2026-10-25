@@ -19,16 +19,24 @@ export_memories(format="json", project="api")
 | `entity` | Only records of this entity. |
 | `mem_type` | Only records of this type. |
 | `updated_after` | Only records changed at or after this ISO date. |
+| `as_of` | Only records whose validity window contains this timestamp. |
+| `tags` / `tags_any` | Only records carrying all / at least one of these tags (mutually exclusive). |
+| `source` / `agent_id` | Only records with this exact provenance value. |
+| `min_confidence` | Only records whose `confidence` is set and at least this value. |
 | `metadata_filter` | Only records whose metadata contains these key/value pairs. |
 
 The payload is returned in `data` and can be passed to `import_memories`
 unchanged.
 
-The JSON format (version `0.3`, `"type": "memory_export"`) contains IDs,
-`superseded_by`, TTL (`expires_at`), `deleted_at`, timestamps, `access_count`,
-the project of every record and the complete graph (entities with scope plus
-relations with weight, scope and — when one was stored — the relation's
-`context` sentence).
+The JSON format (version `0.4`, `"type": "memory_export"`) contains IDs,
+`superseded_by`, TTL (`expires_at`), the validity window (`valid_from`,
+`valid_to`), provenance (`source`, `agent_id`, `confidence`), `tags`,
+`deleted_at`, timestamps, `access_count`, the project of every record and the
+complete graph (entities with scope plus relations with weight, scope and —
+when one was stored — the relation's `context` sentence). The memory type is
+written only as `mem_type`; the duplicate `type` key of version 0.3 is gone, so
+a record no longer carries two copies of the same value (an import still reads
+a legacy `type` field as a fallback).
 
 JSONL is flat, one record per line: a memory line carries the same fields as a
 JSON record (minus the wrapping object), an `entity` line carries `name`,
@@ -59,7 +67,9 @@ import_memories(data=<export data>, format="json")
 | `fuzzy_threshold` | Similarity threshold for semantic dedup of records without an id. |
 | `dry_run` | Validate and count without writing anything; `would_create` names how many records an import would add. |
 
-Records keep their `id`, TTL (`expires_at`), timestamps and `superseded_by`, so
+Records keep their `id`, TTL (`expires_at`), validity window (`valid_from`,
+`valid_to`), provenance (`source`, `agent_id`, `confidence`), `tags`,
+timestamps and `superseded_by`, so
 a re-import is idempotent and restores the exact state. A `superseded_by` link
 whose target is missing from the backup is cleared with a warning (otherwise the
 row would stay unreadable forever; `verify_integrity` reports the same case).

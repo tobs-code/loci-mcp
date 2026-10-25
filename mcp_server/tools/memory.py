@@ -35,6 +35,13 @@ from mcp_server.envelope import (
     fail,
     ok,
 )
+from mcp_server.filters import (
+    MAX_TAGS,
+    normalize_optional_text,
+    normalize_tags,
+    parse_iso_timestamp,
+    validate_confidence,
+)
 from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
@@ -74,6 +81,7 @@ from mcp_server.store_updates import (
     restore_rows,
     stored_entity,
     stored_metadata,
+    stored_tags,
 )
 from mcp_server.write_pipeline import (
     _GRAPH_METADATA_KEYS,
@@ -184,6 +192,27 @@ class BatchFact(BaseModel):
         description="Client idempotency token (1-128 characters). A second "
                     "fact with the same key in the same scope answers "
                     "`duplicate` naming the first row instead of writing.")
+    valid_from: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Optional ISO 8601 timestamp when this fact became true "
+                    "(default: now).")
+    valid_to: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Optional ISO 8601 timestamp when this fact stops being "
+                    "true (usually set by a later supersede).")
+    source: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Where the fact came from (max 200 characters).")
+    agent_id: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Identifier of the writing agent/client (max 200 "
+                    "characters).")
+    confidence: Any = Field(default=None, json_schema_extra={
+        "type": ["number", "null"]},
+        description="How sure the source is of this fact (0.0-1.0).")
+    tags: Any = Field(default=None, json_schema_extra={
+        "type": ["array", "null"], "items": {"type": "string"}},
+        description="Free-form tags (trimmed, lower-cased, at most 32).")
     fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                                  description="Similarity threshold 0.0-1.0 for semantic dedup.")
     dedupe: Any = Field(default=None, json_schema_extra={
@@ -335,6 +364,34 @@ class BatchUpdate(BaseModel):
     clear_expires_at: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Remove the TTL (mutually exclusive with expires_at).")
+    valid_from: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="New ISO 8601 timestamp when the fact became true.")
+    valid_to: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="New ISO 8601 timestamp when the fact stops being true "
+                    "(mutually exclusive with clear_valid_to).")
+    clear_valid_to: Any = Field(default=None, json_schema_extra={
+        "type": ["boolean", "null"]},
+        description="Reopen the validity window (valid_to = NULL).")
+    source: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Where the fact came from (max 200 characters).")
+    agent_id: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Identifier of the writing agent (max 200 characters).")
+    confidence: Any = Field(default=None, json_schema_extra={
+        "type": ["number", "null"]},
+        description="How sure the source is of this fact (0.0-1.0).")
+    tags: Any = Field(default=None, json_schema_extra={
+        "type": ["array", "null"], "items": {"type": "string"}},
+        description="New tags (trimmed, lower-cased, at most 32).")
+    tags_mode: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"], "enum": ["replace", "merge", None]},
+        description="'replace' (default) or 'merge' (add to the stored tags).")
+    clear_tags: Any = Field(default=None, json_schema_extra={
+        "type": ["boolean", "null"]},
+        description="Remove every tag from the memory.")
     touch: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Refresh the memory without changing its content: sets "
@@ -482,6 +539,33 @@ def remember(
                           "first memory and writes nothing (including no "
                           "supersede side effects). Different scopes have "
                           "independent key spaces.")] = None,
+    valid_from: Annotated[
+        str | None,
+        Field(description="Optional ISO 8601 timestamp when this fact became "
+                          "true (default: now). Backdate a fact that was true "
+                          "earlier so `as_of` searches can find it.")] = None,
+    valid_to: Annotated[
+        str | None,
+        Field(description="Optional ISO 8601 timestamp when this fact stops "
+                          "being true. Usually set by a later supersede; omit "
+                          "for a fact that is still valid.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Where the fact came from (document, URL, person, "
+                          "system); trimmed, at most 200 characters.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Identifier of the agent/client that wrote the "
+                          "fact; trimmed, at most 200 characters.")] = None,
+    confidence: Annotated[
+        float | None,
+        Field(ge=0.0, le=1.0,
+              description="How sure the source is of this fact (0.0-1.0).")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Free-form tags (trimmed, lower-cased, at most 32, "
+                          "1-64 characters each). Filter with tags/tags_any "
+                          "on the read tools.")] = None,
     links: Annotated[
         list[dict[str, Any]] | None,
         Field(description="Optional graph edges to create in the same call "
@@ -574,6 +658,19 @@ def remember(
             parse_expires_at(expires_at)
         except ValueError as e:
             return fail(STATUS_ERROR, str(e))
+    try:
+        valid_from = parse_iso_timestamp(valid_from, "valid_from")
+        valid_to = parse_iso_timestamp(valid_to, "valid_to")
+        source = normalize_optional_text(source, "source")
+        agent_id = normalize_optional_text(agent_id, "agent_id")
+        confidence = validate_confidence(confidence)
+        tags = normalize_tags(tags)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    if valid_from is not None and valid_to is not None \
+            and valid_to < valid_from:
+        return fail(STATUS_ERROR,
+                    "valid_to must not be earlier than valid_from")
     if metadata is not None:
         metadata, meta_error = _coerce_metadata(metadata)
         if meta_error:
@@ -623,6 +720,12 @@ def remember(
             links=links,
             idempotency_key=idempotency_key,
             embedding=emb,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            source=source,
+            agent_id=agent_id,
+            confidence=confidence,
+            tags=tags,
         ))
         if outcome.status == STATUS_DUPLICATE:
             if not outcome.persist:
@@ -905,7 +1008,8 @@ def remember_batch(
     `supersede`, `supersede_content`, `supersede_last`, `dedupe`,
     `fuzzy_threshold`, `on_near_duplicate`, `contradiction_mode`,
     `contradiction_min_confidence`, `max_contradiction_supersedes`,
-    `expires_at`, `idempotency_key` and `links` (same edges as `remember`).
+    `expires_at`, `idempotency_key`, `valid_from`, `valid_to`, `source`,
+    `agent_id`, `confidence`, `tags` and `links` (same edges as `remember`).
     A malformed edge is a per-fact error; a runtime edge failure keeps the fact
     and warns ("links failed: ..."). Rejected or duplicate facts store no
     edges. An unknown per-fact key is refused in that entry only.
@@ -1090,6 +1194,23 @@ def remember_batch(
                                  "expires_at must be an ISO 8601 timestamp"))
                 continue
         try:
+            fvalid_from = parse_iso_timestamp(
+                fact.get("valid_from"), "valid_from")
+            fvalid_to = parse_iso_timestamp(
+                fact.get("valid_to"), "valid_to")
+            fsource = normalize_optional_text(fact.get("source"), "source")
+            fagent = normalize_optional_text(fact.get("agent_id"), "agent_id")
+            fconfidence = validate_confidence(fact.get("confidence"))
+            ftags = normalize_tags(fact.get("tags"))
+        except ValueError as e:
+            prepared.append((None, str(e)))
+            continue
+        if fvalid_from is not None and fvalid_to is not None \
+                and fvalid_to < fvalid_from:
+            prepared.append((None,
+                             "valid_to must not be earlier than valid_from"))
+            continue
+        try:
             fkey = _norm_idempotency_key(fact.get("idempotency_key"))
         except ValueError as e:
             prepared.append((None, str(e)))
@@ -1115,6 +1236,12 @@ def remember_batch(
             "ttl_warning": _ttl_past_warning(fexpires),
             "links": flinks,
             "idempotency_key": fkey,
+            "valid_from": fvalid_from,
+            "valid_to": fvalid_to,
+            "source": fsource,
+            "agent_id": fagent,
+            "confidence": fconfidence,
+            "tags": ftags,
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -1167,6 +1294,12 @@ def remember_batch(
                         probe_nli_config=False,
                         report_superseded_match=False,
                         idempotency_key=spec["idempotency_key"],
+                        valid_from=spec["valid_from"],
+                        valid_to=spec["valid_to"],
+                        source=spec["source"],
+                        agent_id=spec["agent_id"],
+                        confidence=spec["confidence"],
+                        tags=spec["tags"],
                     ))
                     if not outcome.persist:
                         raise _EntryRejected(outcome)
@@ -1470,6 +1603,42 @@ def update_memory(
         Field(description="Remove the TTL entirely (makes the memory "
                           "open-ended again). Mutually exclusive with "
                           "expires_at.")] = False,
+    valid_from: Annotated[
+        str | None,
+        Field(description="New ISO 8601 timestamp when this fact became "
+                          "true.")] = None,
+    valid_to: Annotated[
+        str | None,
+        Field(description="New ISO 8601 timestamp when this fact stops being "
+                          "true. Mutually exclusive with clear_valid_to.")] = None,
+    clear_valid_to: Annotated[
+        bool,
+        Field(description="Reopen the validity window (sets valid_to to "
+                          "NULL). Mutually exclusive with valid_to.")] = False,
+    source: Annotated[
+        str | None,
+        Field(description="Where the fact came from (max 200 characters); an "
+                          "empty string clears it.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Identifier of the writing agent/client (max 200 "
+                          "characters); an empty string clears it.")] = None,
+    confidence: Annotated[
+        float | None,
+        Field(ge=0.0, le=1.0,
+              description="How sure the source is of this fact (0.0-1.0).")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="New tags (trimmed, lower-cased, at most 32). "
+                          "`tags_mode` decides whether they replace or extend "
+                          "the stored tags.")] = None,
+    tags_mode: Annotated[
+        Literal["replace", "merge"],
+        Field(description="'replace' (default) sets exactly `tags`; 'merge' "
+                          "adds them to the stored tags.")] = "replace",
+    clear_tags: Annotated[
+        bool,
+        Field(description="Remove every tag from the memory.")] = False,
     touch: Annotated[
         bool,
         Field(description="Refresh the memory without changing its content: "
@@ -1488,6 +1657,9 @@ def update_memory(
     several scopes is refused with the scopes named, so pass `project`.
     `content` re-embeds and dedupe-checks the edit (`dedupe`/`fuzzy_threshold`).
     `expires_at` sets a TTL and `clear_expires_at=True` removes it.
+    `valid_from`/`valid_to` move the validity window (`clear_valid_to=True`
+    reopens it); `source`/`agent_id`/`confidence` update provenance and
+    `tags`/`tags_mode`/`clear_tags` the tags.
     `touch=True` only refreshes the decay age; `restore=True` undoes a soft
     delete and cannot be combined. A superseded or expired row answers
     `conflict`; revive an expired row with a future `expires_at` or
@@ -1508,6 +1680,23 @@ def update_memory(
     if expires_at is not None and clear_expires_at:
         return fail(STATUS_ERROR,
                     "pass either expires_at or clear_expires_at, not both")
+    if valid_to is not None and clear_valid_to:
+        return fail(STATUS_ERROR,
+                    "pass either valid_to or clear_valid_to, not both")
+    if tags_mode not in ("replace", "merge"):
+        return fail(STATUS_ERROR,
+                    "tags_mode must be 'replace' or 'merge'")
+    source_provided = source is not None
+    agent_provided = agent_id is not None
+    try:
+        valid_from_value = parse_iso_timestamp(valid_from, "valid_from")
+        valid_to_value = parse_iso_timestamp(valid_to, "valid_to")
+        source = normalize_optional_text(source, "source")
+        agent_id = normalize_optional_text(agent_id, "agent_id")
+        confidence_value = validate_confidence(confidence)
+        tags_value = normalize_tags(tags)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     if metadata_mode not in ("replace", "merge"):
         return fail(STATUS_ERROR,
                     "metadata_mode must be 'replace' or 'merge'")
@@ -1537,7 +1726,11 @@ def update_memory(
         if (content is not None or importance is not None
                 or metadata is not None or entity is not None
                 or mem_type is not None or expires_at is not None
-                or clear_expires_at or touch or clear_keys):
+                or clear_expires_at or touch or clear_keys
+                or valid_from is not None or valid_to is not None
+                or clear_valid_to or source_provided or agent_provided
+                or confidence is not None or tags is not None
+                or clear_tags):
             return fail(STATUS_ERROR,
                         "restore=true cannot be combined with other update "
                         "fields; it only clears the soft delete")
@@ -1587,6 +1780,23 @@ def update_memory(
         params.append(expires_value)
     elif clear_expires_at:
         sets.append("expires_at = NULL")
+    if valid_from is not None:
+        sets.append("valid_from = %s")
+        params.append(valid_from_value)
+    if valid_to is not None:
+        sets.append("valid_to = %s")
+        params.append(valid_to_value)
+    elif clear_valid_to:
+        sets.append("valid_to = NULL")
+    if source_provided:
+        sets.append("source = %s")
+        params.append(source)
+    if agent_provided:
+        sets.append("agent_id = %s")
+        params.append(agent_id)
+    if confidence_value is not None:
+        sets.append("confidence = %s")
+        params.append(confidence_value)
 
     if sets:
         # Updated memories must also age like new ones for decay scoring.
@@ -1645,6 +1855,20 @@ def update_memory(
                 merged.pop(key, None)
             sets.append("metadata = %s::jsonb")
             params.append(json.dumps(merged))
+        if tags_value is not None or clear_tags:
+            if tags_mode == "merge":
+                merged_tags = list(dict.fromkeys(
+                    stored_tags(db, active_table, memory_id)
+                    + list(tags_value or [])))
+            else:
+                merged_tags = list(tags_value or [])
+            if len(merged_tags) > MAX_TAGS:
+                db.rollback()
+                return fail(STATUS_ERROR,
+                            f"tags accepts at most {MAX_TAGS} tags "
+                            f"(after merging the stored tags)")
+            sets.append("tags = %s::text[]")
+            params.append(merged_tags)
         if sets and "updated_at = NOW()" not in sets:
             # A metadata-only edit must age like every other update.
             sets.append("updated_at = NOW()")
@@ -1653,7 +1877,9 @@ def update_memory(
             return fail(STATUS_ERROR,
                         "nothing to update: pass content, importance, metadata, "
                         "clear_metadata_keys, entity, mem_type, "
-                        "expires_at/clear_expires_at, touch=true or "
+                        "expires_at/clear_expires_at, valid_from, "
+                        "valid_to/clear_valid_to, source, agent_id, "
+                        "confidence, tags/tags_mode/clear_tags, touch=true or "
                         "restore=true")
         scope = _scope_of_table(cur, active_table)
         # `entity=None` means "keep the current entity", not "untagged": the
@@ -1721,9 +1947,12 @@ def update_batch(
         Field(description="Updates to apply. Each entry needs 'memory_id'; "
                           "optional 'content', 'importance', 'metadata', "
                           "'entity', 'mem_type', 'expires_at', "
-                          "'clear_expires_at', 'touch', 'restore' and "
-                          "'project'. Invalid entries are reported "
-                          "individually and the rest is still applied.")],
+                          "'clear_expires_at', 'valid_from', 'valid_to', "
+                          "'clear_valid_to', 'source', 'agent_id', "
+                          "'confidence', 'tags', 'tags_mode', 'clear_tags', "
+                          "'touch', 'restore' and 'project'. Invalid entries "
+                          "are reported individually and the rest is still "
+                          "applied.")],
     project: Annotated[
         str | None,
         Field(description="Default project scope for all entries (per-entry "
@@ -1744,10 +1973,13 @@ def update_batch(
     """Update several memories at once (savepoints per entry).
 
     Each entry works like `update_memory`: `content` re-embeds, then
-    `importance`/`metadata`/`entity`/`mem_type` and TTL are applied. An expired
-    row answers `conflict` unless revived with a future `expires_at` or
-    `clear_expires_at`. `touch=true` refreshes decay and combines with other
-    fields; `restore=true` undoes a soft delete and is exclusive.
+    `importance`/`metadata`/`entity`/`mem_type`, TTL, validity
+    (`valid_from`/`valid_to`/`clear_valid_to`), provenance (`source`,
+    `agent_id`, `confidence`) and tags (`tags`/`tags_mode`/`clear_tags`) are
+    applied. An expired row answers `conflict` unless revived with a future
+    `expires_at` or `clear_expires_at`. `touch=true` refreshes decay and
+    combines with other fields; `restore=true` undoes a soft delete and is
+    exclusive.
     An unknown id answers `not_found`, an id in several scopes without a
     `project` answers `error` with the `scopes`; one bad entry never aborts the
     rest. Answers `count` + `results`, `status="partial"` on failures.
@@ -1861,11 +2093,15 @@ def update_batch(
         try:
             entry_clear = _as_bool(entry.get("clear_expires_at"),
                                    "clear_expires_at")
+            entry_clear_valid_to = _as_bool(entry.get("clear_valid_to"),
+                                            "clear_valid_to")
+            entry_clear_tags = _as_bool(entry.get("clear_tags"), "clear_tags")
             entry_restore = _as_bool(entry.get("restore"), "restore")
             entry_touch = _as_bool(entry.get("touch"), "touch")
         except ValueError as exc:
             error = str(exc)
-            entry_clear = entry_restore = entry_touch = False
+            entry_clear = entry_clear_valid_to = entry_clear_tags = False
+            entry_restore = entry_touch = False
         if error is None and entry_expires is not None and entry_clear:
             error = "pass either expires_at or clear_expires_at, not both"
         elif error is None and entry_expires is not None:
@@ -1878,15 +2114,60 @@ def update_batch(
         entry_ttl_warning = (_ttl_past_warning(entry_expires)
                              if entry_expires is not None and error is None
                              else None)
+        entry_valid_from = entry.get("valid_from")
+        entry_valid_to = entry.get("valid_to")
+        if error is None and entry_valid_to is not None \
+                and entry_clear_valid_to:
+            error = "pass either valid_to or clear_valid_to, not both"
+        if error is None and entry_valid_from is not None:
+            try:
+                fields["valid_from"] = parse_iso_timestamp(
+                    entry_valid_from, "valid_from")
+            except ValueError as exc:
+                error = str(exc)
+        if error is None and entry_valid_to is not None:
+            try:
+                fields["valid_to"] = parse_iso_timestamp(
+                    entry_valid_to, "valid_to")
+            except ValueError as exc:
+                error = str(exc)
+        elif error is None and entry_clear_valid_to:
+            fields["valid_to"] = None
+        for name, label in (("source", "source"), ("agent_id", "agent_id")):
+            raw_text = entry.get(name)
+            if error is None and raw_text is not None:
+                try:
+                    fields[name] = normalize_optional_text(raw_text, label)
+                except ValueError as exc:
+                    error = str(exc)
+        entry_confidence = entry.get("confidence")
+        if error is None and entry_confidence is not None:
+            try:
+                fields["confidence"] = validate_confidence(entry_confidence)
+            except ValueError as exc:
+                error = str(exc)
+        entry_tags = entry.get("tags")
+        entry_tags_mode = entry.get("tags_mode") or "replace"
+        if error is None and entry_tags_mode not in ("replace", "merge"):
+            error = "tags_mode must be 'replace' or 'merge'"
+        if error is None and entry_tags is not None:
+            try:
+                entry_tags = normalize_tags(entry_tags)
+            except ValueError as exc:
+                error = str(exc)
         if error is None and entry_restore and (
-                fields or entry_touch or entry_clear_keys):
+                fields or entry_touch or entry_clear_keys
+                or entry_tags is not None or entry_clear_tags):
             error = ("restore=true cannot be combined with other update "
                      "fields")
         if error is None and not fields and not entry_restore \
-                and not entry_touch and not entry_clear_keys:
+                and not entry_touch and not entry_clear_keys \
+                and entry_tags is None and not entry_clear_tags:
             error = ("nothing to update: pass content, importance, metadata, "
                      "clear_metadata_keys, entity, mem_type, "
-                     "expires_at/clear_expires_at, touch=true or restore=true")
+                     "expires_at/clear_expires_at, valid_from, "
+                     "valid_to/clear_valid_to, source, agent_id, confidence, "
+                     "tags/tags_mode/clear_tags, touch=true or restore=true")
         if error:
             prepared.append((None, error))
         else:
@@ -1898,6 +2179,9 @@ def update_batch(
                               "fuzzy_threshold": entry_fuzzy,
                               "metadata_mode": entry_metadata_mode,
                               "clear_metadata_keys": entry_clear_keys or [],
+                              "tags": entry_tags,
+                              "tags_mode": entry_tags_mode,
+                              "clear_tags": entry_clear_tags,
                               "ttl_warning": entry_ttl_warning}, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -2045,6 +2329,23 @@ def update_batch(
                         merged.pop(key, None)
                     sets.append("metadata = %s::jsonb")
                     params.append(json.dumps(merged))
+                if spec["tags"] is not None or spec["clear_tags"]:
+                    if spec["tags_mode"] == "merge":
+                        merged_tags = list(dict.fromkeys(
+                            stored_tags(db, active_table, memory_id)
+                            + list(spec["tags"] or [])))
+                    else:
+                        merged_tags = list(spec["tags"] or [])
+                    if len(merged_tags) > MAX_TAGS:
+                        _undo(savepoint)
+                        results.append({
+                            "id": memory_id, "status": "error",
+                            "error": (f"tags accepts at most {MAX_TAGS} tags "
+                                      f"(after merging the stored tags)"),
+                            "warnings": []})
+                        continue
+                    sets.append("tags = %s::text[]")
+                    params.append(merged_tags)
                 near_entity = spec["fields"].get("entity")
                 if near_entity is None:
                     near_entity = stored_entity(db, active_table, memory_id)
@@ -2618,6 +2919,9 @@ def merge_memories(
     the sources' metadata (later ids win) and lets explicitly passed keys
     override it; graph-edge metadata (`relation_context`, `from`, `to`,
     `relation_type`, `weight`) is never carried onto a real fact.
+    Provenance follows the same conservative rule: `confidence` is the highest
+    source confidence, `source`/`agent_id` are only carried when every source
+    agrees, and `tags` are the union of the sources' tags.
     """
     warnings: list[str] = []
     if not isinstance(memory_ids, list) or not 2 <= len(memory_ids) <= 20:
@@ -2702,7 +3006,8 @@ def merge_memories(
         rows = db.rows_by_ids(
             ids, table=table,
             columns="id, content, mem_type, entity, importance, metadata, "
-                    "superseded_by, deleted_at, expires_at")
+                    "superseded_by, deleted_at, expires_at, confidence, "
+                    "source, agent_id, tags")
         by_id = {row["id"]: row for row in rows}
         invalid: dict[str, str] = {}
         for mid in ids:
@@ -2758,6 +3063,40 @@ def merge_memories(
         else:
             merged_meta = dict(metadata_obj or {})
 
+        # Provenance of a merge: a confidence is only an upper bound, so the
+        # strongest source wins; a source/agent is only carried when every
+        # source agrees, otherwise the merged fact has no single origin.
+        known_confidence = [float(row["confidence"]) for row in ordered
+                            if row.get("confidence") is not None]
+        merged_confidence = (max(known_confidence) if known_confidence
+                             else None)
+        source_values = {row.get("source") for row in ordered}
+        if len(source_values) == 1:
+            merged_source = next(iter(source_values))
+        else:
+            merged_source = None
+            if any(source_values):
+                warnings.append("the sources had different sources; the "
+                                "merged memory has no source")
+        agent_values = {row.get("agent_id") for row in ordered}
+        if len(agent_values) == 1:
+            merged_agent = next(iter(agent_values))
+        else:
+            merged_agent = None
+            if any(agent_values):
+                warnings.append("the sources had different agent ids; the "
+                                "merged memory has no agent_id")
+        merged_tags: list[str] = []
+        for row in ordered:
+            for tag in row.get("tags") or []:
+                if tag not in merged_tags:
+                    merged_tags.append(tag)
+        if len(merged_tags) > MAX_TAGS:
+            db.rollback()
+            return fail(STATUS_ERROR,
+                        f"the sources carry {len(merged_tags)} distinct tags; "
+                        f"a memory accepts at most {MAX_TAGS}")
+
         emb = embed([content])[0]
         duplicate = _deduplicate(
             cur, content, merge_project, embedding_vec=emb,
@@ -2779,14 +3118,20 @@ def merge_memories(
                               "mem_type": mem_type,
                               "importance": importance,
                               "project": scope_name,
-                              "metadata": merged_meta},
+                              "metadata": merged_meta,
+                              "confidence": merged_confidence,
+                              "source": merged_source,
+                              "agent_id": merged_agent,
+                              "tags": merged_tags},
                 would_supersede=ids, merged_ids=ids,
                 warnings=warnings,
                 message=f"Would merge {len(ids)} memories into one")
         new_id = _store_memory(
             cur, content, emb, mem_type, entity, importance, merged_meta,
             merge_project, expires_at=None,
-            scope=("global" if scope_name == "global" else "project"))
+            scope=("global" if scope_name == "global" else "project"),
+            source=merged_source, agent_id=merged_agent,
+            confidence=merged_confidence, tags=merged_tags)
         db.supersede_many(ids, new_id, table=table)
         db.commit()
         return ok(

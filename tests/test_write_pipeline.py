@@ -27,7 +27,9 @@ class FakeStore:
         return False
 
     def insert(self, content, embedding_vec, mem_type, entity, importance,
-               metadata, *, project=None, scope=None, expires_at=None):
+               metadata, *, project=None, scope=None, expires_at=None,
+               valid_from=None, valid_to=None, source=None, agent_id=None,
+               confidence=None, tags=None):
         self.calls.append(("insert", content, mem_type, entity,
                            dict(metadata), project, scope))
         return "new-id"

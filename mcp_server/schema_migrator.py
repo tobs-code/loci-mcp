@@ -153,6 +153,102 @@ def migrate_idempotency_keys() -> int:
     return changed
 
 
+# Columns added after the first release. `ensure_project_table` and the
+# startup migration share this list, so a new column is never added in one
+# place and forgotten in the other.
+_FEATURE_COLUMN_DEFINITIONS = (
+    ("valid_to", "TIMESTAMPTZ"),
+    ("source", "TEXT"),
+    ("agent_id", "TEXT"),
+    ("confidence", "FLOAT"),
+    ("tags", "TEXT[] NOT NULL DEFAULT '{}'"),
+)
+
+_CONFIDENCE_CHECK = (
+    "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)")
+
+
+def _feature_index_digest(table: str) -> str:
+    if table == "memories":
+        return "memories"
+    return hashlib.sha1(table[len("mem_"):].encode()).hexdigest()[:10]
+
+
+def _ensure_feature_columns(cur, table: str, idx_digest: str) -> None:
+    """Add the temporal/provenance/tag columns plus their indexes to a table.
+
+    `valid_from` needs a three-step migration instead of a plain
+    `DEFAULT NOW()`: on an existing table PostgreSQL would fill every old row
+    with the migration time, so a backdated fact would suddenly look newer
+    than it is. Backfilling from `created_at` keeps the dates honest, then the
+    column becomes NOT NULL.
+    """
+    _safe_ident(table, "table name")
+    cur.execute(
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ")
+    cur.execute(
+        f"UPDATE {table} SET valid_from = COALESCE(created_at, NOW()) "
+        "WHERE valid_from IS NULL")
+    cur.execute(
+        f"ALTER TABLE {table} ALTER COLUMN valid_from SET DEFAULT NOW()")
+    cur.execute(
+        f"ALTER TABLE {table} ALTER COLUMN valid_from SET NOT NULL")
+    for column, definition in _FEATURE_COLUMN_DEFINITIONS:
+        cur.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{idx_digest}_validity "
+        f"ON {table}(valid_from, valid_to)")
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{idx_digest}_tags "
+        f"ON {table} USING GIN (tags)")
+    constraint = f"chk_{idx_digest}_confidence"
+    cur.execute(
+        "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass",
+        (constraint, table),
+    )
+    if not cur.fetchone():
+        cur.execute(
+            f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+            f"CHECK ({_CONFIDENCE_CHECK})")
+
+
+def migrate_feature_columns() -> int:
+    """Add temporal/provenance/tag columns to every existing memory table.
+
+    A table created by an older build never passes through
+    `ensure_project_table` again until a write touches that scope, so the
+    startup pass covers every table. The function is idempotent and returns
+    the number of tables that were missing `valid_from`.
+    """
+    conn = get_conn()
+    changed = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' "
+            "AND table_name ~ '^(memories|mem_[A-Za-z0-9_]+)$'"
+        )
+        for (table,) in cur.fetchall():
+            _safe_ident(table, "table name")
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns WHERE "
+                "table_schema = 'public' AND table_name = %s AND "
+                "column_name = 'valid_from'", (table,))
+            had_column = cur.fetchone() is not None
+            _ensure_feature_columns(cur, table, _feature_index_digest(table))
+            if not had_column:
+                changed += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return changed
+
+
 def ensure_project_table(cur, project: str) -> None:
     project = _norm_project(project)
     if not project:
@@ -180,6 +276,12 @@ def ensure_project_table(cur, project: str) -> None:
             superseded_by TEXT,
             deleted_at TIMESTAMPTZ,
             expires_at TIMESTAMPTZ,
+            valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to TIMESTAMPTZ,
+            source TEXT,
+            agent_id TEXT,
+            confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+            tags TEXT[] NOT NULL DEFAULT '{{}}',
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -187,6 +289,7 @@ def ensure_project_table(cur, project: str) -> None:
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS idempotency_key TEXT")
+    _ensure_feature_columns(cur, f"mem_{safe}", idx_digest)
     cur.execute(
         f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{idx_digest}_idem "
         f"ON mem_{safe}(idempotency_key) "

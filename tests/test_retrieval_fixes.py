@@ -224,14 +224,14 @@ def test_duplicate_warning_names_the_dedupe_mode():
 # One name for the same thing
 # --------------------------------------------------------------------------
 
-def test_export_writes_both_type_and_mem_type():
+def test_export_writes_only_mem_type():
     remember("Export naming probe", mem_type="decision")
 
     payload = export_memories()["data"]
 
     record = payload["records"][0]
-    assert record["type"] == "decision"
     assert record["mem_type"] == "decision"
+    assert "type" not in record
 
 
 def test_memories_report_their_project():

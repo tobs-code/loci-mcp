@@ -65,34 +65,42 @@ def _store_memory(
     supersede: str | None = None,
     scope: str | None = None,
     expires_at: str | None = None,
+    *,
+    source: str | None = None,
+    agent_id: str | None = None,
+    confidence: float | None = None,
+    tags: list[str] | None = None,
 ) -> str:
     mem_id = _gen_id()
     now = _now()
     table = _mem_table(project)
-    c_hash = _content_hash(content)
     effective_scope = scope or ("project" if project else "global")
-    # expires_at arrives as an ISO string the caller already validated; a
+    columns = ["id", "content", "content_hash", "embedding", "mem_type",
+               "scope", "entity", "importance", "metadata", "superseded_by",
+               "created_at", "updated_at"]
+    values: list[Any] = [mem_id, content, _content_hash(content),
+                         embedding_vec, mem_type, effective_scope, entity,
+                         importance, json.dumps(metadata), supersede, now, now]
+    placeholders = ["%s", "%s", "%s", "%s::vector", "%s", "%s", "%s", "%s",
+                    "%s", "%s", "%s", "%s"]
+    # `expires_at` arrives as an ISO string the caller already validated; a
     # NULL value keeps the memory open-ended (the common case).
-    if expires_at is not None:
-        cur.execute(
-            f"""INSERT INTO {table}
-                (id, content, content_hash, embedding, mem_type, scope, entity,
-                 importance, metadata, superseded_by, created_at, updated_at,
-                 expires_at)
-            VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s::timestamptz)""",
-            (mem_id, content, c_hash, embedding_vec, mem_type,
-             effective_scope, entity, importance, json.dumps(metadata),
-             supersede, now, now, expires_at),
-        )
-        return mem_id
+    for name, value, placeholder in (
+        ("expires_at", expires_at, "%s::timestamptz"),
+        ("source", source, "%s"),
+        ("agent_id", agent_id, "%s"),
+        ("confidence", confidence, "%s"),
+        ("tags", tags, "%s::text[]"),
+    ):
+        if value is None:
+            continue
+        columns.append(name)
+        placeholders.append(placeholder)
+        values.append(list(value) if name == "tags" else value)
     cur.execute(
-        f"""INSERT INTO {table}
-            (id, content, content_hash, embedding, mem_type, scope, entity,
-             importance, metadata, superseded_by, created_at, updated_at)
-        VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, %s, %s)""",
-        (mem_id, content, c_hash, embedding_vec, mem_type, effective_scope, entity,
-         importance, json.dumps(metadata), supersede, now, now),
+        f"INSERT INTO {table} ({', '.join(columns)}) "
+        f"VALUES ({', '.join(placeholders)})",
+        tuple(values),
     )
     return mem_id
 
@@ -101,12 +109,14 @@ def _supersede(cur, project: str | None, new_id: str, old_id: str) -> None:
     """Mark old_id as superseded by new_id in the scoped and the global table."""
     table = _mem_table(project)
     cur.execute(
-        f"UPDATE {table} SET superseded_by = %s, updated_at = NOW() WHERE id = %s",
+        f"UPDATE {table} SET superseded_by = %s, "
+        f"valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() WHERE id = %s",
         (new_id, old_id),
     )
     if project:
         cur.execute(
-            "UPDATE memories SET superseded_by = %s, updated_at = NOW() WHERE id = %s",
+            "UPDATE memories SET superseded_by = %s, "
+            "valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() WHERE id = %s",
             (new_id, old_id),
         )
 

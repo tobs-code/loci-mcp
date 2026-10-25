@@ -63,7 +63,8 @@ def test_mark_superseded_only_touches_the_resolved_table():
     store.mark_superseded("old", "new", project="api", target="global")
     statements = [sql for sql, _ in store.conn.cursor_instance.executed]
     assert statements == [
-        ("UPDATE memories SET superseded_by = %s, updated_at = NOW() "
+        ("UPDATE memories SET superseded_by = %s, "
+         "valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
          "WHERE id = %s")
     ]
 
@@ -71,7 +72,8 @@ def test_mark_superseded_only_touches_the_resolved_table():
     store.mark_superseded("old", "new", project="api", target="project")
     statements = [sql for sql, _ in store.conn.cursor_instance.executed]
     assert statements == [
-        ("UPDATE mem_api SET superseded_by = %s, updated_at = NOW() "
+        ("UPDATE mem_api SET superseded_by = %s, "
+         "valid_to = COALESCE(valid_to, NOW()), updated_at = NOW() "
          "WHERE id = %s")
     ]
 

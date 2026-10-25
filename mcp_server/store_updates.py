@@ -85,6 +85,15 @@ def stored_entity(store, table: str, memory_id: str) -> str | None:
     return row.get("entity") if row else None
 
 
+def stored_tags(store, table: str, memory_id: str) -> list[str]:
+    """The stored tags of one row (empty list when absent)."""
+    row = store.one(f"SELECT tags FROM {table} WHERE id = %s",
+                    (memory_id,))
+    if not row or not row.get("tags"):
+        return []
+    return [str(tag) for tag in row["tags"]]
+
+
 def apply_fields(store, table: str, memory_id: str, sets: list[str],
                  params: list[Any]) -> int:
     """Write the prepared field updates to an active row."""

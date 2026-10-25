@@ -280,6 +280,31 @@ def recall(
                           "key/value pairs. Scalar values compare tolerantly "
                           "(the string '8001' matches the number 8001); "
                           "objects and arrays use JSON containment.")] = None,
+    as_of: Annotated[
+        str | None,
+        Field(description="Only memories that were valid at this ISO 8601 "
+                          "instant: valid_from <= as_of and (valid_to is null "
+                          "or valid_to > as_of).")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying every one of these tags "
+                          "(AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying at least one of these tags "
+                          "(OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only memories whose provenance `source` equals this "
+                          "(case-sensitive).")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only memories with a confidence at or above this "
+                          "value (0.0-1.0). Memories without a confidence are "
+                          "excluded.")] = None,
     include_relation_context: Annotated[
         bool,
         Field(description="True (default) includes the relation-context "
@@ -353,7 +378,9 @@ def recall(
         except ValueError as e:
             return fail(STATUS_ERROR, str(e))
     try:
-        _extra_conditions(updated_after, metadata_filter)
+        _extra_conditions(updated_after, metadata_filter, as_of=as_of,
+                          tags=tags, tags_any=tags_any, source=source,
+                          agent_id=agent_id, min_confidence=min_confidence)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     # The graph expansion needs a starting entity. `graph_entity` names it
@@ -408,6 +435,12 @@ def recall(
             stats=stats,
             include_expired=include_expired,
             include_deleted=include_deleted,
+            as_of=as_of,
+            tags=tags,
+            tags_any=tags_any,
+            source=source,
+            agent_id=agent_id,
+            min_confidence=min_confidence,
         ))
 
         # Graph-enhanced retrieval when enabled
@@ -420,6 +453,12 @@ def recall(
                 all_projects=scope.all_projects,
                 include_expired=include_expired,
                 include_deleted=include_deleted,
+                as_of=as_of,
+                tags=tags,
+                tags_any=tags_any,
+                source=source,
+                agent_id=agent_id,
+                min_confidence=min_confidence,
                 warnings=warnings,
                 cur=cur,
             )
@@ -527,6 +566,7 @@ def recall(
     filtered_out = stats.get("dropped_by_similarity", 0)
     dropped_by_coverage = stats.get("dropped_by_coverage", 0)
     dropped_by_expired = stats.get("dropped_by_expired", 0)
+    dropped_by_validity = stats.get("dropped_by_validity", 0)
     dropped_by_cross_scope = stats.get("dropped_by_cross_scope_duplicate", 0)
     candidates = stats.get("candidates", 0)
     best_dropped = stats.get("best_dropped_by_similarity")
@@ -553,6 +593,11 @@ def recall(
             reasons.append(
                 f"{dropped_by_expired} memory/memories were hidden because "
                 f"their TTL expired (pass include_expired=true to see them)")
+        if dropped_by_validity:
+            reasons.append(
+                f"{dropped_by_validity} memory/memories were not valid at "
+                f"as_of={as_of!r} (their validity window did not contain that "
+                f"time; omit as_of or pass a timestamp inside the window)")
         if dropped_by_decay:
             reasons.append(
                 f"{dropped_by_decay} hit(s) were below "
@@ -656,6 +701,8 @@ def recall(
         payload["dropped_by_coverage"] = dropped_by_coverage
     if dropped_by_expired:
         payload["dropped_by_expired"] = dropped_by_expired
+    if dropped_by_validity:
+        payload["dropped_by_validity"] = dropped_by_validity
     # Filter counters are reported even when hits survive: an agent must be
     # able to see that the decay or superseded filter removed candidates
     # from a non-empty result instead of silently getting fewer hits.
@@ -776,6 +823,29 @@ def recall_batch(
         list[str] | None,
         Field(description="Only return these columns per hit, e.g. "
                           "['id', 'content'].")] = None,
+    as_of: Annotated[
+        str | None,
+        Field(description="Only memories valid at this ISO 8601 instant "
+                          "(applies to every query).")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying every one of these tags "
+                          "(AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying at least one of these tags "
+                          "(OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only memories whose provenance `source` equals "
+                          "this.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only memories with a confidence at or above this "
+                          "value (0.0-1.0).")] = None,
 ) -> dict[str, Any]:
     """Run up to 25 independent `recall` queries in one call.
 
@@ -823,7 +893,9 @@ def recall_batch(
             graph_boost=graph_boost, include_global=include_global,
             min_similarity=min_similarity, min_relevance=min_relevance,
             fields=fields, detail=detail,
-            include_relation_context=include_relation_context)
+            include_relation_context=include_relation_context,
+            as_of=as_of, tags=tags, tags_any=tags_any, source=source,
+            agent_id=agent_id, min_confidence=min_confidence)
         entry = {"index": index, "query": query, **call}
         if not call.get("ok"):
             warnings.append(
@@ -873,6 +945,31 @@ def list_memories(
     order_by: Annotated[
         Literal["updated_at", "created_at", "access_count", "importance"],
         Field(description="Sort order (default: updated_at, newest first).")] = "updated_at",
+    as_of: Annotated[
+        str | None,
+        Field(description="Only memories that were valid at this ISO 8601 "
+                          "instant: valid_from <= as_of and (valid_to is null "
+                          "or valid_to > as_of).")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying every one of these tags "
+                          "(AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying at least one of these tags "
+                          "(OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only memories whose provenance `source` equals "
+                          "this.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only memories with a confidence at or above this "
+                          "value (0.0-1.0). Memories without a confidence are "
+                          "excluded.")] = None,
     contains: Annotated[
         str | None,
         Field(description="Only memories whose content contains this text "
@@ -971,7 +1068,9 @@ def list_memories(
         except ValueError as e:
             return fail(STATUS_ERROR, str(e))
     try:
-        _extra_conditions(updated_after, metadata_filter)
+        _extra_conditions(updated_after, metadata_filter, as_of=as_of,
+                          tags=tags, tags_any=tags_any, source=source,
+                          agent_id=agent_id, min_confidence=min_confidence)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     order_value = browse_order_column(order_by)
@@ -996,7 +1095,9 @@ def list_memories(
             name for name, value in (
                 ("entity", entity), ("mem_type", mem_type),
                 ("contains", contains), ("updated_after", updated_after),
-                ("metadata_filter", metadata_filter),
+                ("metadata_filter", metadata_filter), ("as_of", as_of),
+                ("tags", tags), ("tags_any", tags_any), ("source", source),
+                ("agent_id", agent_id), ("min_confidence", min_confidence),
             ) if value is not None
         ]
         if offset:
@@ -1044,7 +1145,9 @@ def list_memories(
             name for name, value in (
                 ("entity", entity), ("mem_type", mem_type),
                 ("contains", contains), ("updated_after", updated_after),
-                ("metadata_filter", metadata_filter),
+                ("metadata_filter", metadata_filter), ("as_of", as_of),
+                ("tags", tags), ("tags_any", tags_any), ("source", source),
+                ("agent_id", agent_id), ("min_confidence", min_confidence),
             ) if value is not None
         ]
         if offset:
@@ -1084,6 +1187,12 @@ def list_memories(
             contains=contains,
             updated_after=updated_after,
             metadata_filter=metadata_filter,
+            as_of=as_of,
+            tags=tags,
+            tags_any=tags_any,
+            source=source,
+            agent_id=agent_id,
+            min_confidence=min_confidence,
             include_relation_context=include_relation_context,
             fields=fields,
         ))
@@ -1382,6 +1491,29 @@ def get_entity(name: Annotated[
         Field(description="Skip this many memories (default 0). Use it with "
                           "`limit` to page through an entity with many "
                           "memories.")] = 0,
+    as_of: Annotated[
+        str | None,
+        Field(description="Only memories that were valid at this ISO 8601 "
+                          "instant.")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying every one of these tags "
+                          "(AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying at least one of these tags "
+                          "(OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only memories whose provenance `source` equals "
+                          "this.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only memories with a confidence at or above this "
+                          "value (0.0-1.0).")] = None,
 ) -> dict[str, Any]:
     """Everything known about one entity: details, linked memories, connections.
 
@@ -1425,6 +1557,13 @@ def get_entity(name: Annotated[
     fields_error = validate_fields(fields)
     if fields_error:
         return fail(STATUS_ERROR, fields_error)
+    try:
+        entity_feature_conditions, entity_feature_params = _extra_conditions(
+            None, None, as_of=as_of, tags=tags, tags_any=tags_any,
+            source=source, agent_id=agent_id,
+            min_confidence=min_confidence)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     db = MemoryStore()
     memories = []
     entity_data = None
@@ -1453,7 +1592,9 @@ def get_entity(name: Annotated[
         for entity_project in graph_projects(db, target):
             scope_presence[entity_project or "global"] = "graph"
         total, hidden_duplicates = entity_row_count(
-            db, target, used_tables, include_superseded, include_expired)
+            db, target, used_tables, include_superseded, include_expired,
+            extra_conditions=entity_feature_conditions,
+            extra_params=entity_feature_params)
         # Fetch enough rows that the cross-scope copies the dedupe removes
         # cannot leave the page short. Adding just the hidden count keeps a
         # big entity from loading every row for a ten-item page.
@@ -1466,6 +1607,12 @@ def get_entity(name: Annotated[
             include_superseded=include_superseded,
             include_expired=include_expired,
             tables=tables,
+            as_of=as_of,
+            tags=tags,
+            tags_any=tags_any,
+            source=source,
+            agent_id=agent_id,
+            min_confidence=min_confidence,
         ))
         # An identical active fact in project and global is one row: the page
         # must apply the same rule as the count, otherwise `total`, `count`
@@ -1637,6 +1784,29 @@ def get_entities(
     offset_per_entity: Annotated[
         int,
         Field(description="Skip this many memories per entity (default 0).")] = 0,
+    as_of: Annotated[
+        str | None,
+        Field(description="Only memories that were valid at this ISO 8601 "
+                          "instant (applies to every entity).")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying every one of these tags "
+                          "(AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying at least one of these tags "
+                          "(OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only memories whose provenance `source` equals "
+                          "this.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only memories with a confidence at or above this "
+                          "value (0.0-1.0).")] = None,
 ) -> dict[str, Any]:
     """Look up several entities in one call.
 
@@ -1695,6 +1865,12 @@ def get_entities(
             fields=fields,
             limit=limit_per_entity,
             offset=offset_per_entity,
+            as_of=as_of,
+            tags=tags,
+            tags_any=tags_any,
+            source=source,
+            agent_id=agent_id,
+            min_confidence=min_confidence,
         )
         if payload.get("ok"):
             entry: dict[str, Any] = {
@@ -2113,6 +2289,29 @@ def compile_context(
         str | None,
         Field(description="Entity to expand the graph neighbourhood from "
                           "without restricting the query.")] = None,
+    as_of: Annotated[
+        str | None,
+        Field(description="Only memories that were valid at this ISO 8601 "
+                          "instant.")] = None,
+    tags: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying every one of these tags "
+                          "(AND). Mutually exclusive with `tags_any`.")] = None,
+    tags_any: Annotated[
+        list[str] | None,
+        Field(description="Only memories carrying at least one of these tags "
+                          "(OR). Mutually exclusive with `tags`.")] = None,
+    source: Annotated[
+        str | None,
+        Field(description="Only memories whose provenance `source` equals "
+                          "this.")] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(description="Only memories written by this agent id.")] = None,
+    min_confidence: Annotated[
+        float | None,
+        Field(description="Only memories with a confidence at or above this "
+                          "value (0.0-1.0).")] = None,
 ) -> dict[str, Any]:
     """Assemble a token-bounded context block from ranked memories.
 
@@ -2145,6 +2344,12 @@ def compile_context(
             entity=entity,
             metadata_filter=metadata_filter,
             updated_after=updated_after,
+            as_of=as_of,
+            tags=tags,
+            tags_any=tags_any,
+            source=source,
+            agent_id=agent_id,
+            min_confidence=min_confidence,
             detail="full",
         )
         if not search.get("ok"):

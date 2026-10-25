@@ -101,8 +101,15 @@ def relation_context_rows(store, target: str, tables: list[str],
 
 def entity_row_count(store, target: str, tables: list[str],
                      include_superseded: bool,
-                     include_expired: bool = False) -> tuple[int, int]:
-    """Rows `get_entity` would list, plus the copies the dedupe hides."""
+                     include_expired: bool = False,
+                     extra_conditions: list[str] | None = None,
+                     extra_params: list | None = None) -> tuple[int, int]:
+    """Rows `get_entity` would list, plus the copies the dedupe hides.
+
+    `extra_conditions`/`extra_params` carry the optional column filters
+    (validity, provenance, tags) so `total` counts exactly the rows the page
+    may show.
+    """
     from mcp_server.browse import dedupe_rows
 
     if not tables:
@@ -110,12 +117,16 @@ def entity_row_count(store, target: str, tables: list[str],
     where = ("entity = %s AND " + visibility_sql(
         include_superseded=include_superseded,
         include_expired=include_expired))
+    conditions = list(extra_conditions or [])
+    params: list = [target] + list(extra_params or [])
+    if conditions:
+        where += " AND " + " AND ".join(conditions)
     rows: list[dict] = []
     for table in tables:
         for item in store.all(
                 f"SELECT id, content_hash, superseded_by, deleted_at, "
                 f"expires_at "
-                f"FROM {table} WHERE {where}", (target,)):
+                f"FROM {table} WHERE {where}", tuple(params)):
             item["_table"] = table
             rows.append(item)
     unique, hidden = dedupe_rows(rows)
