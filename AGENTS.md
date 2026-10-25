@@ -186,8 +186,8 @@ Valid `mem_type`: `fact`, `decision`, `learning`, `preference`, `pattern`,
 - `remember`/`remember_batch` accept `links` to create edges with the fact
   (`from_entity` defaults to the fact's entity). Malformed links are argument
   errors before the write; an edge failure rolls back to a savepoint and warns
-  `links failed: ...` while the fact stays. Rejected or duplicate facts store
-  no edges.
+  `links failed: ...` while the fact stays. A rejected fact stores no edges; a
+  duplicate write still applies its `links` to the existing memory.
 - `relate_batch` is all-or-nothing in one transaction (an invalid edge names its
   index; self-loops warn). `unrelate` deletes one edge, soft-forgets its context
   unless `keep_context=true`, and removes nodes left without an edge or memory.

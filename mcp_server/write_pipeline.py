@@ -41,6 +41,7 @@ from mcp_server.lifecycle import parse_expires_at
 from mcp_server.scope_catalog import (
     _all_mem_tables,
     _mem_table,
+    _norm_entity,
     _safe_ident,
     _scope_of_table,
 )
@@ -688,11 +689,27 @@ def _validate_links(links: Any, default_entity: str | None) -> list[str]:
                 _safe_ident(relation_type, "relation_type")
             except ValueError as e:
                 errors.append(f"links[{i}]: {e}")
-        weight = link.get("weight", 1.0)
-        try:
-            GraphStore.validate_weight(weight)
-        except (TypeError, ValueError) as e:
-            errors.append(f"links[{i}]: weight: {e}")
+        # GraphStore.relate normalizes entity names with _norm_entity, which
+        # also rejects the Cypher-reserved characters. Validating only with
+        # _norm_str let such a name through here and made the edge fail later
+        # during persistence, after the caller believed the input was valid.
+        for field_name, name in (("from_entity", from_entity),
+                                 ("to_entity", to_entity)):
+            if not name:
+                continue
+            try:
+                _norm_entity(name)
+            except ValueError as e:
+                errors.append(f"links[{i}]: {field_name}: {e}")
+        # An absent (or null) weight means "keep the edge's stored strength".
+        # Only a value the caller actually passed is validated here; a new
+        # edge still defaults to 1.0 inside GraphStore.relate.
+        weight = link.get("weight")
+        if weight is not None:
+            try:
+                GraphStore.validate_weight(weight)
+            except (TypeError, ValueError) as e:
+                errors.append(f"links[{i}]: weight: {e}")
         context = link.get("context")
         if context is not None and not isinstance(context, str):
             errors.append(f"links[{i}]: 'context' must be a string")
@@ -703,13 +720,17 @@ def _prepare_links(links: list[dict], default_entity: str | None) -> list[dict]:
     """Normalize `links` items into GraphStore edge dicts."""
     edges: list[dict] = []
     for link in links:
+        raw_weight = link.get("weight")
         edges.append({
             "from_entity": (_norm_str(link.get("from_entity"))
                             or default_entity),
-            "to_entity": link.get("to_entity").strip()
-            if isinstance(link.get("to_entity"), str) else "",
+            "to_entity": _norm_str(link.get("to_entity")) or "",
             "relation_type": link.get("relation_type"),
-            "weight": GraphStore.validate_weight(link.get("weight", 1.0)),
+            # None means "preserve an existing edge's weight" exactly like
+            # `relate`/`relate_batch`; a missing weight must not silently be
+            # treated as an explicit 1.0.
+            "weight": (None if raw_weight is None
+                       else GraphStore.validate_weight(raw_weight)),
             "context": link.get("context"),
         })
     return edges
@@ -733,11 +754,11 @@ def _apply_remember_links(
     warnings: list[str] = []
     if not links:
         return results, warnings
-    edges_added = False
+    savepoint_created = False
     try:
         cur.execute("SAVEPOINT remember_links")
+        savepoint_created = True
         graph = GraphStore(cur=cur)
-        edges_added = True
         for edge in _prepare_links(links, default_entity):
             for lr in graph.relate([edge], store_project):
                 entry = dict(lr)
@@ -750,10 +771,15 @@ def _apply_remember_links(
                 results.append(entry)
         cur.execute("RELEASE SAVEPOINT remember_links")
     except Exception as e:
-        if edges_added:
+        if savepoint_created:
             cur.execute("ROLLBACK TO SAVEPOINT remember_links")
             cur.execute("RELEASE SAVEPOINT remember_links")
-        warnings.append(f"links failed: {e}")
+        # The rollback undid every edge of this call, including edges that
+        # were applied before the failing one. Reporting those as `created`
+        # would claim a persistence state that no longer exists, so the whole
+        # link payload is dropped and only the failure is surfaced.
+        results = []
+        warnings = [f"links failed: {e}"]
     return results, warnings
 
 
