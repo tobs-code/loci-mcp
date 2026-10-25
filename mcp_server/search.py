@@ -1024,12 +1024,12 @@ def _search_memories_rrf(
             relevance = _relevance_score(similarities.get(key, 0.0),
                                          text_scores.get(key, 0.0))
             if key in exact_results:
-                # The literal needle is the strongest evidence a lexical hit
-                # can carry: an exact content match must not lose against a
-                # vaguely similar vector hit, and a substring (an id inside a
-                # longer note) must stay competitive.
-                relevance = max(
-                    relevance, 0.95 if exact_modes[key] == "content" else 0.85)
+                # An exact literal hit is its own retriever signal (it enters
+                # the fusion with a stronger RRF weight and is exempt from the
+                # FTS-only noise floor). `_relevance_score` is left as the
+                # genuine vector+FTS blend: overwriting it with a constant
+                # flattened two exact hits of very different similarity into
+                # the same score and made the field a lie.
                 d["_exact_match"] = exact_modes[key]
             # A project-scoped row wins over an identical global one: the
             # global scope is the fallback, not an equal peer. The boost is
@@ -1041,7 +1041,7 @@ def _search_memories_rrf(
                 effective_boost = round(PROJECT_SCOPE_BOOST * (1.0 - relevance), 4)
                 relevance = relevance + effective_boost
                 d["_scope_boost"] = effective_boost
-            d["_relevance_score"] = round(relevance, 4)
+            d["_relevance_score"] = round(_clamp01(relevance), 4)
             _apply_history_penalty(d)
             if not include_embedding:
                 d.pop("embedding", None)

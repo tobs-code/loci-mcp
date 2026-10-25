@@ -268,8 +268,17 @@ counts and health.
 - An exact literal hit is a first-class retriever: an identifier-like token
   (`ZEBRAFISH_TOKEN`, `app.py`, `v1.2.3`) or a quoted phrase is searched as a
   case-insensitive substring and fused with a stronger RRF weight. Such rows
-  carry `_exact_match` (`"content"` or `"substring"`) and a relevance floor of
-  0.95/0.85, so an exact id outranks a vaguely similar vector hit.
+  carry `_exact_match` (`"content"` or `"substring"`) and enter the fusion
+  with a stronger weight, so an exact id outranks a vaguely similar vector hit.
+  `_relevance_score` stays the genuine vector+FTS blend (it is no longer
+  overwritten by a constant), so two exact hits of different similarity keep
+  different scores; the reranker still floors an exact hit it was asked to
+  score.
+- Pinned facts (`pinned=true`) are the always-include set: `recall`
+  (`include_pinned=true`) and `compile_context` (default) add them to the page
+  regardless of the relevance/decay floors, after the structural filters. A pin
+  carries `_pinned: true` and `_relevance_score` 0.0 (no query judged it).
+  `list_memories(order_by="pinned")` lists them first.
 - Vector search is exact on scopes below 10,000 rows: no IVFFlat index is
   built there, so a nearby row is never missed by an unprobed list.
 - FTS is OR-based; the text score is multiplied by query coverage, and a

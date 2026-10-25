@@ -233,6 +233,31 @@ def test_export_import_preserves_pinned():
 # Bug 3: the exact-match path must not flatten `_relevance_score`
 # ---------------------------------------------------------------------------
 
+def test_exact_matches_keep_their_real_relevance():
+    forget(entity="*", project="round44-exact", soft=False, dry_run=False)
+    # Both rows contain the literal identifier, so both are exact hits; their
+    # vector similarity to the query differs (one carries extra unrelated
+    # words). Before the fix both reported the constant floor.
+    remember("ZEBRAFISH_TOKEN", project="round44-exact")
+    remember("ZEBRAFISH_TOKEN unrelated padded words here",
+             project="round44-exact")
+
+    hits = recall("ZEBRAFISH_TOKEN", project="round44-exact")["results"]
+    by_content = {r["content"]: r for r in hits}
+    bare = by_content.get("ZEBRAFISH_TOKEN")
+    padded = by_content.get("ZEBRAFISH_TOKEN unrelated padded words here")
+    assert bare is not None and padded is not None
+    assert bare.get("_exact_match") in ("content", "substring")
+    assert padded.get("_exact_match") in ("content", "substring")
+    # The identifier-bearing row is the better match; the padded one must not
+    # be forced up to the same constant.
+    assert bare["_relevance_score"] > padded["_relevance_score"]
+
+
+# ---------------------------------------------------------------------------
+# WS5: compile_context diversity and entity cap
+# ---------------------------------------------------------------------------
+
 def test_diversity_is_on_by_default_and_collapses_near_duplicates():
     forget(entity="*", project="round44-div", soft=False, dry_run=False)
     # Identical content with exact dedupe disabled: the rows must survive the

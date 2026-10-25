@@ -138,6 +138,12 @@ dropped by it. Independently of `min_relevance`, a **full-text-only** hit
 (no vector score) whose combined relevance is below 0.25 is dropped as
 stopword noise; exact literal hits (`_exact_match`) are exempt.
 
+An exact literal hit is its own retriever: a token or quoted phrase matched as a
+case-insensitive substring enters the fusion with a stronger weight and carries
+`_exact_match`. It no longer overwrites `_relevance_score` with a constant, so
+two exact hits of different vector similarity keep different scores; the local
+reranker still floors an exact hit it was asked to score.
+
 Pinned facts (`pinned=true`) are the always-include set. `recall` with
 `include_pinned=true` (and `compile_context` by default) fetch them with the
 structural filters only and merge them into the page after the ranked hits;
@@ -145,6 +151,7 @@ structural filters only and merge them into the page after the ranked hits;
 carries `_pinned: true` and `_relevance_score` 0.0. A missing pin displaces the
 lowest-ranked non-pinned hit when the page is full, and the count lands in
 `pinned_included`.
+
 `recall` reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
 `dropped_by_expired` (rows hidden because their TTL passed),
