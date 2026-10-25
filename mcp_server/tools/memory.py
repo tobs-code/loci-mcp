@@ -2680,15 +2680,20 @@ def _forget_by_query(
         db.rollback()
         return fail(STATUS_ERROR, f"query embedding failed: {e}")
 
-    rows = _search_memories(cur, SearchRequest(
-        query_embedding=query_embedding,
-        query_text=query,
-        project=project,
-        tables=[table],
-        limit=limit,
-        min_similarity=min_similarity,
-        exclude_relation_context=True,
-    ))
+    rows = [
+        row for row in _search_memories(cur, SearchRequest(
+            query_embedding=query_embedding,
+            query_text=query,
+            project=project,
+            tables=[table],
+            limit=limit,
+            min_similarity=min_similarity,
+            exclude_relation_context=True,
+        ))
+        if row.get("_similarity") is not None
+        and (min_similarity is None
+             or float(row["_similarity"]) >= min_similarity - 1e-9)
+    ]
 
     bulk_results: list[dict] = []
     for row in rows:
@@ -2705,7 +2710,7 @@ def _forget_by_query(
             "id": row["id"],
             "content_preview": preview,
             "similarity": (round(float(similarity), 4)
-                           if similarity is not None else 0.0),
+                           if similarity is not None else None),
             "status": dry_status if dry_run else live_status,
             "count": removed,
             "scopes": [scope_hit],
