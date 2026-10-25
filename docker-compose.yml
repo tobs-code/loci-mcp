@@ -29,7 +29,7 @@ services:
       - "127.0.0.1:8001:8000"
     environment:
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
-      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -39,6 +39,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      NLI_MAX_WORKERS: ${NLI_MAX_WORKERS:-4}
       RERANK_MODEL: ${RERANK_MODEL:-mixedbread-ai/mxbai-rerank-base-v1}
       RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-256}
     extra_hosts:

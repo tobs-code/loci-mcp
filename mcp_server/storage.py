@@ -398,7 +398,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
     failed = set(failed_indices or ())
     contradictions = []
     unjudged: list[dict] = []
-    for i, (eid, econtent, _eentity) in enumerate(candidates):
+    for i, (eid, econtent, eentity) in enumerate(candidates):
         if i in failed:
             # The provider could not judge this candidate. Its 0.0 is a
             # placeholder, not a verdict: report the pair as unverified
@@ -409,6 +409,7 @@ def _check_contradictions(cur, content: str, entity: str | None,
             continue
         if scores[i] >= 0.7:
             contradictions.append({"existing_id": eid, "existing_content": econtent,
+                                    "existing_entity": eentity,
                                     "similarity": round(scores[i], 3)})
     return contradictions, unjudged
 

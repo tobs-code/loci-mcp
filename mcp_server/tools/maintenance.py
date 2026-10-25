@@ -142,29 +142,22 @@ def contradictions_report(entity: Annotated[
                           "reported but must not invalidate a memory.",
               ge=0.0, le=1.0)] = 0.8,
 ) -> dict[str, Any]:
-    """Find potentially conflicting facts stored for the same entity.
+    """Find conflicting facts via vector candidates plus an NLI verdict.
 
-    Uses vector similarity to find candidate pairs, then NLI to confirm.
-    Returns pairs with confidence scores in [0, 1] (higher = more likely contradictory).
-    Without `entity` the scan is scope-wide: all active memories compete for
-    the candidate slots, so conflicts between differently tagged entities are
-    reported too. With `entity` the scan covers that entity's memories plus
-    untagged neighbours of the scope, so a tagged/untagged conflict stays
-    visible (cross-entity pairs are reported, never auto-resolved). With
-    `resolve="newest"` the older memory of every confirmed
-    pair of the SAME entity is superseded by the newer one (the report names
-    the ids); "newest" is the creation time, so a `touch` never changes the
-    winner. Cross-entity pairs stay untouched. An empty result says in
-    `warnings` why it is empty: nothing to compare, no similar pair, or no
-    contradiction among the checked pairs.
-    When the NLI provider fails for some pairs, `nli_failures` names exactly
-    which fact/neighbour ids were NOT judged (with the reason), so a partial
-    scan is never mistaken for a clean one. The NLI leg has a wall-clock
-    budget (`budget_seconds`, default 40s): when it is exhausted the scan
-    stops early, returns the pairs judged so far, sets `budget_exhausted`
-    and records the unchecked pairs in `nli_failures` with reason
-    `skipped: NLI time budget exhausted`. Narrow the scan with `entity`,
-    lower `limit` or raise the budget to check more.
+    Without `entity` all active memories of the scope compete; with it the scan
+    covers that entity's memories plus untagged neighbours, so tagged/untagged
+    conflicts stay visible. Cross-entity pairs are reported but never
+    auto-resolved. `resolve="newest"` supersedes the older memory of each
+    confirmed SAME-entity pair (creation time decides, `touch` does not).
+    Cross-entity pairs and pairs below `resolve_min_confidence` stay active
+    with a warning; `dry_run=True` only reports `would_resolve`.
+
+    `nli_failures` names pairs that were NOT judged and why, so a partial scan
+    is never mistaken for a clean one. `budget_seconds` (default 40s) bounds
+    the whole NLI leg: on exhaustion the scan stops early, sets
+    `budget_exhausted` and lists unjudged pairs. Narrow the scan with `entity`
+    or a lower `limit`, or raise the budget. An empty result explains itself in
+    `warnings`. Without a configured provider it answers `nli_configured=false`.
     """
     logger.info("contradictions_report entity=%s limit=%s", entity, limit)
     started_at = time.monotonic()
@@ -271,24 +264,16 @@ def verify_integrity(
         Field(description="Maximum number of problem rows to list (default 20).",
               ge=1, le=500)] = 20,
 ) -> dict[str, Any]:
-    """Check stored memories for links that make rows unreachable.
+    """Find `superseded_by` links that hide rows forever.
 
-    The main failure this catches: a memory is marked `superseded_by` an id
-    that no longer exists (the replacement was hard-deleted, a project was
-    dropped, or a partial import restored only one side). Such a row is hidden
-    from every active read forever, although nothing supersedes it any more.
-    `fix=true` clears those links so the row becomes readable history again;
-    it never deletes content and never restores a valid supersede.
-
-    Also reports self-references (`superseded_by = id`) and supersede chains
-    (A replaced by B, B replaced by C), which are legal but often point at an
-    unintended second write. Broken links and chains are listed in `results`;
-    `chains` counts them even when `limit` truncates the list. Expired-but-active
-    rows are counted as context, not as an error.
-
-    With `fix=true` the counts and `results` describe the state AFTER the
-    repair (`fixed` carries what was cleared), so a call reads as an answer
-    to "is the scope clean now?".
+    Catches a row superseded by a missing id (hard-deleted, dropped project,
+    partial import), self-references and supersede chains. Broken links and
+    chains are listed in `results`; `chains` counts them even when `limit`
+    truncates the list. Expired-but-active rows count as context, not as an
+    error. `fix=true` clears dangling/self links so the rows become readable
+    history; it never deletes content or restores a valid supersede, and the
+    counts then describe the state AFTER the repair (`fixed` names what was
+    cleared).
     """
     logger.info("verify_integrity project=%s fix=%s", project, fix)
     try:

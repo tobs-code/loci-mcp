@@ -1,7 +1,7 @@
 # Loci — Memory Server for AI Agents
 
 An MCP server that gives an agent a **persistent memory**: vector search over
-PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 25 tools to write,
+PostgreSQL (pgvector), a knowledge graph (Apache AGE) and 28 tools to write,
 read, connect and forget.
 
 - **Hybrid retrieval** — vector similarity *and* full-text search, so both
@@ -37,11 +37,12 @@ That starts three services:
 > default. To reach the server from another machine, change the mapping to
 > `"8766:8766"` **and** keep the token set.
 >
-> Contradiction detection needs an LLM key. Groq is the default; set
-> `LLM_PROVIDER` to `openai`, `anthropic`, `ollama`, `openai-compatible` or
-> `auto` to use another provider, or `none` to disable NLI. Embeddings always
-> run locally: the image uses an NVIDIA GPU when Docker exposes one and falls
-> back to CPU otherwise. See [GPU acceleration](docs/configuration.md#gpu).
+> Contradiction detection needs a configured LLM provider and is **off by
+> default** (`LLM_PROVIDER=none`). Set `LLM_PROVIDER` to `groq`, `openai`,
+> `anthropic`, `ollama`, `openai-compatible` or `auto` to enable it. Embeddings
+> always run locally: the image uses an NVIDIA GPU when Docker exposes one and
+> falls back to CPU otherwise. See
+> [GPU acceleration](docs/configuration.md#gpu).
 >
 > **Data egress.** `groq`, `openai` and `anthropic` are hosted providers: when
 > a contradiction check runs, the compared memory content is sent to them.
@@ -84,7 +85,8 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 | `remember_batch` | Store many facts at once |
 | `update_memory` | Change content, importance, metadata, entity, type or TTL; `touch=true` refreshes recency, `restore=true` undoes a soft delete |
 | `update_batch` | Update many memories in one call |
-| `forget` | Soft delete or hard delete, by id or by entity |
+| `merge_memories` | Fold 2-20 active memories of one scope into one new fact, superseding every source |
+| `forget` | Soft delete or hard delete, by id, entity, metadata filter or content match |
 
 **Read**
 
@@ -92,8 +94,10 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 |------|--------------|
 | `recall` | Hybrid vector + full-text search with ranking, decay and graph boost |
 | `recall_batch` | Several independent searches in one call (multi-intent turns) |
+| `compile_context` | One token-bounded context block assembled from ranked memories |
 | `list_memories` | Browse memories without a query (filter, sort, page); `memory_id` fetches one, including hidden rows |
 | `get_entity` | Everything known about one entity |
+| `get_entities` | Batch lookup of 1-25 entities in one call |
 | `list_entities` | Browse the entities of a scope |
 | `list_projects` | Discover every scope (project name, tables, graph, counts) |
 | `init_context` | Session bootstrap: recent memories plus `project_stats` for every scope |
@@ -119,8 +123,8 @@ and Zed. Setup for each client, plus the stdio variant for Claude Code, is in
 | `drop_project` | Remove a project scope completely |
 | `server_health` | Check Postgres and the inference API |
 
-`MCP_TOOLSET=core` exposes only the 15 daily read/write/graph tools; the
-default `full` exposes all 25.
+`MCP_TOOLSET=core` exposes only the 16 daily read/write/graph tools; the
+default `full` exposes all 28.
 
 There is also one resource, `memory://stats`, with the memory, entity and
 relation counts plus the health of the services.
@@ -183,7 +187,7 @@ remember(content="The API runs on Postgres", entity="API", project="api")
 | `MCP_AUTH_TOKEN` | - (required for HTTP) | Bearer token every HTTP request must send |
 | `MCP_ALLOW_INSECURE_HTTP` | `false` | Allow an unauthenticated non-loopback HTTP bind (sandbox only) |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available), `cpu` or `cuda` |
-| `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
+| `LLM_PROVIDER` | `none` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none`; `none` disables NLI (egress is opt-in) |
 | `LLM_MODEL` | provider default | NLI model |
 | `LLM_REASONING_EFFORT` | `low` for Groq/gpt-oss | Reasoning budget (`low`/`medium`/`high`; `none` disables) |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |

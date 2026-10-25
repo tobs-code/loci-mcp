@@ -11,11 +11,11 @@ export_memories(format="json", project="api")
 
 | Parameter | Meaning |
 |-----------|---------|
-| `format` | `json` (default) returns an object with the records and the graph; `jsonl` returns one record per line (no graph). |
+| `format` | `json` (default) returns an object with the records and the graph; `jsonl` returns one memory per line plus `entity`/`relation` lines. |
 | `project` | Scope to export. Without it **every** scope is exported and each record carries its `project`. |
 | `include_embeddings` | Include the vector of every memory (large). |
 | `include_superseded` | Include superseded (invalidated) memories. |
-| `include_graph` | Include entities and relations (JSON exports only). |
+| `include_graph` | Include entities and relations (`true` by default, for both formats). |
 | `entity` | Only records of this entity. |
 | `mem_type` | Only records of this type. |
 | `updated_after` | Only records changed at or after this ISO date. |
@@ -26,9 +26,16 @@ unchanged.
 
 The JSON format (version `0.3`, `"type": "memory_export"`) contains IDs,
 `superseded_by`, TTL (`expires_at`), `deleted_at`, timestamps, `access_count`,
-the project of every record and — for JSON — the complete graph (entities with
-scope plus relations with weight and scope). JSONL is flat: one record per
-line, no graph.
+the project of every record and the complete graph (entities with scope plus
+relations with weight, scope and — when one was stored — the relation's
+`context` sentence).
+
+JSONL is flat, one record per line: a memory line carries the same fields as a
+JSON record (minus the wrapping object), an `entity` line carries `name`,
+`type`, `project`, and a `relation` line carries `from_entity`, `to_entity`,
+`relation_type`, `weight`, `project` and optional `context`. Graph lines are
+recognized by `record_type`; `include_graph=false` leaves them out. Both
+formats restore the same state, so a JSONL backup is a complete backup too.
 
 The default export leaves superseded/forgotten history out and says how many
 rows it excluded. Expired rows are included with their `expires_at` and an
@@ -45,7 +52,7 @@ import_memories(data=<export data>, format="json")
 
 | Parameter | Meaning |
 |-----------|---------|
-| `data` | The export payload, as the object, as a list of records, or as its JSON/JSONL string. |
+| `data` | The export payload, as the object, as a list of records, or as its JSON/JSONL string. JSONL may mix memory and `record_type` graph lines. |
 | `project` | Target scope for all records. Without it every record is restored into the scope it was exported from. |
 | `format` | `json` (default) or `jsonl`. |
 | `skip_duplicates` | Skip records whose content already exists when the record has **no** id (default `true`). A record whose id already exists is always skipped - that is what makes a re-import idempotent. |
@@ -68,7 +75,9 @@ Project tables are recreated on
 demand, entities and relations are upserted with MERGE. `graph_entities` and
 `graph_relations` count the processed records; `graph_entities_created` and
 `graph_relations_created` count the ones that did not exist before (MERGE
-updates an existing node/edge instead of duplicating it).
+updates an existing node/edge instead of duplicating it). JSONL graph lines go
+through the same path, including the edge's `context` sentence, so importing a
+JSONL backup restores the graph and its explanations.
 
 Re-importing the same file reports the existing ids as `skipped`. A non-empty
 `skipped` comes with `skipped_reasons` (`id_exists`, `duplicate_content`,
@@ -81,9 +90,10 @@ and listed in `errors`; they are a subset of `skipped`, so
 Every record runs in its own savepoint, so one broken row does not abort the
 file: a record whose embedding has the wrong type or dimension, or whose insert
 fails, is reported in `errors` (named by its id) and the remaining records still
-import. The same holds for a malformed JSONL line: it is collected as
-`skipped_reasons.invalid` with `jsonl line N` in `errors` while the valid lines
-are imported.
+import. The same holds for a malformed JSONL line and for a broken graph
+record: a line is collected as `skipped_reasons.invalid` with `jsonl line N` in
+`errors` (an unknown `record_type` or a relation without endpoints), while the
+valid lines are imported and the remaining edges still restore.
 
 ## Pass the payload as a string
 

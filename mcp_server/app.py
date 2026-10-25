@@ -166,9 +166,9 @@ app = LociFastMCP(
 TOOLS BY TASK
 - Store/change/remove: `remember`, `remember_batch`, `update_memory`
   (content, TTL, `touch=true` for a decay refresh, `restore=true` to undo a
-  soft delete), `update_batch`, `forget`.
-- Search/browse/bootstrap: `recall`, `recall_batch`, `list_memories` (pass `memory_id` for a
-  direct single-memory lookup), `get_entity`, `list_entities`, `init_context`
+  soft delete), `update_batch`, `merge_memories`, `forget`.
+- Search/browse/bootstrap: `recall`, `recall_batch`, `compile_context`, `list_memories` (pass `memory_id` for a
+  direct single-memory lookup), `get_entity`, `get_entities`, `list_entities`, `init_context`
   (`project="*"` lists every scope with sizes in `project_stats`).
 - Graph: `relate`, `relate_batch`, `unrelate`, `find_connections`, `find_paths`,
   `list_relations`.
@@ -176,8 +176,8 @@ TOOLS BY TASK
   `export_memories`, `import_memories`, `verify_integrity`, `prune_memories`,
   `drop_project`.
 
-`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (15 tools);
-the default `full` exposes all 25 (batch, backup and repair included).
+`MCP_TOOLSET=core` exposes only the daily read/write/graph surface (16 tools);
+the default `full` exposes all 28 (batch, backup and repair included).
 
 COMMON FLOWS
 - Start/search: `init_context(project="api")` → `recall(query="deploy steps", project="api")`.

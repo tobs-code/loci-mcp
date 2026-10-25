@@ -104,6 +104,55 @@ def migrate_fts_indexes() -> int:
     return rebuilt
 
 
+def migrate_idempotency_keys() -> int:
+    """Add `idempotency_key` and its active-row unique index to every scope.
+
+    `ensure_schema`/`ensure_project_table` already do this for the tables they
+    create, but a table created by an older build never passes through them
+    again until a write touches that scope. The startup pass covers every
+    existing table so an idempotent replay works before the first write.
+
+    Returns the number of tables that were changed.
+    """
+    conn = get_conn()
+    changed = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' "
+            "AND table_name ~ '^(memories|mem_[A-Za-z0-9_]+)$'"
+        )
+        for (table,) in cur.fetchall():
+            _safe_ident(table, "table name")
+            if table == "memories":
+                index = "uq_memories_idempotency_key"
+            else:
+                digest = hashlib.sha1(
+                    table[len("mem_"):].encode()).hexdigest()[:10]
+                index = f"uq_{digest}_idem"
+            cur.execute("SELECT 1 FROM information_schema.columns WHERE "
+                        "table_schema = 'public' AND table_name = %s AND "
+                        "column_name = 'idempotency_key'", (table,))
+            had_column = cur.fetchone() is not None
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "
+                        "idempotency_key TEXT")
+            cur.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {index} "
+                f"ON {table}(idempotency_key) "
+                "WHERE idempotency_key IS NOT NULL "
+                "AND superseded_by IS NULL AND deleted_at IS NULL")
+            if not had_column:
+                changed += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return changed
+
+
 def ensure_project_table(cur, project: str) -> None:
     project = _norm_project(project)
     if not project:
@@ -137,6 +186,12 @@ def ensure_project_table(cur, project: str) -> None:
     """)
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
     cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
+    cur.execute(f"ALTER TABLE mem_{safe} ADD COLUMN IF NOT EXISTS idempotency_key TEXT")
+    cur.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{idx_digest}_idem "
+        f"ON mem_{safe}(idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL "
+        "AND superseded_by IS NULL AND deleted_at IS NULL")
     # Look indexes up by table + definition: long project names get truncated
     # by PostgreSQL to 63 characters, so the exact index name is unreliable.
     cur.execute(f"SELECT COUNT(*) FROM mem_{safe}")

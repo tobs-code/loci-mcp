@@ -103,6 +103,7 @@ def ensure_schema():
                 superseded_by TEXT,
                 deleted_at TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
+                idempotency_key TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
@@ -181,6 +182,13 @@ def ensure_schema():
             "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(superseded_by) WHERE superseded_by IS NULL AND deleted_at IS NULL",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+            # One active row per idempotency key. Expiry cannot be part of the
+            # predicate (a partial index needs an IMMUTABLE expression), so an
+            # expired row's key is cleared lazily before the next insert.
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_memories_idempotency_key "
+            "ON memories(idempotency_key) WHERE idempotency_key IS NOT NULL "
+            "AND superseded_by IS NULL AND deleted_at IS NULL",
             "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)",
             "CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id)",
             "CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id)",

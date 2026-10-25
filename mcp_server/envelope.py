@@ -19,6 +19,7 @@ from typing import Any
 
 STATUS_STORED = "stored"
 STATUS_CREATED = "created"
+STATUS_MERGED = "merged"
 STATUS_DUPLICATE = "duplicate"
 STATUS_UPDATED = "updated"
 STATUS_DELETED = "deleted"

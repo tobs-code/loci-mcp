@@ -169,11 +169,11 @@ def test_export_entity_filter_narrows_the_graph():
         ("BillingService", "PostgresDB")}
 
 
-def test_jsonl_export_warns_that_the_graph_is_ignored():
-    remember("The JSONL backup has no graph", project="jsonl-graph")
+def test_jsonl_export_includes_the_graph():
+    remember("The JSONL backup keeps the graph", project="jsonl-graph")
     exported = export_memories(project="jsonl-graph", format="jsonl")
-    assert exported["graph_included"] is False
-    assert any("has no graph" in w for w in exported["warnings"])
+    assert exported["graph_included"] is True
+    assert not any("has no graph" in w for w in exported["warnings"])
 
 
 def test_import_dry_run_names_would_create():

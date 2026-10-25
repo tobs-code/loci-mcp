@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
+from mcp_server.browse import escape_like
 from mcp_server.config import (
     CONTRADICTION_AUTO_MAX_SUPERSEDES,
     CONTRADICTION_AUTO_MIN_CONFIDENCE,
@@ -21,6 +22,7 @@ from mcp_server.duplicates import (
 from mcp_server.envelope import (
     STATUS_CONFLICT,
     STATUS_DELETED,
+    STATUS_MERGED,
     STATUS_DUPLICATE,
     STATUS_ERROR,
     STATUS_NOT_FOUND,
@@ -36,6 +38,9 @@ from mcp_server.envelope import (
 from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
+    ACTIVE_ROW_SQL,
+)
+from mcp_server.lifecycle import (
     is_expired as _is_past,
 )
 from mcp_server.lifecycle import (
@@ -50,10 +55,12 @@ from mcp_server.scope_catalog import (
     _scope_of_table,
     _table_exists,
 )
-from mcp_server.scoring import _content_hash
+from mcp_server.scoring import _content_hash, _gen_id
+from mcp_server.search import _extra_conditions
 from mcp_server.storage import (
     _deduplicate,
     _find_near_duplicate,
+    _store_memory,
     clear_dangling_supersede,
 )
 from mcp_server.store import MemoryStore
@@ -69,6 +76,7 @@ from mcp_server.store_updates import (
     stored_metadata,
 )
 from mcp_server.write_pipeline import (
+    _GRAPH_METADATA_KEYS,
     WriteIntent,
     _coerce_metadata,
     _near_duplicate_warning,
@@ -171,6 +179,11 @@ class BatchFact(BaseModel):
         "type": ["string", "null"]},
         description="Optional ISO 8601 timestamp when this memory stops "
                     "being active (TTL).")
+    idempotency_key: Any = Field(default=None, json_schema_extra={
+        "type": ["string", "null"]},
+        description="Client idempotency token (1-128 characters). A second "
+                    "fact with the same key in the same scope answers "
+                    "`duplicate` naming the first row instead of writing.")
     fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                                  description="Similarity threshold 0.0-1.0 for semantic dedup.")
     dedupe: Any = Field(default=None, json_schema_extra={
@@ -223,6 +236,21 @@ def _as_bool(value: Any, name: str) -> bool:
         return value
     raise ValueError(
         f"{name} must be a boolean (true or false), got {type(value).__name__}")
+
+
+def _norm_idempotency_key(value: Any) -> str | None:
+    """Validate a client idempotency token: trimmed, 1-128 characters."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"idempotency_key must be a string (got {type(value).__name__})")
+    key = value.strip()
+    if not key:
+        raise ValueError("idempotency_key must not be empty")
+    if len(key) > 128:
+        raise ValueError("idempotency_key must be at most 128 characters")
+    return key
 
 
 def _hidden_state_reason(db: MemoryStore, memory_id: str,
@@ -446,6 +474,14 @@ def remember(
                           "active reads and dedupe; the row itself stays until "
                           "it is pruned or soft-forgotten. Omit for an "
                           "open-ended memory.")] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Field(description="Optional client idempotency token (1-128 "
+                          "characters). A second `remember` with the same key "
+                          "in the same scope returns `duplicate`, names the "
+                          "first memory and writes nothing (including no "
+                          "supersede side effects). Different scopes have "
+                          "independent key spaces.")] = None,
     links: Annotated[
         list[dict[str, Any]] | None,
         Field(description="Optional graph edges to create in the same call "
@@ -454,42 +490,31 @@ def remember(
                           "optional 'from_entity' (default: the memory's "
                           "entity), 'weight' (0.0-1.0) and 'context'.")] = None,
 ) -> dict[str, Any]:
-    """Store a memory (fact, decision, learning, preference, ...).
+    """Store a memory with its embedding.
 
-    Automatically embedded for vector search. Attach to an entity for graph connectivity.
-    If `check_contradictions` is true, returns warnings for conflicting existing facts.
-    Use `supersede` to replace an existing memory by ID, `supersede_content` to
-    replace the fact with the same wording, or `supersede_last` to replace the
-    best-matching fact of the same entity (most similar, not the newest);
-    without an entity the best-matching memory of the whole scope is replaced
-    (same topic guard).
-    `supersede_last` refuses to replace a fact
-    that is about a different topic (it would destroy it); the new fact is
-    stored additionally and the response carries a warning.
-    `on_near_duplicate` decides what happens when dedupe did not reject a
-    reworded copy: "warn" (default) stores it and warns, "supersede" replaces
-    the old memory, "reject" stores nothing. `auto_supersede_near_duplicate`
-    is the backwards-compatible alias for "supersede".
-    `metadata_mode="merge"` (default) carries metadata keys of a replaced
-    memory that the new fact does not set; "replace" drops them.
-    `dedupe` selects how duplicates are detected: "exact" (default, content
-    hash), "semantic" (also vector similarity, see `fuzzy_threshold`) or "off".
-    A duplicate answer names the mode that matched ("exact" or "semantic") and
-    the measured similarity. A stored memory that is still very similar to an
-    active one (but not similar enough to dedupe) returns a `near-duplicate`
-    warning naming the other id.
-    A project write that invalidates a shared (global) fact returns a
-    `cross-scope supersede` warning plus `cross_scope_superseded`: the global
-    fact is hidden in every scope now, not only in this project.
-    `scope` defaults to "project" when a project is given, else "global".
-    scope="global" stores in the shared table even when a project is given.
-    `links` creates graph edges in the same call: each item is a `relate`
-    edge whose `from_entity` defaults to the memory's `entity`. Edge failures
-    are warnings, never a lost fact.
+    `scope` defaults to "project" when a project is given, else "global";
+    scope="global" writes the shared table even inside a project.
+    Replace an existing fact with `supersede` (id), `supersede_content` (exact
+    wording) or `supersede_last` (best-matching fact of the entity, or of the
+    scope without one). `supersede_last` refuses a different topic: the fact is
+    stored additionally and a warning is returned. Metadata of a replaced row is
+    carried over unless `metadata_mode="replace"`.
+    `dedupe`: "exact" (default), "semantic" (vector, `fuzzy_threshold`) or
+    "off". A duplicate names the matched mode and similarity.
+    `on_near_duplicate` handles a reworded copy below the dedupe threshold:
+    "warn" (default, store and warn), "supersede" or "reject" (nothing stored).
+    The alias `auto_supersede_near_duplicate` means "supersede".
+    `check_contradictions` NLI-checks the nearest memories; `contradiction_mode`,
+    `contradiction_min_confidence` and `max_contradiction_supersedes` bound what
+    may be superseded. A project write that invalidates a global fact reports
+    `cross_scope_superseded` plus a warning.
+    `links` creates graph edges in the same call (`relate` semantics,
+    `from_entity` defaults to the memory's entity); edge failures warn and never
+    lose the fact. `metadata` must be an object; a JSON-encoded object is
+    accepted. `idempotency_key` makes a retry safe: a replay stores nothing and
+    answers `duplicate` with `idempotent_replay: true`.
 
     Returns the standard envelope: {"ok", "status", "id", "error", "warnings"}.
-    `metadata` must be a JSON object, e.g. {"env": "test"} - a JSON-encoded
-    string of an object is also accepted; any other type fails.
     """
     logger.info("remember entity=%s mem_type=%s importance=%s check_contradictions=%s fuzzy=%s scope=%s dedupe=%s",
                 entity, mem_type, importance, check_contradictions, fuzzy_threshold, scope, dedupe)
@@ -553,6 +578,10 @@ def remember(
         metadata, meta_error = _coerce_metadata(metadata)
         if meta_error:
             return fail(STATUS_ERROR, meta_error)
+    try:
+        idempotency_key = _norm_idempotency_key(idempotency_key)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
     per_link_errors = _validate_links(links, entity)
     if per_link_errors:
         return fail(STATUS_ERROR, "; ".join(per_link_errors))
@@ -592,6 +621,7 @@ def remember(
             contradiction_min_confidence=contradiction_min_confidence,
             max_contradiction_supersedes=max_contradiction_supersedes,
             links=links,
+            idempotency_key=idempotency_key,
             embedding=emb,
         ))
         if outcome.status == STATUS_DUPLICATE:
@@ -606,8 +636,10 @@ def remember(
                     project=outcome.project,
                     warnings=[_near_rejected_warning(outcome)])
             db.commit()
-            warnings = [(f"memory already exists; nothing stored "
-                         f"({outcome.duplicate_detail})")]
+            warnings = [(
+                outcome.warnings[0] if outcome.idempotent_replay else
+                f"memory already exists; nothing stored "
+                f"({outcome.duplicate_detail})")]
             if outcome.created_scope:
                 warnings.append(_remember_scope_warning(store_project))
             warnings.extend(outcome.duplicate_supersede_warnings)
@@ -624,6 +656,8 @@ def remember(
                 # batch entries and the single call symmetric.
                 "duplicate_of": outcome.duplicate_of,
             }
+            if outcome.idempotent_replay:
+                payload["idempotent_replay"] = True
             if outcome.superseded:
                 payload["superseded"] = outcome.superseded
                 if outcome.cross_scope_superseded:
@@ -664,10 +698,14 @@ def remember(
                 outcome.near_duplicate, outcome.near_conflict))
         elif (outcome.near_duplicate
               and outcome.near_duplicate["id"] not in superseded):
+            confirmed = _confirmed_conflicts(outcome)
             warnings.append(_near_duplicate_warning(
                 outcome.near_duplicate, entity, outcome.near_conflict,
                 new_content=content,
-                explicit_supersede=supersede or supersede_content))
+                explicit_supersede=supersede or supersede_content,
+                contradicted=bool(confirmed),
+                contradiction_confidence=confirmed.get(
+                    outcome.near_duplicate["id"])))
         if outcome.cross_scope_warning:
             warnings.append(outcome.cross_scope_warning)
         if outcome.cross_duplicate_warning:
@@ -741,6 +779,19 @@ def remember(
         return fail(STATUS_ERROR, str(e))
     finally:
         db.close()
+
+
+def _confirmed_conflicts(outcome: Any) -> dict[str, float]:
+    """Confirmed NLI contradictions of a write, keyed by existing id."""
+    payload = outcome.contradictions or {}
+    found: dict[str, float] = {}
+    for key in ("superseded", "kept"):
+        for pair in payload.get(key) or []:
+            confidence = float(pair.get("confidence")
+                               or pair.get("similarity") or 0.0)
+            if confidence >= 0.7:
+                found[pair["existing_id"]] = confidence
+    return found
 
 
 def _remember_scope_warning(store_project: str | None) -> str:
@@ -847,42 +898,24 @@ def remember_batch(
                           "'on_near_duplicate' wins): 'warn', 'supersede' or "
                           "'reject'.")] = "warn",
 ) -> dict[str, Any]:
-    """Store multiple facts at once. Each dict needs 'content'.
+    """Store many facts in one call with per-entry savepoints.
 
-    Optional keys: mem_type (one of the memory types), entity, importance,
-    metadata (a JSON object - a JSON-encoded string of an object is accepted),
-    scope ("project" or "global"; 'project' requires a project), project,
-    supersede (memory id
-    or content), supersede_content, supersede_last, on_near_duplicate
-    ("warn"/"supersede"/"reject"),
-    auto_supersede_near_duplicate, expires_at (ISO 8601 TTL timestamp),
-    fuzzy_threshold, dedupe ("exact", "semantic", or "off"),
-    contradiction_mode ("supersede"/"warn"), contradiction_min_confidence
-    (0.0-1.0), max_contradiction_supersedes (>= 0), and links
-    ([{to_entity, relation_type, weight?, context?, from_entity?}] - graph
-    edges created with the fact, 'from_entity' defaults to the fact's
-    entity); a malformed edge is a per-fact error and an edge runtime failure
-    keeps the fact and warns ("links failed: ...").
-    A stored entry reports its edges in `links` (same shape as remember) and
-    failed edges inside `link_warnings`; a fact that was REJECTED (a
-    near-duplicate reject or a duplicate) stores no edges.
-    The last three contradiction keys
-    override the top-level defaults per fact.
-    Set skip_duplicates=False to allow storing identical content multiple times.
-    Set fuzzy_threshold (0.0-1.0) for semantic dedup across all facts.
-    Per-fact 'fuzzy_threshold' overrides the top-level value.
-    `dedupe` selects how duplicates are detected: "exact" (default, content
-    hash), "semantic" (also vector similarity) or "off".
-    A stored fact that is still very similar to an active one returns a
-    `near-duplicate` warning in its result entry; a project fact that
-    invalidates a shared (global) fact adds `cross_scope_superseded` and a
-    `cross-scope supersede` warning to that entry.
-    `scope` sets the default scope for all facts; per-fact 'scope' wins.
-    Set check_contradictions=True to NLI-check each fact against the nearest
-    active memories of its scope and auto-supersede contradictions (an
-    entity-scoped fact gets that entity's memories first; without an entity
-    all entities compete).
-    Invalid facts are reported individually; the remaining facts are stored.
+    Each fact needs `content`. Per fact (otherwise the top-level value wins):
+    `project`, `scope`, `entity`, `mem_type`, `importance`, `metadata`,
+    `supersede`, `supersede_content`, `supersede_last`, `dedupe`,
+    `fuzzy_threshold`, `on_near_duplicate`, `contradiction_mode`,
+    `contradiction_min_confidence`, `max_contradiction_supersedes`,
+    `expires_at`, `idempotency_key` and `links` (same edges as `remember`).
+    A malformed edge is a per-fact error; a runtime edge failure keeps the fact
+    and warns ("links failed: ..."). Rejected or duplicate facts store no
+    edges. An unknown per-fact key is refused in that entry only.
+    `check_contradictions` and `skip_duplicates` apply to every fact.
+    Invalid facts are reported individually; the rest are stored (`partial`).
+    A stored entry reports its edges in `links`, failed ones in
+    `link_warnings`, and a duplicate names `duplicate_of`; an idempotency
+    replay adds `idempotent_replay: true`. A global fact invalidated from a
+    project entry reports `cross_scope_superseded` and a warning.
+    `count` is the entry count, `succeeded`/`failed` split the outcomes.
     """
     logger.info("remember_batch count=%s skip_duplicates=%s fuzzy=%s check_contradictions=%s scope=%s dedupe=%s",
                 len(facts) if isinstance(facts, list) else -1, skip_duplicates,
@@ -1056,6 +1089,11 @@ def remember_batch(
                 prepared.append((None,
                                  "expires_at must be an ISO 8601 timestamp"))
                 continue
+        try:
+            fkey = _norm_idempotency_key(fact.get("idempotency_key"))
+        except ValueError as e:
+            prepared.append((None, str(e)))
+            continue
         prepared.append(({
             "content": content,
             "mem_type": mem_type,
@@ -1076,6 +1114,7 @@ def remember_batch(
             "expires_at": fexpires,
             "ttl_warning": _ttl_past_warning(fexpires),
             "links": flinks,
+            "idempotency_key": fkey,
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -1127,6 +1166,7 @@ def remember_batch(
                         skip_duplicates=skip_duplicates,
                         probe_nli_config=False,
                         report_superseded_match=False,
+                        idempotency_key=spec["idempotency_key"],
                     ))
                     if not outcome.persist:
                         raise _EntryRejected(outcome)
@@ -1150,6 +1190,9 @@ def remember_batch(
                     "project": outcome.project,
                 }
                 warnings: list[str] = []
+                if outcome.idempotent_replay:
+                    entry["idempotent_replay"] = True
+                    warnings.extend(outcome.warnings)
                 if outcome.created_scope:
                     warnings.append(_batch_scope_warning(store_project))
                 if not outcome.persist:
@@ -1219,9 +1262,13 @@ def remember_batch(
                 # Already replaced through the explicit supersede path: the
                 # entry's `superseded` list already names it, so no extra
                 # advice is needed.
+                confirmed = _confirmed_conflicts(outcome)
                 entry["warnings"].append(_near_duplicate_warning(
                     outcome.near_duplicate, spec["entity"],
-                    outcome.near_conflict, new_content=spec["content"]))
+                    outcome.near_conflict, new_content=spec["content"],
+                    contradicted=bool(confirmed),
+                    contradiction_confidence=confirmed.get(
+                        outcome.near_duplicate["id"])))
             if outcome.cross_scope_superseded:
                 entry["cross_scope_superseded"] = (
                     outcome.cross_scope_superseded)
@@ -1435,18 +1482,16 @@ def update_memory(
                           "Mutually exclusive with every other update "
                           "field.")] = False,
 ) -> dict[str, Any]:
-    """Update an existing memory's content, importance, metadata, entity, type or TTL.
+    """Update content, importance, metadata, entity, type or TTL of a memory.
 
-    Without `project`, the memory is looked up in every scope. A memory id is
-    unique per scope, so an id that exists in several scopes (an import copies
-    the id) is refused: the response names the scopes, and `project` says
-    which one to update.
-    `expires_at` sets a new TTL (`clear_expires_at=True` removes it).
-    `touch=True` only refreshes the decay age (no content change);
-    `restore=True` undoes a soft delete (the inverse of `forget(soft=True)`).
-    An expired row is inactive and answers `conflict` like a superseded one;
-    revive it deliberately with a future `expires_at` or `clear_expires_at`.
-    A real `superseded_by` is never cleared by a restore.
+    Without `project` the id is looked up in every scope; an id found in
+    several scopes is refused with the scopes named, so pass `project`.
+    `content` re-embeds and dedupe-checks the edit (`dedupe`/`fuzzy_threshold`).
+    `expires_at` sets a TTL and `clear_expires_at=True` removes it.
+    `touch=True` only refreshes the decay age; `restore=True` undoes a soft
+    delete and cannot be combined. A superseded or expired row answers
+    `conflict`; revive an expired row with a future `expires_at` or
+    `clear_expires_at`, and a real `superseded_by` is never cleared.
     """
     logger.info("update_memory id=%s has_content=%s has_importance=%s has_metadata=%s",
                 memory_id, content is not None, importance is not None, metadata is not None)
@@ -1630,12 +1675,17 @@ def update_memory(
                 db.rollback()
                 detail = ("exact content hash" if dup_mode == "exact"
                           else f"semantic match (similarity {dup_similarity})")
-                return ok(
-                    # Nothing was changed, so `id` names the existing memory
-                    # that blocked the edit (same contract as remember). The
-                    # id the caller tried to edit is `memory_id`.
-                    STATUS_DUPLICATE, id=dup_id, memory_id=memory_id,
-                    duplicate_of=dup_id,
+                return fail(
+                    # Nothing was changed, so `ok: false` is the honest
+                    # answer: an agent must not read this as "updated".
+                    # `id` names the existing memory that blocked the edit
+                    # (same contract as remember); the id the caller tried
+                    # to edit is `memory_id`.
+                    STATUS_DUPLICATE,
+                    f"update not applied: the new content would duplicate "
+                    f"active memory {dup_id} ({detail}); nothing was changed",
+                    id=dup_id, memory_id=memory_id,
+                    duplicate_of=dup_id, applied=False,
                     duplicate_mode=dup_mode, similarity=dup_similarity,
                     project=scope,
                     warnings=[f"update not applied: the new content would "
@@ -1693,20 +1743,14 @@ def update_batch(
 ) -> dict[str, Any]:
     """Update several memories at once (savepoints per entry).
 
-    Each entry works like one `update_memory` call: `content` changes
-    re-embed the memory, `importance`/`metadata`/`entity`/`mem_type` and the
-    TTL (`expires_at`/`clear_expires_at`) are applied as given. An expired
-    row answers `conflict` unless the entry revives it with a future
-    `expires_at` or `clear_expires_at`. `touch=true`
-    refreshes the decay age without changing the content and can be combined
-    with the other fields. `restore=true`
-    undoes a soft delete and is mutually exclusive with the other fields.
-    An unknown id answers `not_found` in its entry, an id
-    that exists in several scopes without a `project` answers `error` with
-    the `scopes` - one bad entry never aborts the rest (unlike
-    `relate_batch`, which is all-or-nothing).
-    Returns `count` + `results`; `status` is "partial" when some entries
-    failed.
+    Each entry works like `update_memory`: `content` re-embeds, then
+    `importance`/`metadata`/`entity`/`mem_type` and TTL are applied. An expired
+    row answers `conflict` unless revived with a future `expires_at` or
+    `clear_expires_at`. `touch=true` refreshes decay and combines with other
+    fields; `restore=true` undoes a soft delete and is exclusive.
+    An unknown id answers `not_found`, an id in several scopes without a
+    `project` answers `error` with the `scopes`; one bad entry never aborts the
+    rest. Answers `count` + `results`, `status="partial"` on failures.
     """
     logger.info("update_batch count=%s project=%s",
                 len(updates) if isinstance(updates, list) else -1, project)
@@ -2022,6 +2066,8 @@ def update_batch(
                         results.append({
                             "id": dup_id, "memory_id": memory_id,
                             "status": "duplicate",
+                            "ok": False,
+                            "applied": False,
                             "duplicate_of": dup_id,
                             "duplicate_mode": dup_mode,
                             "similarity": dup_similarity,
@@ -2084,6 +2130,133 @@ def update_batch(
 
 
 
+def _forget_by_selector(
+    db: MemoryStore,
+    cur,
+    project: str | None,
+    scope_name: str,
+    explicit_scope: bool,
+    memory_id: str | None,
+    memory_ids: list[str] | None,
+    entity_name: str | None,
+    metadata_filter: Any,
+    contains: str | None,
+    *,
+    soft: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Remove the active memories matched by `metadata_filter`/`contains`."""
+    if metadata_filter is not None and contains is not None:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "metadata_filter and contains are mutually exclusive")
+    if memory_id or memory_ids or entity_name:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "metadata_filter and contains cannot be combined with "
+                    "memory_id, memory_ids or entity")
+    if not explicit_scope:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "metadata_filter and contains remove a selected set of "
+                    "memories: pass project=<name> to name the scope "
+                    "(the shared scope is addressed with project=\"global\")")
+    if metadata_filter is not None:
+        if isinstance(metadata_filter, str):
+            try:
+                metadata_filter = json.loads(metadata_filter)
+            except json.JSONDecodeError:
+                db.rollback()
+                return fail(STATUS_ERROR,
+                            "metadata_filter must be an object, not a string")
+        if not isinstance(metadata_filter, dict):
+            db.rollback()
+            return fail(STATUS_ERROR, "metadata_filter must be an object")
+        if not metadata_filter:
+            db.rollback()
+            return fail(STATUS_ERROR, "metadata_filter must not be empty")
+    if contains is not None:
+        if not isinstance(contains, str) or not contains.strip():
+            db.rollback()
+            return fail(STATUS_ERROR, "contains must be a non-empty string")
+        contains = contains.strip()
+
+    counts = {"memories": 0, "entities": 0, "relations": 0}
+    dry_status = "would_soft_forget" if soft else "would_delete"
+    live_status = STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED
+    reason = "metadata_filter" if metadata_filter is not None else "contains"
+    table = _mem_table(project)
+    if not _table_exists(cur, table):
+        db.rollback()
+        return ok(
+            STATUS_OK, id=None, project=scope_name, counts=counts,
+            count=0, scopes_affected=[], bulk_results=[], dry_run=dry_run,
+            warnings=[f"no memories matched {reason} in scope {scope_name!r}"],
+            message=f"no memories matched {reason} in {scope_name}",
+        )
+
+    conditions = [ACTIVE_ROW_SQL]
+    params: list[Any] = []
+    if metadata_filter is not None:
+        meta_conditions, meta_params = _extra_conditions(None, metadata_filter)
+        conditions.extend(meta_conditions)
+        params.extend(meta_params)
+    if contains is not None:
+        conditions.append("content ILIKE %s")
+        params.append(f"%{escape_like(contains)}%")
+    where = " AND ".join(conditions)
+    rows = db.all(
+        f"SELECT id, content FROM {table} WHERE {where} "
+        f"ORDER BY updated_at DESC",
+        params,
+    )
+    scope_hit = _scope_of_table(cur, table)
+    bulk_results: list[dict] = []
+    for row in rows:
+        removed, _touched = db.forget_rows(
+            row["id"], tables=[table], soft=soft, dry_run=dry_run)
+        if not removed:
+            continue
+        counts["memories"] += removed
+        preview = " ".join(str(row.get("content") or "").split())
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        bulk_results.append({
+            "id": row["id"],
+            "content_preview": preview,
+            "status": dry_status if dry_run else live_status,
+            "count": removed,
+            "scopes": [scope_hit],
+            "reason": reason,
+        })
+
+    if not bulk_results:
+        db.rollback()
+        return ok(
+            STATUS_OK, id=None, project=scope_name, counts=counts,
+            count=0, scopes_affected=[], bulk_results=[], dry_run=dry_run,
+            warnings=[f"no memories matched {reason} in scope {scope_name!r}"],
+            message=f"no memories matched {reason} in {scope_name}",
+        )
+
+    if dry_run:
+        db.rollback()
+    else:
+        if not soft:
+            clear_dangling_supersede(cur)
+        db.commit()
+    warnings: list[str] = []
+    return ok(
+        STATUS_OK if dry_run else live_status, id=None, project=scope_name,
+        counts=counts, count=len(bulk_results),
+        scopes_affected=[scope_hit], bulk_results=bulk_results,
+        dry_run=dry_run, warnings=warnings,
+        message=(f"{'Would remove' if dry_run else 'Removed'} "
+                 f"{counts['memories']} memory/memories matching {reason} "
+                 f"in {scope_name}"),
+    )
+
+
 def forget(
     memory_id: Annotated[
         str | None,
@@ -2112,33 +2285,37 @@ def forget(
         bool,
         Field(description="True only reports what would be removed; nothing is "
                           "deleted or hidden.")] = False,
+    metadata_filter: Annotated[
+        dict[str, Any] | None,
+        Field(description="Remove the active memories whose metadata contains "
+                          "these key/value pairs (same comparison as "
+                          "`recall`). Needs an explicit `project` and cannot "
+                          "be combined with ids or `entity`.")] = None,
+    contains: Annotated[
+        str | None,
+        Field(description="Remove the active memories whose content contains "
+                          "this literal text (case-insensitive). Needs an "
+                          "explicit `project` and cannot be combined with ids "
+                          "or `entity`.")] = None,
 ) -> dict[str, Any]:
-    """Remove a fact by memory_id(s) or delete an entity and all its memories.
+    """Remove memories by id(s), entity, `metadata_filter` or `contains`.
 
-    The entity can be passed as `entity` or `entity_name`.
-    When soft=True (default), hides the memory by setting deleted_at and a
-    forgotten sentinel; it remains available only for database-level recovery.
-    Without `project`, the id/entity is looked up in every table; deleting an
-    entity also removes its memories from all scopes and its graph node.
+    `soft=True` (default) hides a row via `deleted_at` and a forgotten sentinel;
+    hard delete is permanent. Without `project` the id/entity is looked up in
+    every scope, and an entity delete also removes its graph node. `entity="*"`
+    empties one project (project required).
 
-    A `memory_id` is unique per scope, not globally: if the same id exists in
-    several scopes (an import copies the id), the call is refused and the
-    scopes are named - pass `project` to say which one to remove. An explicit
-    `project` (including "global") restricts the removal to that one table:
-    copies of the id that live in other scopes are never touched.
+    An id is unique per scope: an id found in several scopes is refused with the
+    scopes named, and an explicit `project` (including "global") bounds the
+    removal to that table. `memory_ids` is a bulk form; each id is reported in
+    `bulk_results` (status `soft_forgotten`/`deleted`, or `would_*` with
+    `dry_run`). `memory_id` and `memory_ids` are mutually exclusive.
 
-    `memory_ids` accepts a list of ids to remove in one call. Bulk operations
-    are more efficient than multiple single calls. Each id is validated
-    individually and the response reports which ids were found and which were
-    not; a found id carries the scope(s) it was removed from, and with
-    `dry_run=True` its status is `would_soft_forget`/`would_delete` instead
-    of `soft_forgotten`/`deleted`. `memory_id` and `memory_ids` are mutually
-    exclusive.
-
-    `entity="*"` removes every memory of the given project (memories and
-    graph nodes); `project` is required for that, so a stray call cannot wipe
-    the whole database. `dry_run=True` reports the counts without changing
-    anything.
+    `metadata_filter` and `contains` remove a matched set and need an explicit
+    `project` ("global" for the shared table); they cannot be combined with
+    ids, `entity` or each other. `counts` splits memories/entities/relations,
+    an entity delete without a project reports `scopes_affected`, and a
+    selector that matches nothing answers `ok` with a warning.
     """
     entity_name = entity or entity_name
     logger.info("forget memory_id=%s memory_ids=%s entity_name=%s soft=%s dry_run=%s",
@@ -2150,8 +2327,10 @@ def forget(
         return fail(STATUS_ERROR, str(e))
     if memory_id and memory_ids:
         return fail(STATUS_ERROR, "memory_id and memory_ids are mutually exclusive")
-    if not memory_id and not memory_ids and not entity_name:
-        return fail(STATUS_ERROR, "memory_id, memory_ids or entity is required")
+    selector_used = metadata_filter is not None or contains is not None
+    if not memory_id and not memory_ids and not entity_name and not selector_used:
+        return fail(STATUS_ERROR, "memory_id, memory_ids, entity, "
+                                  "metadata_filter or contains is required")
     scope_name = project if project else "global"
     purge_all = entity_name == "*"
     # An explicit `project` names the scope to purge — including the reserved
@@ -2171,6 +2350,12 @@ def forget(
     bulk_results: list[dict] = []
     try:
         cur = db.cur
+        if selector_used:
+            return _forget_by_selector(
+                db, cur, project, scope_name, explicit_scope,
+                memory_id, memory_ids, entity_name,
+                metadata_filter, contains, soft=soft, dry_run=dry_run,
+            )
         # An explicit scope (a project name, or the reserved "global" that
         # _norm_project maps to None) must narrow the lookup to that one
         # table. A plain `if not project` test widened project="global" to
@@ -2374,3 +2559,242 @@ def forget(
               project=(scope_name if project else None),
               dry_run=False, **extra, warnings=warnings,
               message=f"{'Soft-forgotten' if soft else 'Deleted'} {target}")
+
+
+def merge_memories(
+    memory_ids: Annotated[
+        list[str],
+        Field(description="2-20 ids of active memories to merge into one new "
+                          "memory.")],
+    content: Annotated[
+        str,
+        Field(description="Content of the merged memory (non-empty).")],
+    project: Annotated[
+        str | None,
+        Field(description="Scope of the merge. Without it the scope of the "
+                          "source ids is used; mixed scopes are refused.")] = None,
+    entity: Annotated[
+        str | None,
+        Field(description="Entity of the merged memory; defaults to the "
+                          "sources' shared entity.")] = None,
+    importance: Annotated[
+        float | None,
+        Field(description="Importance of the merged memory (0.0-1.0); defaults "
+                          "to the highest importance of the sources.")] = None,
+    metadata: Annotated[
+        dict[str, Any] | None,
+        Field(description="Metadata of the merged memory. With "
+                          "`metadata_mode='merge'` (default) it is combined "
+                          "with the sources' metadata and these keys win.")] = None,
+    metadata_mode: Annotated[
+        Literal["merge", "replace"],
+        Field(description="'merge' (default) carries the sources' metadata "
+                          "(later ids win) and lets explicit keys override "
+                          "it; 'replace' stores only `metadata`.")] = "merge",
+    mem_type: Annotated[
+        str | None,
+        Field(description=MEMORY_TYPE_HELP + " Defaults to the sources' shared "
+                                             "type, else 'fact'.")] = None,
+    dedupe: Annotated[
+        Literal["exact", "semantic", "off"],
+        Field(description="Duplicate check for the merged content against "
+                          "other active memories: 'exact' (default), "
+                          "'semantic' or 'off'.")] = "exact",
+    fuzzy_threshold: Annotated[
+        float | None,
+        Field(description="Similarity threshold for `dedupe='semantic'` "
+                          "(default 0.85).")] = None,
+    dry_run: Annotated[
+        bool,
+        Field(description="True only reports the merged memory and the "
+                          "sources it would supersede; nothing is written.")] = False,
+) -> dict[str, Any]:
+    """Merge several active memories into one new fact.
+
+    All sources must live in the same scope and be active (not superseded,
+    soft-forgotten or expired). The new memory is written first and then every
+    source is marked as superseded by it, in one transaction: a failed write
+    leaves the sources untouched. `metadata_mode='merge'` (default) combines
+    the sources' metadata (later ids win) and lets explicitly passed keys
+    override it; graph-edge metadata (`relation_context`, `from`, `to`,
+    `relation_type`, `weight`) is never carried onto a real fact.
+    """
+    warnings: list[str] = []
+    if not isinstance(memory_ids, list) or not 2 <= len(memory_ids) <= 20:
+        return fail(STATUS_ERROR, "memory_ids must contain 2-20 ids")
+    if any(not isinstance(mid, str) or not mid.strip() for mid in memory_ids):
+        return fail(STATUS_ERROR, "memory_ids must contain non-empty strings")
+    ids = list(dict.fromkeys(mid.strip() for mid in memory_ids))
+    if len(ids) != len(memory_ids):
+        return fail(STATUS_ERROR, "memory_ids must not contain duplicates")
+    if not isinstance(content, str) or not content.strip():
+        return fail(STATUS_ERROR, "content must be a non-empty string")
+    content = content.strip()
+    if dedupe not in DEDUPE_MODES:
+        return fail(STATUS_ERROR,
+                    f"dedupe must be one of {', '.join(sorted(DEDUPE_MODES))}")
+    if metadata_mode not in ("merge", "replace"):
+        return fail(STATUS_ERROR, "metadata_mode must be 'merge' or 'replace'")
+    if importance is not None and not 0.0 <= float(importance) <= 1.0:
+        return fail(STATUS_ERROR, "importance must be between 0.0 and 1.0")
+    try:
+        metadata_obj, metadata_error = (
+            (None, None) if metadata is None else _coerce_metadata(metadata))
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+    if metadata_error:
+        return fail(STATUS_ERROR, metadata_error)
+    if metadata_mode == "replace":
+        merged_meta = dict(metadata_obj or {})
+    else:
+        merged_meta = {}
+    raw_project = project
+    explicit_scope = (raw_project is not None
+                      and str(raw_project).strip() != "")
+    try:
+        project = _norm_project(project)
+    except ValueError as e:
+        return fail(STATUS_ERROR, str(e))
+
+    db = MemoryStore()
+    try:
+        cur = db.cur
+        scopes_by_id = {mid: db.scopes_of(mid) for mid in ids}
+        missing = [mid for mid, scopes in scopes_by_id.items() if not scopes]
+        if missing:
+            db.rollback()
+            return fail(STATUS_NOT_FOUND,
+                        f"NOT FOUND: {', '.join(missing)}", missing=missing)
+        if explicit_scope:
+            scope_name = project or "global"
+            absent = [mid for mid, scopes in scopes_by_id.items()
+                      if scope_name not in scopes]
+            if absent:
+                db.rollback()
+                return fail(
+                    STATUS_NOT_FOUND,
+                    f"NOT FOUND in scope {scope_name!r}: {', '.join(absent)}",
+                    missing=absent)
+            if any(len(scopes_by_id[mid]) > 1 for mid in ids):
+                warnings.append(
+                    "some source ids also exist in another scope; only the "
+                    f"copies in {scope_name!r} were merged")
+        else:
+            all_scopes = {scope for scopes in scopes_by_id.values()
+                          for scope in scopes}
+            if len(all_scopes) > 1:
+                db.rollback()
+                return fail(
+                    STATUS_ERROR,
+                    f"the source ids live in several scopes "
+                    f"({', '.join(sorted(all_scopes))}); pass project=<name> "
+                    f"to merge the copies of one scope",
+                    scopes=sorted(all_scopes))
+            scope_name = next(iter(all_scopes))
+        # The sources name the scope; a project omitted from the call must not
+        # redirect the merge to the shared table (and report every id as
+        # missing).
+        merge_project = None if scope_name == "global" else scope_name
+        table = _mem_table(merge_project)
+        if not _table_exists(cur, table):
+            db.rollback()
+            return fail(STATUS_NOT_FOUND, "the source scope has no memory table")
+        rows = db.rows_by_ids(
+            ids, table=table,
+            columns="id, content, mem_type, entity, importance, metadata, "
+                    "superseded_by, deleted_at, expires_at")
+        by_id = {row["id"]: row for row in rows}
+        invalid: dict[str, str] = {}
+        for mid in ids:
+            row = by_id.get(mid)
+            if row is None:
+                invalid[mid] = "not_found"
+            elif row["deleted_at"] is not None:
+                invalid[mid] = "soft_forgotten"
+            elif (row["superseded_by"] is not None
+                  and row["superseded_by"] != SENTINEL_FORGOTTEN):
+                invalid[mid] = "superseded"
+            elif _is_past(row["expires_at"]):
+                invalid[mid] = "expired"
+        if invalid:
+            db.rollback()
+            named = ", ".join(f"{mid} ({reason})"
+                              for mid, reason in invalid.items())
+            return fail(STATUS_CONFLICT,
+                        f"cannot merge inactive memories: {named}",
+                        invalid=invalid)
+        ordered = [by_id[mid] for mid in ids]
+
+        if not entity:
+            entities = {row["entity"] for row in ordered}
+            if len(entities) == 1:
+                entity = next(iter(entities))
+            elif any(entities):
+                warnings.append("the sources had different entities; the "
+                                "merged memory is untagged")
+        if not mem_type:
+            types = {row["mem_type"] for row in ordered}
+            mem_type = next(iter(types)) if len(types) == 1 else "fact"
+        elif mem_type not in MEMORY_TYPES:
+            db.rollback()
+            return fail(STATUS_ERROR,
+                        f"invalid mem_type {mem_type!r}; valid types are "
+                        f"{', '.join(MEMORY_TYPES)}")
+        if importance is None:
+            importance = max(float(row["importance"] or 0.0)
+                             for row in ordered)
+        if metadata_mode == "merge":
+            for row in ordered:
+                meta = row["metadata"] or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except json.JSONDecodeError:
+                        meta = {}
+                for key, value in dict(meta).items():
+                    if key not in _GRAPH_METADATA_KEYS:
+                        merged_meta[key] = value
+            merged_meta.update(metadata_obj or {})
+        else:
+            merged_meta = dict(metadata_obj or {})
+
+        emb = embed([content])[0]
+        duplicate = _deduplicate(
+            cur, content, merge_project, embedding_vec=emb,
+            fuzzy_threshold=fuzzy_threshold, dedupe=dedupe)
+        if duplicate is not None:
+            dup_id, mode, similarity = duplicate
+            if dup_id not in ids:
+                db.rollback()
+                return fail(
+                    STATUS_DUPLICATE,
+                    f"the merged content already exists as {dup_id}",
+                    id=dup_id, duplicate_of=dup_id, duplicate_mode=mode,
+                    similarity=similarity)
+        if dry_run:
+            db.rollback()
+            return ok(
+                STATUS_OK, id=None, dry_run=True,
+                would_create={"content": content, "entity": entity,
+                              "mem_type": mem_type,
+                              "importance": importance,
+                              "project": scope_name,
+                              "metadata": merged_meta},
+                would_supersede=ids, merged_ids=ids,
+                warnings=warnings,
+                message=f"Would merge {len(ids)} memories into one")
+        new_id = _store_memory(
+            cur, content, emb, mem_type, entity, importance, merged_meta,
+            merge_project, expires_at=None,
+            scope=("global" if scope_name == "global" else "project"))
+        db.supersede_many(ids, new_id, table=table)
+        db.commit()
+        return ok(
+            STATUS_MERGED, id=new_id, merged_ids=ids, superseded=ids,
+            count=len(ids), project=scope_name, warnings=warnings,
+            message=f"Merged {len(ids)} memories into {new_id}")
+    except Exception as e:
+        db.rollback()
+        return fail(STATUS_ERROR, str(e))
+    finally:
+        db.close()

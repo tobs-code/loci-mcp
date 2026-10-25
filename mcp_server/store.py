@@ -193,6 +193,34 @@ class MemoryStore:
     def counts(self, project: str | None = None) -> dict[str, int]:
         return lifecycle_counts(self.cur, _mem_table(project))
 
+    def lock_idempotency_key(self, table: str, key: str) -> None:
+        """Serialize first-writes that carry the same key in one scope.
+
+        The lock is transaction-scoped: a concurrent caller with the same key
+        waits here, then sees the committed row in the replay check instead of
+        running dedupe/supersede side effects and losing the insert race.
+        """
+        self.cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         (f"{table}:{key}",))
+
+    def clear_stale_idempotency_keys(self, key: str, *, table: str) -> int:
+        """Free a key held by an expired row (the index cannot see expiry)."""
+        return self.execute(
+            f"UPDATE {table} SET idempotency_key = NULL "
+            "WHERE idempotency_key = %s AND superseded_by IS NULL "
+            "AND deleted_at IS NULL AND expires_at IS NOT NULL "
+            "AND expires_at <= NOW()",
+            (key,))
+
+    def find_idempotency_key(self, key: str, *,
+                             table: str) -> dict | None:
+        """The active row already stored for `key` in one scope, or None."""
+        return self.one(
+            f"SELECT * FROM {table} WHERE idempotency_key = %s "
+            "AND superseded_by IS NULL AND deleted_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > NOW())",
+            (key,))
+
     # -- domain writes -------------------------------------------------------
 
     def insert(self, content: str, embedding_vec: list[float] | None,
@@ -200,7 +228,8 @@ class MemoryStore:
                metadata: dict, *, project: str | None = None,
                scope: str | None = None, expires_at: str | None = None,
                superseded_by: str | None = None,
-               memory_id: str | None = None) -> str:
+               memory_id: str | None = None,
+               idempotency_key: str | None = None) -> str:
         """Insert one active memory and return its id."""
         mem_id = memory_id or _gen_id()
         now = _now()
@@ -211,16 +240,23 @@ class MemoryStore:
             effective_scope, entity, importance, json.dumps(metadata),
             superseded_by, now, now,
         ]
-        ttl = ""
+        extra_columns = ""
+        extra_values = ""
         if expires_at is not None:
-            ttl = ", expires_at"
+            extra_columns += ", expires_at"
+            extra_values += ", %s::timestamptz"
             params.append(expires_at)
+        if idempotency_key is not None:
+            extra_columns += ", idempotency_key"
+            extra_values += ", %s"
+            params.append(idempotency_key)
         self.cur.execute(
             f"""INSERT INTO {table}
                 (id, content, content_hash, embedding, mem_type, scope, entity,
-                 importance, metadata, superseded_by, created_at, updated_at{ttl})
+                 importance, metadata, superseded_by, created_at, updated_at
+                 {extra_columns})
             VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, %s, %s
-                    {', %s::timestamptz' if expires_at is not None else ''})""",
+                    {extra_values})""",
             tuple(params),
         )
         return mem_id
@@ -253,6 +289,31 @@ class MemoryStore:
                 (superseded_by, memory_id),
             )
         return touched
+
+    def rows_by_ids(self, memory_ids: list[str], *, table: str | None = None,
+                    project: str | None = None,
+                    columns: str = "*") -> list[dict]:
+        """Rows of the given ids from one table (id order is not kept)."""
+        target = table or _mem_table(project)
+        if not memory_ids:
+            return []
+        return self.all(
+            f"SELECT {columns} FROM {target} WHERE id = ANY(%s)",
+            (list(memory_ids),),
+        )
+
+    def supersede_many(self, memory_ids: list[str], superseded_by: str, *,
+                       table: str | None = None,
+                       project: str | None = None) -> int:
+        """Mark several rows of ONE table as replaced by the same id."""
+        target = table or _mem_table(project)
+        if not memory_ids:
+            return 0
+        return self.execute(
+            f"UPDATE {target} SET superseded_by = %s, updated_at = NOW() "
+            f"WHERE id = ANY(%s)",
+            (superseded_by, list(memory_ids)),
+        )
 
     def forget_rows(self, memory_id: str, *, project: str | None = None,
                     tables: list[str] | None = None, soft: bool = True,

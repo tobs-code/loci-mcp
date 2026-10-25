@@ -30,14 +30,21 @@ def _chat_payload(score=0.9, label="contradiction"):
     }
 
 
-def test_defaults_to_groq_and_is_unconfigured_without_a_key():
+def test_defaults_to_none_so_egress_is_opt_in():
     config = load_config({})
 
-    assert config.provider == "groq"
-    assert config.model == "openai/gpt-oss-20b"
-    assert config.base_url == "https://api.groq.com/openai/v1"
-    assert config.style == "openai"
+    assert config.provider == "none"
+    assert config.model == ""
+    assert config.base_url == ""
+    assert config.style == "none"
     assert config.configured is False
+
+
+def test_auto_detection_still_finds_a_configured_key():
+    config = load_config({"LLM_PROVIDER": "auto", "OPENAI_API_KEY": "sk-test"})
+
+    assert config.provider == "openai"
+    assert config.configured is True
 
 
 def test_groq_keeps_the_legacy_env_names():

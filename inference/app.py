@@ -4,7 +4,7 @@ import threading
 
 import torch
 from fastapi import FastAPI
-from llm import classify, load_config
+from llm import classify_many, load_config
 from pydantic import BaseModel
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -25,6 +25,17 @@ EMBED_MODEL = os.environ.get(
     "EMBED_MODEL", "jinaai/jina-embeddings-v5-text-nano-retrieval"
 ).strip() or "jinaai/jina-embeddings-v5-text-nano-retrieval"
 DEVICE_REQUEST = os.environ.get("INFERENCE_DEVICE", "auto").strip().lower() or "auto"
+
+# Documents of one /nli request are judged concurrently. The endpoint used to
+# classify them sequentially, so a contradiction scan (one request per fact,
+# six documents each) spent most of its wall-clock budget queueing provider
+# round trips. Four workers keep a full scan (six client-side workers) within
+# typical provider concurrency while cutting the per-request latency.
+try:
+    NLI_MAX_WORKERS = int(os.environ.get("NLI_MAX_WORKERS", "4"))
+except ValueError:
+    NLI_MAX_WORKERS = 4
+NLI_MAX_WORKERS = max(1, min(16, NLI_MAX_WORKERS))
 
 
 def _resolve_device(request: str) -> torch.device:
@@ -281,29 +292,13 @@ def nli(req: NliRequest):
         return NliResponse(contradiction_scores=[0.0] * len(req.documents),
                            error=f"LLM provider {llm.provider!r} is not configured")
 
-    scores: list[float] = []
-    failures: list[str] = []
-    failure_indices: list[int] = []
-    document_entities = req.document_entities or []
-    for index, doc in enumerate(req.documents):
-        document_entity = (
-            document_entities[index] if index < len(document_entities) else None
-        )
-        try:
-            scores.append(classify(
-                llm, req.query, doc,
-                query_entity=req.query_entity,
-                document_entity=document_entity,
-            ))
-        except Exception as exc:
-            # One malformed provider response must not throw away the
-            # judgments for the other documents: record the failure, keep
-            # the 0.0 placeholder, and continue. A failed score is reported
-            # separately so the caller never reads it as "neutral".
-            logger.warning("NLI failed for one document: %s", exc)
-            scores.append(0.0)
-            failures.append(str(exc))
-            failure_indices.append(index)
+    scores, failures, failure_indices = classify_many(
+        llm, req.query, req.documents,
+        query_entity=req.query_entity,
+        document_entities=req.document_entities or [],
+        max_workers=NLI_MAX_WORKERS,
+    )
+
 
     if failures and len(failures) == len(req.documents):
         # Nothing was judged: this is an outage, not a clean scan.

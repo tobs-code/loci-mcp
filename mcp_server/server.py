@@ -20,7 +20,11 @@ from mcp_server.graph import (
     unrelate,
 )
 from mcp_server.graph_store import GraphStore
-from mcp_server.schema_migrator import ensure_fts_language, migrate_fts_indexes
+from mcp_server.schema_migrator import (
+    ensure_fts_language,
+    migrate_fts_indexes,
+    migrate_idempotency_keys,
+)
 from mcp_server.tools.maintenance import (
     contradictions_report,
     prune_memories,
@@ -30,12 +34,15 @@ from mcp_server.tools.maintenance import (
 )
 from mcp_server.tools.memory import (
     forget,
+    merge_memories,
     remember,
     remember_batch,
     update_batch,
     update_memory,
 )
 from mcp_server.tools.read import (
+    compile_context,
+    get_entities,
     get_entity,
     init_context,
     list_entities,
@@ -53,6 +60,7 @@ _CORE_TOOL_NAMES = frozenset({
     "update_memory",
     "forget",
     "recall",
+    "compile_context",
     "list_memories",
     "get_entity",
     "list_entities",
@@ -70,11 +78,14 @@ _ALL_TOOLS = (
     remember_batch,
     update_memory,
     update_batch,
+    merge_memories,
     forget,
     recall,
     recall_batch,
+    compile_context,
     list_memories,
     get_entity,
+    get_entities,
     list_entities,
     list_projects,
     init_context,
@@ -93,8 +104,8 @@ _ALL_TOOLS = (
     drop_project,
 )
 
-# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (15
-# tools); `full` (default) exposes all 25. Maintenance and batch tools are
+# `MCP_TOOLSET=core` exposes only the daily read/write/graph surface (16
+# tools); `full` (default) exposes all 28. Maintenance and batch tools are
 # full-only, which keeps the per-turn schema small for interactive agents.
 _toolset = os.environ.get("MCP_TOOLSET", "full").strip().lower() or "full"
 if _toolset == "core":
@@ -205,6 +216,17 @@ def main() -> None:
         migrate_memory_tables()
     except Exception as e:
         message = f"memory table migration skipped: {e}"
+        logger.error(message)
+        record_warning(message)
+
+    # Older project tables only get the idempotency column when a write
+    # touches that scope; replay has to work before that first write.
+    try:
+        changed = migrate_idempotency_keys()
+        if changed:
+            logger.info("Added idempotency_key to %s memory table(s)", changed)
+    except Exception as e:
+        message = f"idempotency-key migration skipped: {e}"
         logger.error(message)
         record_warning(message)
 

@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from psycopg2 import errors as pg_errors
+
 from mcp_server.config import (
     CONTRADICTION_AUTO_MAX_SUPERSEDES,
     CONTRADICTION_AUTO_MIN_CONFIDENCE,
@@ -97,6 +99,10 @@ class WriteIntent:
     contradiction_min_confidence: float = CONTRADICTION_AUTO_MIN_CONFIDENCE
     max_contradiction_supersedes: int = CONTRADICTION_AUTO_MAX_SUPERSEDES
     links: list[dict] | None = None
+    # Client-supplied idempotency token. A second write with the same token in
+    # the same scope answers `duplicate` naming the first row instead of
+    # storing (or superseding) anything.
+    idempotency_key: str | None = None
     # Batch tools pre-embed every fact in one call; passing the vector keeps
     # that batching and its single "embedding failed" answer intact.
     embedding: list[float] | None = None
@@ -148,6 +154,35 @@ class WriteOutcome:
     cross_scope_warning: str | None = None
     cross_duplicate_warning: str | None = None
     persist: bool = True
+    idempotent_replay: bool = False
+
+
+def _idempotent_replay_outcome(
+        row: dict, *, content: str, store_project: str | None,
+        meta: dict, created_scope: bool) -> WriteOutcome:
+    """Answer a write whose idempotency key already names an active row."""
+    same_content = (row.get("content") or "") == content
+    warning = (
+        f"idempotent replay: idempotency_key already stored memory "
+        f"{row['id']}; nothing stored"
+        if same_content else
+        f"idempotent replay: idempotency_key already stored memory "
+        f"{row['id']} with different content; nothing stored - use a new "
+        f"key to store this fact")
+    return WriteOutcome(
+        status=STATUS_DUPLICATE,
+        id=row["id"],
+        scope=row.get("scope") or "global",
+        project=(store_project or "global"),
+        content=content,
+        warnings=[warning],
+        duplicate_mode="idempotency_key",
+        duplicate_of=row["id"],
+        metadata=meta,
+        created_scope=created_scope,
+        duplicate_detail="idempotency_key replay",
+        idempotent_replay=True,
+    )
 
 
 def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
@@ -170,6 +205,25 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
     ttl_warning = _ttl_past_warning(intent.expires_at)
 
     created_scope = db.ensure_scope(store_project)
+
+    # Idempotency is checked before dedupe, supersede and the near-duplicate
+    # policy: a replay must have no side effects at all (a second call must not
+    # invalidate the fact the first call already touched). The advisory lock
+    # serializes two concurrent first-writes, so the loser sees the winner's
+    # row here instead of running those side effects and then failing its
+    # insert.
+    idem_table: str | None = None
+    if intent.idempotency_key:
+        idem_table = db.table(store_project)
+        db.lock_idempotency_key(idem_table, intent.idempotency_key)
+        db.clear_stale_idempotency_keys(intent.idempotency_key,
+                                       table=idem_table)
+        replay = db.find_idempotency_key(intent.idempotency_key,
+                                         table=idem_table)
+        if replay is not None:
+            return _idempotent_replay_outcome(
+                replay, content=content, store_project=store_project,
+                meta=meta, created_scope=created_scope)
 
     exact_copy: str | None = None
     if not intent.skip_duplicates and intent.dedupe != "off":
@@ -312,9 +366,33 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         auto_near = near_dup
         superseded.append(near_dup["id"])
 
-    mem_id = db.insert(content, emb, mem_type, entity,
-                       intent.importance, meta, project=store_project,
-                       scope=effective_scope, expires_at=intent.expires_at)
+    def _insert(key: str | None) -> str:
+        extra = {"idempotency_key": key} if key is not None else {}
+        return db.insert(content, emb, mem_type, entity,
+                         intent.importance, meta, project=store_project,
+                         scope=effective_scope, expires_at=intent.expires_at,
+                         **extra)
+
+    if intent.idempotency_key:
+        try:
+            with db.attempt("idempotency_insert"):
+                mem_id = _insert(intent.idempotency_key)
+        except pg_errors.UniqueViolation:
+            # The partial unique index cannot include expiry, so a row that
+            # expired after the pre-check can still hold the key. A concurrent
+            # writer is excluded by the advisory lock, but recover the same way
+            # instead of surfacing a raw integrity error.
+            db.clear_stale_idempotency_keys(intent.idempotency_key,
+                                           table=idem_table)
+            replay = db.find_idempotency_key(intent.idempotency_key,
+                                             table=idem_table)
+            if replay is not None:
+                return _idempotent_replay_outcome(
+                    replay, content=content, store_project=store_project,
+                    meta=meta, created_scope=created_scope)
+            mem_id = _insert(intent.idempotency_key)
+    else:
+        mem_id = _insert(None)
 
     for old_id in superseded:
         db.mark_superseded(
@@ -333,6 +411,12 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
             confidence = float(c.get("confidence",
                                      c.get("similarity", 0.0)) or 0.0)
             c["confidence"] = round(confidence, 3)
+            # NLI judges the texts, not the entity tags: a confirmed
+            # contradiction between differently tagged (or one untagged)
+            # memories is real, but the response must say that a fact of
+            # ANOTHER entity was invalidated.
+            c["cross_entity"] = _entities_differ(
+                entity, c.get("existing_entity"))
             if c["existing_id"] in superseded:
                 continue
             if confidence < contradiction_min_confidence:
@@ -350,6 +434,11 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
                 db.mark_superseded(
                     c["existing_id"], mem_id, project=store_project,
                     target=_scope_of_id(cur, c["existing_id"], store_project))
+            cross_replaced = [c for c in auto_superseded
+                              if c.get("cross_entity")]
+            if cross_replaced:
+                guard_warnings.append(
+                    _cross_entity_supersede_warning(entity, cross_replaced))
 
     # A project write that invalidates a SHARED (global) fact hides that fact
     # in every scope, not only in this project.
@@ -384,6 +473,14 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
     link_results, link_warnings = _apply_remember_links(
         cur, intent.links, entity, store_project)
 
+    confirmed_conflicts = {
+        c["existing_id"]: float(c.get("confidence")
+                                or c.get("similarity") or 0.0)
+        for c in contradictions
+    }
+    near_contradiction = (
+        confirmed_conflicts.get(near_dup["id"]) if near_dup else None)
+
     near_warning: str | None = None
     if auto_near:
         near_warning = (
@@ -399,7 +496,9 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
         # advice: the `superseded` list already names it.
         near_warning = _near_duplicate_warning(
             near_dup, entity, near_conflict, new_content=content,
-            explicit_supersede=intent.supersede or intent.supersede_content)
+            explicit_supersede=intent.supersede or intent.supersede_content,
+            contradicted=bool(confirmed_conflicts),
+            contradiction_confidence=near_contradiction)
 
     cross_warning = (_cross_scope_warning(cross_scope_superseded)
                      if cross_scope_superseded else None)
@@ -431,6 +530,13 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
             contradictions_payload["unjudged"] = contradiction_unjudged
         if not entity and not skip:
             # Transparency: the check ran, but beyond the entity tag.
+            contradictions_payload["cross_entity"] = True
+        elif any(c.get("cross_entity")
+                 for c in contradictions_payload["superseded"]
+                 + contradictions_payload["kept"]):
+            # The write was tagged, yet NLI confirmed a conflict with a
+            # differently tagged (or untagged) memory. Name that instead of
+            # reporting a plain same-entity supersede.
             contradictions_payload["cross_entity"] = True
 
     warnings: list[str] = []
@@ -816,11 +922,40 @@ def _same_subject_entity(near_dup: dict, entity: str | None) -> bool:
     return _norm_str(near_dup.get("entity")) == _norm_str(entity)
 
 
+def _entities_differ(left: str | None, right: str | None) -> bool:
+    """Whether two entity tags name different subjects.
+
+    Both untagged counts as the same (unknown) subject; one tagged and one
+    untagged counts as different, because the tags alone cannot prove a
+    shared subject.
+    """
+    return _norm_str(left) != _norm_str(right)
+
+
+def _cross_entity_supersede_warning(entity: str | None,
+                                    replaced: list[dict]) -> str:
+    """Name a contradiction supersede that invalidated another entity's fact."""
+    pairs = ", ".join(
+        f"{c['existing_id']} (entity {c.get('existing_entity')!r}, "
+        f"confidence {c['confidence']})" for c in replaced[:5])
+    if len(replaced) > 5:
+        pairs += ", ..."
+    new_entity = entity if entity is not None else "untagged"
+    return (
+        f"cross-entity supersede: NLI confirmed a contradiction and this "
+        f"write (entity {new_entity!r}) invalidated {len(replaced)} memory/"
+        f"fact(s) tagged with another entity: {pairs}. The other subject's "
+        f"fact is now history - verify this was intended; use "
+        f"contradiction_mode='warn' to only report such pairs")
+
+
 def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
                             conflict: bool = False,
                             update: bool = False,
                             new_content: str | None = None,
-                            explicit_supersede: str | None = None) -> str:
+                            explicit_supersede: str | None = None,
+                            contradicted: bool = False,
+                            contradiction_confidence: float | None = None) -> str:
     """Warning for a write that dedupe did not match but that still reads
     like a reworded copy of an active memory (remember + remember_batch).
 
@@ -882,7 +1017,20 @@ def _near_duplicate_warning(near_dup: dict, entity: str | None = None,
             f"supersede={near_dup['id']} if you are sure the other fact must "
             f"be replaced. Matched content: {preview!r}"
         ) + note
+    if contradiction_confidence is not None:
+        # NLI already judged the pair: the overlap is real, so the warning
+        # must not claim the two facts share no subject.
+        return (
+            f"near-duplicate: active memory {near_dup['id']} matches this "
+            f"content with similarity {near_dup['similarity']}, and NLI "
+            f"confirms a contradiction (confidence "
+            f"{contradiction_confidence:.2f}) - this is the same subject, not "
+            f"a different one. The contradiction check already reports the "
+            f"pair; resolve it with supersede={near_dup['id']} if the new fact "
+            f"is the intended one, or keep both on purpose"
+        ) + note
     if (new_content is not None and near_dup.get("content")
+            and not contradicted
             and not _shares_subject(
                 new_content, near_dup["content"], entity,
                 near_dup.get("similarity"))):

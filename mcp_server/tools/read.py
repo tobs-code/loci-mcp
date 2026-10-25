@@ -28,7 +28,14 @@ from mcp_server.config import (
 from mcp_server.duplicates import (
     dedupe_similar_rows as dedupe_near_duplicates,
 )
-from mcp_server.envelope import STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, fail, ok
+from mcp_server.envelope import (
+    STATUS_ERROR,
+    STATUS_NOT_FOUND,
+    STATUS_OK,
+    STATUS_PARTIAL,
+    fail,
+    ok,
+)
 from mcp_server.graph_store import GraphStore
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import (
@@ -89,6 +96,12 @@ from mcp_server.store_rows import (
 from mcp_server.tools.maintenance import _health_check
 
 logger = logging.getLogger(__name__)
+
+# A hit found only by full-text search (no vector score) is never filtered by
+# `min_similarity`. A stopword-only OR match can then reach the caller with a
+# relevance around 0.24 and read like an answer. Exact literal hits are exempt:
+# they carry `_exact_match` and a 0.85/0.95 relevance floor of their own.
+_FTS_ONLY_MIN_RELEVANCE = 0.25
 
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
@@ -226,7 +239,9 @@ def recall(
                           "similarity and full-text rank. Graph-boost-only "
                           "hits carry no relevance score and are never "
                           "dropped by this filter. Null (default) keeps every "
-                          "hit that passed the similarity floor.")] = None,
+                          "hit that passed the similarity floor; FTS-only "
+                          "hits below an implicit 0.25 noise floor are still "
+                          "dropped.")] = None,
     fields: Annotated[
         list[str] | None,
         Field(description="Only return these columns, e.g. ['id', 'content']. "
@@ -272,68 +287,37 @@ def recall(
                           "'<from>_<relation>_<to>'); False hides them from "
                           "the ranking.")] = True,
 ) -> dict[str, Any]:
-    """Search memories using hybrid vector + fulltext search (RRF fusion).
+    """Hybrid vector + full-text search (RRF fusion).
 
-    Project searches also see global memories; global searches see only global ones.
-    Set graph_boost=True to add the memories of entities connected in the graph.
-    `graph_entity` names the entity to expand from and leaves the query search
-    unfiltered ("query hits + graph neighbourhood"); without it `entity` is
-    used for the expansion *and* filters the search, so unrelated hits are
-    dropped. Graph hits have no similarity: their `_similarity` and
-    `_relevance_score` are null and they carry `_graph_boost` instead.
-    Graph-only hits fill the slots left by query hits; they never push a
-    query match out of the page.
-    `min_similarity` defaults to 0.30, just above the embedding model's
-    measured 0.288 noise floor, and only applies to the vector retriever;
-    a full-text hit is kept even when its embedding is a poor match, so an
-    exact identifier ("ZEBRAFISH_TOKEN") is found even if the embedding model
-    handles that word badly. Pass `None` to disable the filter. The response
-    reports `candidates` and `dropped_by_similarity`, and warns when the
-    filter removed everything. When hits were dropped, it also names
-    `best_dropped_by_similarity` (id, similarity, scope, content preview):
-    the strongest rejected vector hit, so a natural-language question that
-    missed the threshold by a hair is visible and one retry with
-    `min_similarity=null` can recover it.
-    When the first stage is ambiguous (best relevance below 0.85 and margin
-    to the runner-up below 0.10), the top candidates are reranked by a local
-    cross-encoder; `reranked` reports how many were rescored. Reranked rows
-    carry `_rerank_score` (a per-candidate sigmoid of the cross-encoder logit,
-    so the value does not depend on the candidate block size) and an
-    updated `_relevance_score`; `_similarity` still reports the vector score.
-    A reranker failure is reported in `rerank_error` and falls back to the
-    first-stage ranking.
-    `_relevance_score` is normalized to 0..1 and combines both signals: the
-    cosine similarity of the vector hit and the rank of the full-text hit.
-    A memory that both retrievers found scores higher than either signal
-    alone. `_similarity` is the raw cosine similarity (0..1): a natural
-    language question that matches scores ~0.6-0.95, a bare keyword that
-    occurs verbatim in the memory only ~0.3-0.6.
-    `_scope_boost` is compressed with the relevance for a project row:
-    `0.05 * (1 - relevance)`, so a weak project hit gains more than a strong
-    one and a project memory outranks an equally relevant global one.
-    `_final_score` is the ranking score in 0..1: relevance blended with decay
-    plus the graph boost. It is only present with `include_decay=True` or
-    `graph_boost=True`; without them the ranking is `_relevance_score`.
-    Set include_decay=True to blend in recency/frequency (max 30% of the score).
-    min_decay_score (0..1) filters on the normalized decay score; a fresh
-    memory with importance 1.0 scores 0.9 (importance 0.5 scores 0.45), and
-    a 90-day-old one is roughly half of that.
-    Set only_superseded=True to return only invalidated facts.
-    Set fields=["id", "content"] to receive only the named columns.
-    Set include_global=False to restrict a project search to project memories.
-    `updated_after` and `metadata_filter` narrow the result set.
-    include_relation_context=False hides the relation-context sentences of
-    the graph edges from the ranking (they repeat what the edge already says).
-    `offset` pages through the ranked results (with `limit`); the response
-    reports `has_more` and `next_offset`.
-    The answer carries `confidence` (`high` >= 0.60, `medium` >= 0.45,
-    `low` below that, `none` for no result, `graph` for graph-only hits) and
-    `best_relevance`. A low-confidence answer warns instead of looking like a
-    confident miss; the warning names `min_similarity=null` when the floor
-    may have removed the intended fact.
-    `project="*"` searches every scope at once. A project that does not
-    exist is reported in `warnings`: the search then only covered the global
-    scope.
+    Project searches also see global memories; global searches see only global
+    ones; `project="*"` searches every scope. `include_global=False` restricts a
+    project search to project rows.
+
+    `min_similarity` (default 0.30) filters vector hits only: a full-text hit
+    survives a poor embedding, so an exact identifier is still found. Pass None
+    to disable it. An empty result names every filter that removed something,
+    including `best_dropped_by_similarity` (the strongest rejected vector hit);
+    retry with `min_similarity=None` when one nearly matched. `min_relevance`
+    filters on `_relevance_score`.
+
+    Ambiguous first-stage results are reranked by a local cross-encoder
+    (`reranked`); rows then carry `_rerank_score`. A failure sets `rerank_error`
+    and keeps the first-stage order. `_similarity` is raw cosine (0..1),
+    `_relevance_score` the normalized vector+FTS blend.
+    `min_decay_score` filters on the decay score; include_decay=True blends
+    recency/frequency into `_final_score` (at most 30%).
+
+    `graph_boost` adds memories of connected entities. Without `graph_entity`,
+    `entity` both filters the search and names the expansion point; with it the
+    query stays unfiltered. Graph hits have no similarity and carry
+    `_graph_boost`; they only fill slots left by query hits.
+
+    Flags: `only_superseded`, `include_superseded`, `include_deleted`,
+    `include_expired`, `include_relation_context` (False hides edge sentences),
+    `fields`, `detail="slim"`. `offset` pages; the answer reports `has_more`,
+    `next_offset`, `confidence` (high >= 0.60, medium >= 0.45, low, none, graph)
+    and `best_relevance`; a low-confidence answer warns. An unknown project is
+    named in `warnings` and only the global scope is searched.
     """
     logger.info("recall query='%s' entity=%s hybrid=%s include_decay=%s graph_boost=%s min_similarity=%s",
                 query[:80], entity, hybrid, include_decay, graph_boost, min_similarity)
@@ -471,23 +455,28 @@ def recall(
             results = kept
 
         dropped_by_relevance = 0
-        if min_relevance is not None:
-            kept = []
-            for r in results:
-                if not isinstance(r, dict) or "error" in r:
-                    kept.append(r)
-                    continue
-                relevance = r.get("_relevance_score")
-                if relevance is None:
-                    # Graph-boost-only hits carry no relevance score: the
-                    # filter cannot judge them and must not drop them.
-                    kept.append(r)
-                    continue
-                if relevance >= min_relevance - 1e-6:
-                    kept.append(r)
-                else:
-                    dropped_by_relevance += 1
-            results = kept
+        kept = []
+        for r in results:
+            if not isinstance(r, dict) or "error" in r:
+                kept.append(r)
+                continue
+            relevance = r.get("_relevance_score")
+            if relevance is None:
+                # Graph-boost-only hits carry no relevance score: the
+                # filter cannot judge them and must not drop them.
+                kept.append(r)
+                continue
+            threshold = min_relevance
+            if (threshold is None and r.get("_similarity") is None
+                    and not r.get("_exact_match")):
+                # FTS-only hit: apply the implicit noise floor even when the
+                # caller did not ask for a relevance filter.
+                threshold = _FTS_ONLY_MIN_RELEVANCE
+            if threshold is None or relevance >= threshold - 1e-6:
+                kept.append(r)
+            else:
+                dropped_by_relevance += 1
+        results = kept
 
         dropped_by_superseded = 0
         if only_superseded:
@@ -751,7 +740,7 @@ def recall_batch(
                           "(0.0-1.0), the blend of vector similarity and "
                           "full-text rank. Graph-boost-only hits are never "
                           "dropped by this filter. Null (default) applies no "
-                          "relevance floor.")] = None,
+                          "explicit floor.")] = None,
     include_decay: Annotated[
         bool,
         Field(description="Blend recency/access into the score.")] = False,
@@ -788,16 +777,13 @@ def recall_batch(
         Field(description="Only return these columns per hit, e.g. "
                           "['id', 'content'].")] = None,
 ) -> dict[str, Any]:
-    """Run several independent `recall` queries in one call.
+    """Run up to 25 independent `recall` queries in one call.
 
-    A multi-intent turn (\"how do we deploy and where are the logs?\") often
-    needs two searches; this tool returns one ranked list per query instead of
-    forcing the agent to concatenate them (which dilutes the vector score).
-    The shared options apply to every query; each entry reports its own
+    One ranked list per query instead of concatenating intents (which dilutes
+    the scores). Shared options apply to every query; each entry reports its own
     `count`, `warnings`, filter counters and `scopes_searched`.
-    An empty query is reported in its own entry (`ok: false`, `status:
-    error`) and in the top-level `warnings`; the other queries still run, so
-    one bad intent does not discard the whole batch.
+    A failed query (including an empty one) is named in the top-level
+    `warnings` and answered in its own entry; the rest still run.
     """
     logger.info("recall_batch queries=%s", len(queries or []))
     if not isinstance(queries, list) or not queries:
@@ -942,31 +928,26 @@ def list_memories(
                           "True lists every copy, so a browse across scopes "
                           "shows each scope's row.")] = False,
 ) -> dict[str, Any]:
-    """Browse stored memories without a search query.
+    """Browse stored memories without a search query, newest first.
 
-    Newest first. Project scope also lists global memories, like `recall`.
-    Without `project` (or with `project="*"`) every scope is listed;
-    `project="global"` lists only the shared scope. Set `fields` to narrow
-    the returned columns. Set
-    `include_global=False` to restrict a project browse to project memories.
-    `updated_after` and `metadata_filter` narrow the result set, `order_by`
-    changes the sorting and `contains` filters on a literal substring of the
-    content. `offset` pages through a scope that has more matches than
-    `limit`. Pass `memory_id` for a direct id lookup: the answer then carries
-    the single `memory` (and a one-item `results`) with the
-    `superseded_by`/`forgotten`/`expired` markers, and a hidden row names the
-    flag that reveals it. Browse filters are ignored for that lookup.
-    `include_deleted=True` includes soft-forgotten memories (they carry
-    `deleted_at`); superseded history stays hidden unless
-    `include_superseded=True` is also passed — the two flags are orthogonal.
-    Expired TTL rows are separate: they stay hidden until
-    `include_expired=True` and then carry `expired: true`.
-    `include_relation_context=False` hides the relation-context sentences of
-    the graph edges. A project that does not exist is reported in `warnings`:
-    the browse then only covered the global scope.
-    Identical content that exists in several scopes is listed once; the answer
-    says in `warnings` how many copies were hidden. Pass
-    `include_duplicates=True` to see every copy.
+    Without `project` (or with `"*"`) every scope is listed; `project="global"`
+    lists only the shared table; a project browse also shows global rows unless
+    `include_global=False`. `updated_after`, `metadata_filter`, `contains`
+    (literal, case-insensitive) and `mem_type` narrow the set; `order_by`
+    changes the sort; `limit`/`offset` page and the answer reports
+    `total`/`has_more`/`next_offset`.
+
+    `memory_id` is a direct lookup: the answer carries the single `memory` (and
+    a one-item `results`) with history markers; a hidden row names the flag that
+    reveals it and browse filters are ignored. `memory_ids` is the bulk form
+    (max 200; missing ids are reported, `hidden` lists rows behind a flag).
+    `include_deleted` shows soft-forgotten rows, `include_superseded` history,
+    `include_expired` passed TTLs; the flags are orthogonal.
+    `include_relation_context=False` hides edge sentences.
+
+    Identical active content in several scopes is listed once; a warning names
+    the hidden copies. `include_duplicates=True` shows every copy. An unknown
+    project warns that only the global scope was browsed.
     """
     logger.info("list_memories entity=%s mem_type=%s limit=%s offset=%s project=%s",
                 entity, mem_type, limit, offset, project)
@@ -1402,21 +1383,18 @@ def get_entity(name: Annotated[
                           "`limit` to page through an entity with many "
                           "memories.")] = 0,
 ) -> dict[str, Any]:
-    """Get everything known about an entity, including all linked memories.
+    """Everything known about one entity: details, linked memories, connections.
 
-    The entity can be passed as `entity` or `name`.
-    Memory-only entities have no graph node; `details.type` is `memory-only`.
-    A graph node's `details.type` is `graph` with the raw AGE label of its
-    scope in `details.label`.
-    Set fields=["id", "content"] to receive only the named memory columns.
-    Set include_global=False to restrict a project lookup to project memories.
-    The relation-context sentences of the entity's edges are included, even
-    though they are stored under the synthetic entity `<from>_<rel>_<to>`;
-    `total` counts them too. Pass `include_relation_context=false` to hide
-    them (the entity's own memories stay).
-    The memories are paged with `limit`/`offset`; `total` counts them all, so
-    a truncated answer is visible instead of looking complete.
-    `project="*"` is rejected: the answer describes exactly one entity.
+    `entity` (alias `name`) is required; `project="*"` is rejected, an unknown
+    project warns. `details.type` is 'graph' (raw AGE label in `details.label`)
+    or 'memory-only'. `include_global=False` restricts a project lookup to
+    project memories. `fields` narrows the returned columns.
+    The entity's edge context sentences are included under `total`; set
+    `include_relation_context=false` to hide them. `include_superseded` and
+    `include_expired` reveal hidden rows. `limit`/`offset` page but `total`
+    counts every match. If the name exists in several scopes,
+    `scopes_with_entity` names each one and a warning says which scope was
+    described; a miss names the other scopes, so repeat with `project=<name>`.
     """
     if entity and name and entity.strip() != name.strip():
         return fail(
@@ -1492,7 +1470,12 @@ def get_entity(name: Annotated[
         # An identical active fact in project and global is one row: the page
         # must apply the same rule as the count, otherwise `total`, `count`
         # and the last page disagree (a 12-row page could claim total=11).
-        memories, _hidden_duplicates = dedupe_rows(memories)
+        memories, deduped_hidden = dedupe_rows(memories)
+        # `entity_row_count` measures the copies the dedupe rule hides across
+        # the whole entity, while `_search_memories` may already have
+        # collapsed them for the page; report the larger of the two so the
+        # warning never claims one scope's rows are present when they are not.
+        duplicates_hidden = max(hidden_duplicates, deduped_hidden)
         # The context sentence of an edge belongs to both of its endpoints.
         # Its content is deduplicated against the entity rows and against the
         # other scopes' context sentences for the same reason.
@@ -1571,11 +1554,16 @@ def get_entity(name: Annotated[
     if len(scope_presence) > 1:
         entity_data["scopes_with_entity"] = scope_presence
         detail_scope = entity_data.get("project") or "global"
+        duplicate_note = (
+            f" Identical content in several scopes is listed once "
+            f"({duplicates_hidden} hidden copy/copies); pass project=<name> to "
+            f"see that scope's copy."
+            if duplicates_hidden else "")
         warnings.append(
             f"entity {target!r} exists in several scopes "
             f"({', '.join(sorted(scope_presence))}); `details` describes the "
             f"{detail_scope!r} occurrence and the memories come from "
-            f"{', '.join(scopes_searched)}. Pass project=<name> for one scope")
+            f"{', '.join(scopes_searched)}.{duplicate_note}")
     for memory in memories:
         scope_name = memory.get("_project") or "global"
         memories_by_scope[scope_name] = (
@@ -1610,8 +1598,155 @@ def get_entity(name: Annotated[
               next_offset=paging.next_offset,
               scopes_searched=scopes_searched,
               memories_by_scope=memories_by_scope,
+              duplicates_hidden=duplicates_hidden,
               warnings=warnings)
 
+
+def get_entities(
+    entities: Annotated[
+        list[str],
+        Field(description="Entity names to look up (1-25, duplicates are "
+                          "removed). A blank name is an argument error.")],
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. Without it only the global scope is "
+                          "used.")] = None,
+    include_global: Annotated[
+        bool,
+        Field(description="True (default) includes global memories; False "
+                          "restricts a project lookup to project memories.")] = True,
+    include_superseded: Annotated[
+        bool,
+        Field(description="Also include superseded memories.")] = False,
+    include_expired: Annotated[
+        bool,
+        Field(description="Also include memories whose TTL has passed. They "
+                          "carry `expired: true`.")] = False,
+    include_relation_context: Annotated[
+        bool,
+        Field(description="True (default) also lists the relation-context "
+                          "sentences of each entity's graph edges.")] = True,
+    fields: Annotated[
+        list[str] | None,
+        Field(description="Only return these memory columns, e.g. "
+                          "['id', 'content'].")] = None,
+    limit_per_entity: Annotated[
+        int,
+        Field(description="Maximum number of memories per entity (default 50). "
+                          "Each entry reports its own `total` and `has_more`.")] = 50,
+    offset_per_entity: Annotated[
+        int,
+        Field(description="Skip this many memories per entity (default 0).")] = 0,
+) -> dict[str, Any]:
+    """Look up several entities in one call.
+
+    Each entry answers exactly like `get_entity` (same details, memories,
+    cross-scope dedupe and paging), so an agent that already knows the names
+    does not need one round trip per entity. An unknown name is a
+    `not_found` entry and never aborts the call; the envelope reports
+    `count`, `succeeded` and `failed`.
+
+    `project="*"` is rejected: every entry describes exactly one entity.
+    Duplicate names are removed, and names are trimmed like in `get_entity`.
+    """
+    logger.info("get_entities count=%s project=%s", len(entities or []), project)
+    if project == "*":
+        return fail(
+            STATUS_ERROR,
+            "project='*' is not supported by get_entities: each entry "
+            "describes exactly one entity. Omit `project` for the global "
+            "scope or pass one project name",
+        )
+    if not entities:
+        return fail(STATUS_ERROR,
+                    "entities is required (1-25 entity names)")
+    if len(entities) > 25:
+        return fail(
+            STATUS_ERROR,
+            f"entities accepts at most 25 names, got {len(entities)}")
+    fields_error = validate_fields(fields)
+    if fields_error:
+        return fail(STATUS_ERROR, fields_error)
+    if limit_per_entity < 1:
+        return fail(STATUS_ERROR, "limit_per_entity must be >= 1")
+    if offset_per_entity < 0:
+        return fail(STATUS_ERROR, "offset_per_entity must be >= 0")
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in entities:
+        if not isinstance(raw, str):
+            return fail(STATUS_ERROR, "entity names must be strings")
+        name = raw.strip()
+        if not name:
+            return fail(STATUS_ERROR, "entity names must not be blank")
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    results: list[dict[str, Any]] = []
+    for name in names:
+        payload = get_entity(
+            name,
+            project=project,
+            include_global=include_global,
+            include_superseded=include_superseded,
+            include_expired=include_expired,
+            include_relation_context=include_relation_context,
+            fields=fields,
+            limit=limit_per_entity,
+            offset=offset_per_entity,
+        )
+        if payload.get("ok"):
+            entry: dict[str, Any] = {
+                "ok": True,
+                "status": payload.get("status"),
+                "entity": payload.get("entity", name),
+                "details": payload.get("details"),
+                "memories": payload.get("memories", []),
+                "total": payload.get("total", 0),
+                "has_more": payload.get("has_more", False),
+                "duplicates_hidden": payload.get("duplicates_hidden", 0),
+                "scopes_searched": payload.get("scopes_searched"),
+                "memories_by_scope": payload.get("memories_by_scope"),
+                "warnings": list(payload.get("warnings") or []),
+            }
+            if payload.get("relation_context_count"):
+                entry["relation_context_count"] = payload[
+                    "relation_context_count"]
+            details = payload.get("details") or {}
+            if details.get("scopes_with_entity"):
+                entry["scopes_with_entity"] = details["scopes_with_entity"]
+        else:
+            entry = {
+                "ok": False,
+                "status": payload.get("status"),
+                "entity": name,
+                "error": payload.get("error"),
+                "warnings": list(payload.get("warnings") or []),
+            }
+            if payload.get("scopes_with_entity"):
+                entry["scopes_with_entity"] = payload["scopes_with_entity"]
+        results.append(entry)
+    failed_entries = [entry for entry in results if not entry["ok"]]
+    succeeded = len(results) - len(failed_entries)
+    if not succeeded:
+        return fail(
+            STATUS_NOT_FOUND,
+            f"none of the {len(results)} entities were found",
+            count=len(results),
+            succeeded=0,
+            failed=len(failed_entries),
+            results=results,
+        )
+    warnings: list[str] = []
+    if failed_entries:
+        warnings.append(
+            f"{len(failed_entries)} entity/entities not found: "
+            + ", ".join(str(entry["entity"]) for entry in failed_entries)
+            + "; the other entries are complete")
+    status = STATUS_PARTIAL if failed_entries else STATUS_OK
+    return ok(status, count=len(results), succeeded=succeeded,
+              failed=len(failed_entries), results=results, warnings=warnings)
 
 
 def list_entities(
@@ -1640,26 +1775,19 @@ def list_entities(
                           "with `limit` to page through a long entity list; the "
                           "response reports `has_more`.")] = 0,
 ) -> dict[str, Any]:
-    """Browse entities.
+    """Browse entities, sorted by name.
 
-    Returns graph entities (created via `relate`) plus entity names that only
-    exist on memories. With `project`, that project and global scope are
-    listed by default; set `include_global=False` for strict project
-    isolation. Without `project` (or with `project="*"`) every scope is
-    listed; `project="global"` lists only the shared scope. Each row carries
-    its `project`; `graph_node`
-    is false for memory-only entities. The `type` column says which kind an
-    entity is: 'graph' (with the raw AGE label of its scope in `label`) or
-    'memory-only'. Synthetic relation-context entities
-    (`<from>_<relation>_<to>`) are not listed. The list is
-    sorted by name; `offset` pages through it.
-    `count` is the page size and `total` the full match count: an entity that
-    has a graph node is still reported as such even when `entity_type` hides
-    that node.
-    `entity_type` selects one kind of entity: 'graph', 'memory-only', or a
-    raw AGE label for one scope's nodes. Without it both kinds are listed.
-    A project that does not exist is reported in `warnings`: the browse then
-    only covered the global scope.
+    Lists graph nodes (created via `relate`) plus names that only exist on
+    memories. With `project` the project and global scope are listed unless
+    `include_global=False`; without it (or with `"*"`) every scope is listed;
+    `"global"` lists only the shared table. Each row names its `project`, and
+    `type` is 'graph' (raw AGE label in `label`) or 'memory-only'.
+
+    `entity_type` selects 'graph', 'memory-only' or a raw AGE label; an unknown
+    value is refused and names the labels present. `limit`/`offset` page;
+    `count` is the page size, `total` the full match count. Synthetic
+    relation-context entities are hidden. An unknown project warns that only
+    the global scope was browsed.
     """
     logger.info("list_entities entity_type=%s limit=%s offset=%s project=%s",
                 entity_type, limit, offset, project)
@@ -1814,29 +1942,21 @@ def init_context(project: Annotated[
                           "memories; False only scopes with active "
                           "memories.")] = True,
 ) -> dict[str, Any]:
-    """Call at session start. Returns recent + important bootstrap info + health.
+    """Session bootstrap: the most recently changed memories, counts and health.
 
-    Pass `project` to bootstrap for one project; global memories are included
-    by default. Set `include_global=False` to exclude them. Without a project,
-    only global memories are summarized; pass `project="*"` for all projects.
-    `detail="slim"` (default) returns only the fields a session needs and
-    removes near-duplicates; `detail="full"` returns every column except the
-    internal ones and the search score annotations. Every memory carries the
-    `project` it belongs to, and the list is sorted by the last update.
+    Pass `project` for one project (global rows included unless
+    `include_global=False`); without it only the global scope is summarized and
+    a warning names the other scopes. `project="*"` covers every scope.
+    The list holds the most recently changed memories, sorted by update time,
+    not a decay ranking. `detail="slim"` (default) returns the session fields
+    and removes near-duplicates; "full" returns every public column.
 
-    The memories are the most recently changed ones of the scope - a freshly
-    stored fact always shows up, even if it was never read before.
-    `projects` lists every scope the answer covers, including the shared
-    one ("global"). `active_memories` counts the active rows across the
-    covered tables (a cross-scope copy can be counted in both).
-    `superseded_memories` and `forgotten_memories` are independent counts:
-    a row can be BOTH superseded and forgotten, so the numbers can overlap
-    and do not have to add up to `total_memories - active_memories`.
-    `project_stats` lists every covered scope with its own sizes (memories,
-    total, superseded, forgotten, entities, relations) and replaces the
-    separate project listing; `include_empty_projects=False` drops scopes
-    without active memories.
-    `graph_entities_count` counts the graph nodes of the covered scopes.
+    `projects` names the covered scopes (including "global"),
+    `project_stats` carries their sizes (memories, total, superseded, forgotten,
+    entities, relations), and `include_empty_projects=False` drops scopes
+    without active memories. `active_memories`, `total_memories`,
+    `superseded_memories`, `forgotten_memories` and `graph_entities_count`
+    describe the covered scopes; a row can be both superseded and forgotten.
     """
     try:
         scope = resolve_scope(project, include_global)
@@ -1941,5 +2061,161 @@ def init_context(project: Annotated[
         recent_memories=memories,
         graph_entities_count=_count_entities(scope_names),
         inference_healthy=_health_check(),
+        warnings=warnings,
+    )
+
+
+def compile_context(
+    query: Annotated[
+        str,
+        Field(description="Search text used to select and rank the memories "
+                          "that go into the context block. Non-empty.")],
+    project: Annotated[
+        str | None,
+        Field(description="Project scope. Without it only global memories are "
+                          "searched; '*' searches every scope.")] = None,
+    include_global: Annotated[
+        bool,
+        Field(description="True (default) lets a project search also see "
+                          "global memories.")] = True,
+    max_tokens: Annotated[
+        int,
+        Field(description="Token budget of the context block (256-32000, "
+                          "default 4000). The block never exceeds it.")] = 4000,
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of ranked memories to consider "
+                          "(default 50).")] = 50,
+    entity: Annotated[
+        str | None,
+        Field(description="Only consider memories of this entity.")] = None,
+    metadata_filter: Annotated[
+        dict[str, Any] | None,
+        Field(description="Only memories whose metadata contains these "
+                          "key/value pairs (same comparison as `recall`).")] = None,
+    updated_after: Annotated[
+        str | None,
+        Field(description="Only memories changed at or after this ISO date, "
+                          "e.g. '2026-10-01'.")] = None,
+    hybrid: Annotated[
+        bool,
+        Field(description="True (default) fuses vector and full-text "
+                          "retrieval.")] = True,
+    include_decay: Annotated[
+        bool,
+        Field(description="Blend recency/frequency into the ranking (default "
+                          "true).")] = True,
+    graph_boost: Annotated[
+        bool,
+        Field(description="Add memories of graph-connected entities. Needs "
+                          "`entity` or `graph_entity`.")] = False,
+    graph_entity: Annotated[
+        str | None,
+        Field(description="Entity to expand the graph neighbourhood from "
+                          "without restricting the query.")] = None,
+) -> dict[str, Any]:
+    """Assemble a token-bounded context block from ranked memories.
+
+    Runs the same hybrid search as `recall` (same scope, filter and dedupe
+    semantics), then packs the hits in ranking order into one text block that
+    never exceeds `max_tokens`. The estimate is conservative (about four
+    characters per token plus a fixed per-item overhead), so callers get a
+    context they can paste into a prompt without blowing its budget.
+    """
+    try:
+        if not isinstance(query, str) or not query.strip():
+            return fail(STATUS_ERROR, "query must be a non-empty string")
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            return fail(STATUS_ERROR, "max_tokens must be an integer")
+        if not 256 <= max_tokens <= 32000:
+            return fail(STATUS_ERROR,
+                        "max_tokens must be between 256 and 32000")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return fail(STATUS_ERROR, "limit must be a positive integer")
+        search = recall(
+            query=query,
+            project=project,
+            include_global=include_global,
+            limit=min(limit, 200),
+            offset=0,
+            hybrid=hybrid,
+            include_decay=include_decay,
+            graph_boost=graph_boost,
+            graph_entity=graph_entity,
+            entity=entity,
+            metadata_filter=metadata_filter,
+            updated_after=updated_after,
+            detail="full",
+        )
+        if not search.get("ok"):
+            return search
+    except Exception as e:
+        return fail(STATUS_ERROR, str(e))
+
+    hits = search.get("results") or []
+    # A fixed overhead covers the header line, separators and the tokenizer's
+    # per-message cost; the content estimate stays deliberately pessimistic so
+    # the block never overruns max_tokens.
+    item_overhead = 8
+    used = 0
+    truncated = False
+    items: list[dict[str, Any]] = []
+    blocks: list[str] = []
+    for index, hit in enumerate(hits, start=1):
+        content = str(hit.get("content") or "")
+        header = (
+            f"[{index}] entity={hit.get('entity') or '-'} "
+            f"project={hit.get('project') or 'global'} "
+            f"type={hit.get('mem_type') or 'fact'} id={hit.get('id')}"
+        )
+        cost = item_overhead + (len(header) + 3) // 4
+        text_cost = (len(content) + 3) // 4
+        if used + cost + text_cost > max_tokens:
+            remaining = max_tokens - used - cost
+            if remaining >= 16 and not blocks:
+                # Keep at least a slice of the best hit instead of an empty
+                # context when a single long memory exceeds the whole budget.
+                keep = max(remaining, 16) * 4
+                content = content[:keep].rstrip()
+                text_cost = (len(content) + 3) // 4
+                truncated = True
+            else:
+                truncated = True
+                break
+        used += cost + text_cost
+        blocks.append(f"{header}\n{content}")
+        items.append({
+            "id": hit.get("id"),
+            "content": content,
+            "entity": hit.get("entity"),
+            "mem_type": hit.get("mem_type"),
+            "project": hit.get("project"),
+            "_relevance_score": hit.get("_relevance_score"),
+            "_final_score": hit.get("_final_score"),
+        })
+        if used >= max_tokens:
+            truncated = index < len(hits)
+            break
+
+    warnings = list(search.get("warnings") or [])
+    if not blocks:
+        warnings.append(
+            f"no memories matched the query in scope "
+            f"{search.get('scopes_searched') or 'global'}")
+    elif truncated:
+        warnings.append(
+            f"context truncated at {max_tokens} tokens; "
+            f"{len(hits) - len(items)} memory/memories did not fit")
+    context = "\n\n".join(blocks)
+    return ok(
+        STATUS_OK,
+        context=context,
+        count=len(items),
+        items=items,
+        used_tokens=used,
+        max_tokens=max_tokens,
+        truncated=truncated,
+        candidates=search.get("candidates"),
+        scopes_searched=search.get("scopes_searched"),
         warnings=warnings,
     )

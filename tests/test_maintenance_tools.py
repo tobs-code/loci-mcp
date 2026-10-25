@@ -32,18 +32,24 @@ def test_export_json_contains_records_and_graph():
     assert payload["graph"]["relations"][0]["relation_type"] == "KNOWS"
 
 
-def test_export_jsonl_is_flat_and_has_no_graph():
+def test_export_jsonl_includes_graph_records():
     _export_fixture()
     exported = export_memories(format="jsonl")
     assert "records" not in exported
 
-    lines = [line for line in exported["data"].splitlines() if line.strip()]
-    assert len(lines) == 1
-    record = json.loads(lines[0])
-    assert record["content"] == "Export me"
-    assert "graph" not in record
+    lines = [json.loads(line) for line in exported["data"].splitlines()
+             if line.strip()]
+    memories = [r for r in lines if not r.get("record_type")]
+    entities = [r for r in lines if r.get("record_type") == "entity"]
+    relations = [r for r in lines if r.get("record_type") == "relation"]
+    assert len(memories) == 1
+    assert memories[0]["content"] == "Export me"
+    assert "graph" not in memories[0]
+    assert {e["name"] for e in entities} == {"Alpha", "Beta"}
+    assert relations[0]["relation_type"] == "KNOWS"
+    assert relations[0]["weight"] == 0.7
     assert exported["data_format"] == "jsonl"
-    assert exported["graph_included"] is False
+    assert exported["graph_included"] is True
 
 
 def test_import_restores_records_and_graph_into_a_new_project():

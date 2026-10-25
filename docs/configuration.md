@@ -14,7 +14,7 @@
 | `MCP_AUTH_TOKEN` | - (required for HTTP) | Shared bearer token; every HTTP request must send `Authorization: Bearer <token>` |
 | `MCP_ALLOW_INSECURE_HTTP` | `false` | Allow an unauthenticated non-loopback HTTP bind. Sandbox only; never in production |
 | `FTS_LANGUAGE` | `english` | PostgreSQL text-search dictionary; invalid names fall back to `english` |
-| `MCP_TOOLSET` | `full` | `full` (25 tools) or `core` (15 daily read/write/graph tools); an unknown value warns and falls back to `full` |
+| `MCP_TOOLSET` | `full` | `full` (28 tools) or `core` (16 daily read/write/graph tools); an unknown value warns and falls back to `full` |
 | `INFERENCE_DEVICE` | `auto` | `auto` (CUDA when available, else CPU), `cpu` or `cuda`; `cuda` still falls back if no device is visible |
 | `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | Build arg for the inference image; use `https://download.pytorch.org/whl/cpu` for a CPU-only image |
 | `RERANK_ENABLED` | `true` | Local cross-encoder reranking of ambiguous first-stage results |
@@ -25,7 +25,8 @@
 | `RERANK_TRIGGER_MARGIN` | `0.10` | A lead over the runner-up at or above this value is trusted without reranking |
 | `RERANK_ALWAYS` | `false` | Rerank every query instead of only ambiguous ones |
 | `RERANK_LOGIT_BIAS` | `1.0` | Offset before the sigmoid cap; the raw reranker logits are not calibrated (-5..5) |
-| `LLM_PROVIDER` | `groq` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none` |
+| `LLM_PROVIDER` | `none` | `groq`, `openai`, `anthropic`, `ollama`, `openai-compatible`, `auto` or `none`. Egress is opt-in: `none` (the default) disables NLI |
+| `NLI_MAX_WORKERS` | `4` | Documents of one `/nli` request judged concurrently (1-16). Higher values cut scan latency but raise provider concurrency |
 | `LLM_MODEL` | provider default | NLI model (empty = provider default) |
 | `LLM_REASONING_EFFORT` | `low` for Groq/gpt-oss | Reasoning budget (`low`/`medium`/`high`; `none` disables). gpt-oss otherwise spends the token budget on hidden reasoning and returns empty content |
 | `LLM_API_KEY` | – | Generic key; overrides the provider-specific key |
@@ -95,8 +96,13 @@ LLM_API_KEY=...
 LLM_MODEL=...
 ```
 
+The default is `LLM_PROVIDER=none`: contradiction detection stays off until a
+provider is chosen, so memory content is not sent anywhere by accident.
 `LLM_PROVIDER=auto` picks the first configured key (Groq, OpenAI, Anthropic),
-then `LLM_BASE_URL`, then `OLLAMA_BASE_URL`. `LLM_PROVIDER=none` disables
+then `LLM_BASE_URL`, then `OLLAMA_BASE_URL`. Outside the bundled compose file
+(which passes `none` explicitly) an omitted `LLM_PROVIDER` still detects a
+configured provider key, so existing deployments keep working; a bare install
+stays on `none`. `LLM_PROVIDER=none` disables
 contradiction detection. Without a usable provider `/nli` returns placeholder
 `0.0` scores together with an `error`; the MCP client raises instead of
 treating those zeros as judgments. `contradictions_report` short-circuits when
@@ -114,7 +120,8 @@ judable skips the check.
 sends the two compared memory texts to the provider (`/nli` builds
 `Fact A: ...` / `Fact B: ...` and posts it to the provider endpoint). This is
 the only path that moves stored content off the machine: embeddings and
-reranking run locally.
+reranking run locally. With the default `LLM_PROVIDER=none` no content leaves
+the machine at all.
 
 Use `LLM_PROVIDER=ollama` or `openai-compatible` with a local endpoint, or
 `LLM_PROVIDER=none`, to keep memory content local. `server_health` reports the

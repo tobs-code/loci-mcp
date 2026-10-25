@@ -134,15 +134,18 @@ trims an online agent's result window server-side: instead of fetching 10 hits
 hoping to keep the top 3, pass `min_relevance=0.6` and get only the hits that
 actually answer the query. It has its own `dropped_by_relevance` counter and
 empty-result reason; graph-only hits carry no relevance score and are never
-dropped by it.
+dropped by it. Independently of `min_relevance`, a **full-text-only** hit
+(no vector score) whose combined relevance is below 0.25 is dropped as
+stopword noise; exact literal hits (`_exact_match`) are exempt.
 
 `recall` reports `candidates` (the hits that made it into the ranking),
 `dropped_by_similarity` (the number of vector hits the filter removed),
 `dropped_by_expired` (rows hidden because their TTL passed) and
 `dropped_by_coverage` (the number of full-text hits the coverage filter
 removed). `dropped_by_relevance`, `dropped_by_decay` and
-`dropped_by_superseded` are reported whenever the `min_relevance` /
-`min_decay_score` / `only_superseded` filter removed hits — also
+`dropped_by_superseded` are reported whenever the `min_relevance` (including
+the implicit FTS-only floor) / `min_decay_score` / `only_superseded` filter
+removed hits — also
 when other hits survived, so a non-empty result is never quietly short. When
 the result is empty, the warning names **every** filter that removed
 something, so the caller does not have to guess which one was responsible.
@@ -329,7 +332,10 @@ and warns about the broader comparison, so it is never silent.
    `ORDER BY embedding <=>` (`CONTRADICTION_NEIGHBORS`, 1-20).
 3. Only the deduplicated candidate pairs are checked via `/nli` — one call per
    memory, not one call per pair. The calls run in a bounded pool (6 workers,
-   `CONTRADICTION_NLI_WORKERS`) and are reported in candidate order.
+   `CONTRADICTION_NLI_WORKERS`) and are reported in candidate order. Inside
+   one `/nli` request the documents are judged concurrently too
+   (`NLI_MAX_WORKERS`, default 4), so a six-document fact is not six serial
+   provider round trips.
 4. The whole scan runs on one wall-clock budget (`budget_seconds`, default
    40s or `CONTRADICTION_SCAN_BUDGET_SECONDS`): candidate loading (a pgvector
    search per seed) eats into the same budget as the NLI leg, so the total

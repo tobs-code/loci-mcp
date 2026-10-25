@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import requests
@@ -131,7 +132,7 @@ def _detect_provider(env) -> str:
         return "openai-compatible"
     if (env.get("OLLAMA_BASE_URL") or "").strip():
         return "ollama"
-    return "groq"
+    return "none"
 
 
 def _normalize_ollama_url(url: str) -> str:
@@ -143,7 +144,12 @@ def _normalize_ollama_url(url: str) -> str:
 
 def load_config(env=None) -> LLMConfig:
     env = os.environ if env is None else env
-    provider = (env.get("LLM_PROVIDER") or "groq").strip().lower()
+    provider = (env.get("LLM_PROVIDER") or "").strip().lower()
+    # No explicit provider: keep the legacy key detection, but a bare install
+    # stays on `none`. Contradiction checks send memory content to the LLM, so
+    # egress must be opt-in, not a default that waits for a key to appear.
+    if not provider:
+        provider = _detect_provider(env)
     if provider == "auto":
         provider = _detect_provider(env)
     if provider in ("none", "off", "disabled"):
@@ -472,3 +478,53 @@ def classify(config: LLMConfig, query: str, document: str,
                 last_error = exc
                 break
     raise RuntimeError(f"LLM request failed: {last_error}")
+
+
+def classify_many(
+    config: LLMConfig,
+    query: str,
+    documents: list[str],
+    *,
+    query_entity: str | None = None,
+    document_entities: list[str | None] | None = None,
+    max_workers: int = 4,
+) -> tuple[list[float], list[str], list[int]]:
+    """Classify every document, preserving input order.
+
+    Returns `(scores, failures, failure_indices)`. A failing document keeps a
+    0.0 placeholder but is named, so the caller never reads it as neutral.
+    Documents are judged concurrently: the scan sends six documents per fact
+    and sequentially waiting for each provider round trip dominated the
+    wall-clock budget.
+    """
+    entities = document_entities or []
+    workers = max(1, min(16, int(max_workers)))
+    workers = min(workers, len(documents)) if documents else 1
+
+    def _judge(index: int) -> tuple[int, float, str | None]:
+        document_entity = entities[index] if index < len(entities) else None
+        try:
+            return index, classify(
+                config, query, documents[index],
+                query_entity=query_entity,
+                document_entity=document_entity,
+            ), None
+        except Exception as exc:  # noqa: BLE001 - reported per document
+            logger.warning("NLI failed for one document: %s", exc)
+            return index, 0.0, str(exc)
+
+    if len(documents) > 1 and workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            outcomes = list(pool.map(_judge, range(len(documents))))
+    else:
+        outcomes = [_judge(index) for index in range(len(documents))]
+
+    scores: list[float] = []
+    failures: list[str] = []
+    failure_indices: list[int] = []
+    for index, score, failure in outcomes:
+        scores.append(score)
+        if failure is not None:
+            failures.append(failure)
+            failure_indices.append(index)
+    return scores, failures, failure_indices

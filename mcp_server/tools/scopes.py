@@ -48,22 +48,14 @@ def drop_project(
         Field(description="True only reports what would be removed; nothing is "
                           "deleted.")] = False,
 ) -> dict[str, Any]:
-    """Remove a project scope completely.
+    """Remove a project scope completely and permanently.
 
-    Deletes the project's memory table, its registry entry, its graph nodes
-    and its rows in the entity/relation mirror. This is permanent: unlike
-    `forget(entity="*")`, which only empties a scope, the project disappears
-    from every listing.
-
-    Use `dry_run=True` first if you want to see the counts.
-
-    A scope that only exists in the graph (a project in which `relate` was
-    used but no fact was stored) has no memory table; it is removed as well,
-    otherwise its graph nodes would stay behind as orphans that no listing
-    shows and no tool can delete.
-
-    'global' is the shared scope and cannot be dropped. To empty it, use
-    `forget(entity="*", project="global")`.
+    Deletes the memory table, registry entry, graph nodes and mirror rows, so
+    the project disappears from every listing (unlike `forget(entity="*")`,
+    which only empties it). A graph-only scope is removed too, otherwise its
+    nodes would become orphaned. `dry_run=True` reports the counts first.
+    'global' cannot be dropped; empty it with
+    `forget(entity="*", project="global")` instead.
     """
     logger.info("drop_project project=%s dry_run=%s", project, dry_run)
     raw = str(project or "").strip()
@@ -143,21 +135,16 @@ def list_projects(
                           "the active-memory count is still computed "
                           "internally for include_empty.")] = True,
 ) -> dict[str, Any]:
-    """List every project scope (and the shared global one).
+    """List every project scope and the shared `global` one.
 
-    A project exists as soon as a write created its table (or `relate` created
-    graph nodes for it). The shared scope is reported as `global`. This is the
-    discovery tool for `recall`, `list_memories` and `init_context`: a caller
-    that does not know the project names would otherwise have to guess them
-    with `init_context(project='*')`.
-
-    `project` on every row is the value to pass to the other tools (`global`
-    for the shared scope). `has_table=False` marks a graph-only scope.
-
-    With `include_counts=True`: `memories` counts the ACTIVE rows (what every
-    read shows), while `total_memories` counts every row including superseded,
-    forgotten and expired history. `superseded_memories`/`forgotten_memories`
-    name the history parts, so the numbers decompose without guessing.
+    A project exists once a write created its table or `relate` created graph
+    nodes. Use this to discover the names that `recall`, `list_memories` and
+    `init_context` accept: each row's `project` is the value to pass, and
+    `has_table=False` marks a graph-only scope.
+    `include_empty=False` keeps only scopes with active memories or graph data.
+    With `include_counts=True`, `memories` counts ACTIVE rows while
+    `total_memories` includes superseded, forgotten and expired history;
+    `superseded_memories`/`forgotten_memories` name those parts.
     """
     logger.info("list_projects include_empty=%s", include_empty)
     db = MemoryStore()

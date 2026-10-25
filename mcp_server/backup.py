@@ -8,7 +8,7 @@ from pydantic import Field
 from mcp_server.config import SENTINEL_FORGOTTEN
 from mcp_server.store import MemoryStore
 from mcp_server.envelope import STATUS_ERROR, STATUS_OK, fail, ok
-from mcp_server.graph_store import GraphStore
+from mcp_server.graph_store import GraphStore, _edge_context
 from mcp_server.inference_gateway import embed
 from mcp_server.lifecycle import is_expired, parse_expires_at
 from mcp_server.scope_catalog import (
@@ -188,12 +188,21 @@ def _export_graph(cur, project: str | None,
         f"ORDER BY e1.project, e1.name, e2.name",
         rel_params,
     )
-    relations = [
-        {"from_entity": r[0], "to_entity": r[1], "relation_type": r[2],
-         "weight": float(r[3] or 1.0),
-         "project": "global" if r[4] == "global" else r[4]}
-        for r in cur.fetchall()
-    ]
+    relations = []
+    for r in cur.fetchall():
+        relation = {
+            "from_entity": r[0], "to_entity": r[1], "relation_type": r[2],
+            "weight": float(r[3] or 1.0),
+            "project": "global" if r[4] == "global" else r[4],
+        }
+        # An edge's context sentence explains *why* the two entities are
+        # connected. A backup that dropped it restored a graph without its
+        # "why", so the sentence travels with the edge. `_edge_context`
+        # normalizes "global" to the shared scope itself.
+        context = _edge_context(cur, relation["project"], r[0], r[1], r[2])
+        if context:
+            relation["context"] = context
+        relations.append(relation)
     if entity:
         # An entity-filtered export keeps the incident edges - so it must keep
         # their other endpoints too. Without them the backup held an edge whose
@@ -223,8 +232,9 @@ def export_memories(
     format: Annotated[
         Literal["json", "jsonl"],
         Field(description="'json' (default) returns an object with records and "
-                          "the graph; 'jsonl' returns one record per line "
-                          "(no graph).")]= "json",
+                          "the graph; 'jsonl' returns one record per line, "
+                          "including graph entity/relation lines when "
+                          "include_graph is true.")]= "json",
     project: Annotated[
         str | None,
         Field(description="Scope to export. 'global' exports only the shared "
@@ -250,7 +260,8 @@ def export_memories(
                           "Pass false to export active rows only.")] = True,
     include_graph: Annotated[
         bool,
-        Field(description="Include entities and relations (JSON exports only).")] = True,
+        Field(description="Include entities and relations (JSON and JSONL "
+                          "exports).")] = True,
     entity: Annotated[
         str | None,
         Field(description="Only export memories of this entity. The "
@@ -269,20 +280,18 @@ def export_memories(
                           "key/value pairs (same tolerant comparison as "
                           "`list_memories`).")] = None,
 ) -> dict[str, Any]:
-    """Export memories (and optionally the graph) as JSON or JSONL.
+    """Export memories (and the graph) as JSON or JSONL.
 
     Without `project` every scope is exported and each record carries its
-    `project`. IDs, `superseded_by` and timestamps are preserved, so imports
-    can restore the exact state. The graph is only included in JSON exports.
-    `include_deleted` separates soft-forgotten rows from superseded history:
-    pass false to export invalidated facts without deliberately forgotten
-    ones, true to include both.
-    `entity` also exports the relation-context sentences of that entity's
-    graph edges (they live under a synthetic entity name), so an entity
-    backup keeps the edge explanations together with the incident edges.
-
-    The payload is returned in "data" and can be passed to `import_memories`
-    unchanged.
+    `project`. Ids, `superseded_by`, timestamps and TTLs are preserved, so an
+    import restores the exact state. JSON keeps the graph in a `graph` section;
+    JSONL appends one `record_type` line per entity and relation after the
+    memory lines. `include_graph=false` exports memories only.
+    `include_deleted` separates soft-forgotten rows from history (None follows
+    `include_superseded`); `include_superseded` and `include_expired` add the
+    corresponding inactive rows. `entity` narrows memories and the graph and
+    keeps the edge `context` sentences. The payload is in `data` and can be
+    passed to `import_memories` unchanged.
     """
     logger.info("export_memories format=%s project=%s graph=%s", format, project, include_graph)
     # `_norm_project("global")` returns None, which also means "no scope
@@ -310,7 +319,7 @@ def export_memories(
                                      include_deleted=include_deleted)
         graph = (_export_graph(cur, project, only_global=only_global,
                                entity=entity)
-                 if (include_graph and format != "jsonl") else None)
+                 if include_graph else None)
         excluded = ((0, 0)
                     if (include_superseded and include_deleted is not False)
                     else _export_excluded_counts(cur, project, only_global))
@@ -358,10 +367,6 @@ def export_memories(
         records.append(record)
 
     warnings: list[str] = []
-    if format == "jsonl" and include_graph:
-        warnings.append(
-            "format='jsonl' has no graph: include_graph was ignored. Use "
-            "format='json' to back up entities and relations")
     if graph is not None and (mem_type or updated_after or metadata_filter):
         warnings.append(
             "the memory filters (mem_type/updated_after/metadata_filter) do "
@@ -409,9 +414,34 @@ def export_memories(
                 + where + "; pass include_superseded=true for a complete "
                   "backup")
     if format == "jsonl":
-        data = "\n".join(json.dumps(r) for r in records)
+        lines = [json.dumps(r) for r in records]
+        if graph is not None:
+            # A flat line stream can carry the graph too: each node/edge is
+            # one self-describing line. `record_type` is the discriminator
+            # (memory lines stay unchanged, so a legacy JSONL backup keeps
+            # importing exactly as before).
+            for ent in graph.get("entities", []):
+                lines.append(json.dumps({
+                    "record_type": "entity",
+                    "name": ent["name"],
+                    "type": ent.get("type"),
+                    "project": ent.get("project", "global"),
+                }))
+            for rel in graph.get("relations", []):
+                line = {
+                    "record_type": "relation",
+                    "from_entity": rel["from_entity"],
+                    "to_entity": rel["to_entity"],
+                    "relation_type": rel["relation_type"],
+                    "weight": rel.get("weight", 1.0),
+                    "project": rel.get("project", "global"),
+                }
+                if rel.get("context"):
+                    line["context"] = rel["context"]
+                lines.append(json.dumps(line))
+        data = "\n".join(lines)
         return ok(STATUS_OK, format=format, count=len(records), data=data,
-                  data_format="jsonl", graph_included=False,
+                  data_format="jsonl", graph_included=graph is not None,
                   include_expired=include_expired, warnings=warnings)
     payload = {"type": "memory_export", "version": "0.3",
                "records": records, "count": len(records)}
@@ -458,12 +488,41 @@ def _as_list(value):
     return value
 
 
+def _graph_line_error(entry: dict, kind: str) -> str | None:
+    """Why a JSONL graph line cannot be imported, or None when it can.
+
+    The line is validated before it reaches the graph writer so one malformed
+    line is reported as `skipped_reasons.invalid` (with its `jsonl line N`)
+    instead of aborting the graph restore.
+    """
+    if kind == "entity":
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return "entity record has no 'name'"
+        return None
+    for key in ("from_entity", "to_entity", "relation_type"):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return f"relation record has no {key!r}"
+    weight = entry.get("weight", 1.0)
+    try:
+        GraphStore.validate_weight(weight)
+    except (TypeError, ValueError) as exc:
+        return f"relation weight: {exc}"
+    context = entry.get("context")
+    if context is not None and not isinstance(context, str):
+        return "relation 'context' must be a string"
+    return None
+
+
 def import_memories(
     data: Annotated[
         str | dict | list,
         Field(description="Payload of `export_memories`, either as the object, "
                           "a list of record objects, or its JSON string. "
-                          "JSONL payloads are one record per line. Passing "
+                          "JSONL payloads are one record per line (memory "
+                          "lines plus entity/relation lines with a "
+                          "`record_type`). Passing "
                           "the payload as a JSON string is the most reliable "
                           "form: some clients repack the arrays inside a "
                           "free-form object.")],
@@ -491,10 +550,12 @@ def import_memories(
         Field(description="True validates the payload and reports what would "
                           "be imported without writing anything.")] = False,
 ) -> dict[str, Any]:
-    """Import memories (and graph, for JSON exports).
+    """Import memories (and graph, for JSON and JSONL exports).
 
     `data` accepts the payload of `export_memories` either as an object or as
-    its JSON string.
+    its JSON string. JSONL graph lines are recognized by their `record_type`
+    (`entity`/`relation`) and restored through the same idempotent MERGE path
+    as the JSON `graph` section; unknown types are reported as invalid.
     Records keep their `id`, timestamps and `superseded_by`, so a re-import is
     idempotent and restores the exact state. Without `project`, each record is
     restored into the scope it was exported from; with `project`, everything
@@ -512,6 +573,7 @@ def import_memories(
                     imported=0, skipped=0)
     graph: dict | None = None
     parse_errors: list[str] = []
+    graph_lines: list[dict] = []
     try:
         if format == "jsonl" and isinstance(data, dict):
             return fail(
@@ -527,11 +589,26 @@ def import_memories(
             parsed = []
             for lineno, line in enumerate(lines, 1):
                 try:
-                    parsed.append(json.loads(line))
+                    entry = json.loads(line)
                 except json.JSONDecodeError as exc:
                     # One broken line must not lose the rest of the backup:
                     # the line is reported as invalid and the others import.
                     parse_errors.append(f"jsonl line {lineno}: {exc}")
+                    continue
+                if isinstance(entry, dict) and entry.get("record_type"):
+                    kind = entry["record_type"]
+                    if kind not in ("entity", "relation"):
+                        parse_errors.append(
+                            f"jsonl line {lineno}: unknown record_type "
+                            f"{kind!r} (expected 'entity' or 'relation')")
+                        continue
+                    problem = _graph_line_error(entry, kind)
+                    if problem:
+                        parse_errors.append(f"jsonl line {lineno}: {problem}")
+                        continue
+                    graph_lines.append(entry)
+                    continue
+                parsed.append(entry)
             if (len(parsed) == 1 and isinstance(parsed[0], dict)
                     and "records" in parsed[0]):
                 # A single line that is a whole export object is not JSONL.
@@ -563,6 +640,41 @@ def import_memories(
         return fail(STATUS_ERROR,
                     f"'records' must be a list of objects, got {type(records).__name__}",
                     imported=0, skipped=0)
+    # A list payload (or a JSON object whose records were built from JSONL
+    # lines by a client) can carry graph records too. They are moved out of the
+    # memory stream instead of being skipped as "no content".
+    memory_records: list = []
+    for index, rec in enumerate(records):
+        if not isinstance(rec, dict) or not rec.get("record_type"):
+            memory_records.append(rec)
+            continue
+        kind = rec["record_type"]
+        if kind not in ("entity", "relation"):
+            parse_errors.append(
+                f"record {index}: unknown record_type {kind!r} "
+                f"(expected 'entity' or 'relation')")
+            continue
+        problem = _graph_line_error(rec, kind)
+        if problem:
+            parse_errors.append(f"record {index}: {problem}")
+            continue
+        graph_lines.append(rec)
+    records = memory_records
+    if graph_lines:
+        base = graph if isinstance(graph, dict) else {}
+        existing_entities = _as_list(base.get("entities") or [])
+        existing_relations = _as_list(base.get("relations") or [])
+        graph = {
+            **base,
+            "entities": (existing_entities if isinstance(existing_entities, list)
+                         else []),
+            "relations": (existing_relations
+                          if isinstance(existing_relations, list) else []),
+        }
+        graph["entities"].extend(
+            line for line in graph_lines if line["record_type"] == "entity")
+        graph["relations"].extend(
+            line for line in graph_lines if line["record_type"] == "relation")
 
     db = MemoryStore()
     imported = 0
@@ -738,7 +850,14 @@ def import_memories(
                 return _norm_project(project if project is not None else value)
 
             for ent in _as_list(graph.get("entities", [])):
-                if not isinstance(ent, dict) or not ent.get("name"):
+                if not isinstance(ent, dict):
+                    errors.append("graph entity is not an object")
+                    skipped += 1
+                    continue
+                problem = _graph_line_error(ent, "entity")
+                if problem:
+                    errors.append(f"graph entity {ent.get('name')!r}: {problem}")
+                    skipped += 1
                     continue
                 # A bad graph record must not abort the memory import (or the
                 # rest of the graph): each entity gets its own savepoint.
@@ -753,25 +872,25 @@ def import_memories(
                     cur.execute("RELEASE SAVEPOINT import_entity")
                     errors.append(
                         f"graph entity {ent['name']!r}: {exc}")
+                    skipped += 1
                     continue
                 cur.execute("RELEASE SAVEPOINT import_entity")
                 if created:
                     graph_entities_created += 1
                 graph_entities += 1
 
-            grouped: dict[Any, list[dict]] = {}
+            relation_entries: list[tuple[Any, dict]] = []
             for rel in _as_list(graph.get("relations", [])):
                 if not isinstance(rel, dict):
+                    errors.append("graph relation is not an object")
+                    skipped += 1
                     continue
-                if not rel.get("from_entity") or not rel.get("to_entity"):
-                    continue
-                try:
-                    weight = float(rel.get("weight", 1.0))
-                except (TypeError, ValueError):
+                problem = _graph_line_error(rel, "relation")
+                if problem:
                     errors.append(
-                        f"graph relation "
-                        f"{rel.get('from_entity')!r} -> "
-                        f"{rel.get('to_entity')!r}: weight must be a number")
+                        f"graph relation {rel.get('from_entity')!r} -> "
+                        f"{rel.get('to_entity')!r}: {problem}")
+                    skipped += 1
                     continue
                 try:
                     relation_scope = _resolve(rel.get("project"))
@@ -780,27 +899,35 @@ def import_memories(
                         f"graph relation "
                         f"{rel.get('from_entity')!r} -> "
                         f"{rel.get('to_entity')!r}: {exc}")
+                    skipped += 1
                     continue
-                grouped.setdefault(relation_scope, []).append({
+                relation_entries.append((relation_scope, {
                     "from_entity": rel["from_entity"],
                     "to_entity": rel["to_entity"],
                     "relation_type": rel["relation_type"],
-                    "weight": weight,
-                })
-            for index, (scope, edges) in enumerate(grouped.items()):
+                    "weight": float(rel.get("weight", 1.0)),
+                    # The sentence travels with the edge, so a flat JSONL
+                    # backup restores the "why" of a relation too.
+                    "context": rel.get("context"),
+                }))
+            # One savepoint per record: a single edge failure (a reserved
+            # character in an endpoint, a broken context embedding) is
+            # reported and the remaining edges still restore.
+            for index, (scope, edge) in enumerate(relation_entries):
                 savepoint = f"import_relations_{index}"
                 cur.execute(f"SAVEPOINT {savepoint}")
                 try:
-                    restored = graph_store.relate(edges, scope)
+                    restored = graph_store.relate([edge], scope)
                 except Exception as exc:
                     cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                     errors.append(f"graph relations: {exc}")
+                    skipped += 1
                     continue
                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                 graph_relations += len(restored)
                 graph_relations_created += sum(
-                    1 for edge in restored if edge.get("status") == "created")
+                    1 for item in restored if item.get("status") == "created")
 
         # A partial restore can leave a `superseded_by` link whose target was
         # not imported into the link's own scope. Link validity is global: a
