@@ -505,11 +505,13 @@ def prune_memories(
     params: list[Any] = [hard_delete_grace_days]
     if include_expired:
         conditions.append(
-            f"(expires_at IS NOT NULL AND expires_at <= {cutoff_sql})")
+            f"(expires_at IS NOT NULL AND expires_at <= {cutoff_sql} "
+            f"AND hard_deleted_at IS NULL)")
         params.append(older_than_days)
     if include_forgotten:
         conditions.append(
-            f"(deleted_at IS NOT NULL AND deleted_at <= {cutoff_sql})")
+            f"(deleted_at IS NOT NULL AND deleted_at <= {cutoff_sql} "
+            f"AND hard_deleted_at IS NULL)")
         params.append(older_than_days)
     if include_superseded:
         conditions.append(

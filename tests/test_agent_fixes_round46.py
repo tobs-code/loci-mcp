@@ -3,13 +3,17 @@
 Bug A: `forget(query=...)` is a semantic selector. It must keep only rows with
 a real vector score at or above `min_similarity`; a keyword-only full-text hit
 is not a semantic match and must not be removed.
+
+Bug B: `prune_memories` must never purge a hard-deleted row through the
+expired/forgotten branches. Only the hard-delete grace branch may remove it.
 """
 
 from mcp_server.db import get_conn
-from mcp_server.server import forget, remember
+from mcp_server.server import forget, prune_memories, remember
 from mcp_server.tools.memory import _mem_table
 
 BUG_A = "round46-bug-a"
+BUG_B = "round46-bug-b"
 
 QUERY = "Kubernetes deployment rollout"
 
@@ -66,3 +70,37 @@ def test_forget_query_never_selects_a_keyword_only_hit():
         entry["id"] for entry in result["bulk_results"]}
     for entry in result["bulk_results"]:
         assert entry["similarity"] is not None
+
+
+def test_prune_memories_does_not_purge_a_hard_deleted_row_before_grace():
+    stored = remember("Round46 grace probe", project=BUG_B)
+    forget(stored["id"], project=BUG_B, soft=False)
+
+    pending = prune_memories(project=BUG_B, dry_run=True, older_than_days=0,
+                             hard_delete_grace_days=30)
+    assert pending["ok"] is True
+    assert pending["counts"]["memories"] == 0
+    assert pending["counts"]["pending_purge"] == 1
+    assert pending["counts"]["by_scope"] == {}
+
+
+def test_prune_memories_purges_a_hard_deleted_row_after_grace():
+    stored = remember("Round46 expired grace probe", project=BUG_B)
+    forget(stored["id"], project=BUG_B, soft=False)
+
+    due = prune_memories(project=BUG_B, dry_run=True, older_than_days=30,
+                         hard_delete_grace_days=0)
+    assert due["ok"] is True
+    assert due["counts"]["memories"] == 1
+    assert due["counts"]["pending_purge"] == 0
+
+
+def test_prune_memories_still_removes_soft_forgotten_rows():
+    stored = remember("Round46 soft forgotten probe", project=BUG_B)
+    forget(stored["id"], project=BUG_B)
+
+    pruned = prune_memories(project=BUG_B, dry_run=True, older_than_days=0,
+                            hard_delete_grace_days=30)
+    assert pruned["ok"] is True
+    assert pruned["counts"]["memories"] == 1
+    assert pruned["counts"]["pending_purge"] == 0
