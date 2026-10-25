@@ -73,15 +73,21 @@ def test_update_memory_restore_brings_a_soft_forgotten_fact_back():
     assert "deleted_at" not in default_list["results"][0]
 
 
-def test_update_memory_restore_rejects_an_active_or_hard_deleted_fact():
+def test_update_memory_restore_rejects_an_active_row_and_revives_a_hard_deleted_one():
     active_id = remember("This fact was never forgotten")["id"]
     # The id exists, it just has nothing to restore: that is a conflict, not
     # a missing row.
     assert update_memory(active_id, restore=True)["status"] == "conflict"
 
-    purged_id = remember("This fact is gone for good")["id"]
-    forget(purged_id, soft=False)
-    assert update_memory(purged_id, restore=True)["status"] == "not_found"
+    # A hard delete is recoverable until the purge grace window passes, so the
+    # row is still there and restore undoes it.
+    purged_id = remember("This fact is waiting for its purge")["id"]
+    forgotten = forget(purged_id, soft=False)
+    assert forgotten["status"] == "deleted"
+    assert forgotten["undo_until"]
+
+    assert update_memory(purged_id, restore=True)["status"] == "restored"
+    assert list_memories(memory_id=purged_id)["memory"]["id"] == purged_id
 
 
 # --------------------------------------------------------------------------

@@ -110,6 +110,7 @@ def ensure_schema():
                 confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
                 tags TEXT[] NOT NULL DEFAULT '{}',
                 pinned BOOLEAN NOT NULL DEFAULT FALSE,
+                hard_deleted_at TIMESTAMPTZ,
                 idempotency_key TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -196,6 +197,7 @@ def ensure_schema():
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence FLOAT",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}'",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS hard_deleted_at TIMESTAMPTZ",
             "CREATE INDEX IF NOT EXISTS idx_memories_validity ON memories(valid_from, valid_to)",
             "CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN (tags)",
             "CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(id) WHERE pinned",

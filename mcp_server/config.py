@@ -216,4 +216,9 @@ CACHE_ACCESS_BOOST_DAYS = 7
 SENTINEL_FORGOTTEN = '__forgotten__'
 
 
+# A hard delete only marks the row; `prune_memories` physically removes it
+# after this grace period, so an accidental delete stays undoable.
+HARD_DELETE_GRACE_DAYS = _env_float("HARD_DELETE_GRACE_DAYS", 7.0, 0.0, 3650.0)
+
+
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

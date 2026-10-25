@@ -26,6 +26,7 @@ CREATE TABLE memories (
     confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
     tags TEXT[] NOT NULL DEFAULT '{}',
     pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    hard_deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );

@@ -377,8 +377,13 @@ class MemoryStore:
                     f"WHERE id = %s AND deleted_at IS NULL",
                     (SENTINEL_FORGOTTEN, memory_id))
             else:
-                count = self.execute(f"DELETE FROM {table} WHERE id = %s",
-                                     (memory_id,))
+                count = self.execute(
+                    f"UPDATE {table} SET superseded_by = "
+                    f"COALESCE(superseded_by, %s), "
+                    f"deleted_at = COALESCE(deleted_at, NOW()), "
+                    f"hard_deleted_at = NOW(), updated_at = NOW() "
+                    f"WHERE id = %s",
+                    (SENTINEL_FORGOTTEN, memory_id))
             if count:
                 total += count
                 touched.append(table)
@@ -390,7 +395,8 @@ class MemoryStore:
         table = _mem_table(project)
         summary = lifecycle_counts(self.cur, table)
         if dry_run:
-            where = "WHERE deleted_at IS NULL" if soft else ""
+            where = ("WHERE deleted_at IS NULL" if soft
+                     else "WHERE hard_deleted_at IS NULL")
             count = self.scalar(f"SELECT COUNT(*) FROM {table} {where}") or 0
         elif soft:
             count = self.execute(
@@ -398,7 +404,12 @@ class MemoryStore:
                 f"COALESCE(superseded_by, %s), deleted_at = NOW() "
                 f"WHERE deleted_at IS NULL", (SENTINEL_FORGOTTEN,))
         else:
-            count = self.execute(f"DELETE FROM {table}")
+            count = self.execute(
+                f"UPDATE {table} SET superseded_by = "
+                f"COALESCE(superseded_by, %s), "
+                f"deleted_at = COALESCE(deleted_at, NOW()), "
+                f"hard_deleted_at = NOW(), updated_at = NOW() "
+                f"WHERE hard_deleted_at IS NULL", (SENTINEL_FORGOTTEN,))
         return count, summary
 
     def restore(self, memory_id: str, *, project: str | None = None,
@@ -409,6 +420,7 @@ class MemoryStore:
         for table in candidates:
             total += self.execute(
                 f"UPDATE {table} SET deleted_at = NULL, "
+                f"hard_deleted_at = NULL, "
                 f"superseded_by = CASE WHEN superseded_by = %s THEN NULL "
                 f"ELSE superseded_by END, updated_at = NOW() "
                 f"WHERE id = %s AND deleted_at IS NOT NULL",

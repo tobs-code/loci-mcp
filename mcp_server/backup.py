@@ -108,7 +108,8 @@ def _export_memories_json(cur, project: str | None,
     for table, scope_name in tables:
         cur.execute(
             f"SELECT id, content, mem_type, entity, importance, metadata, "
-            f"access_count, superseded_by, deleted_at, expires_at, "
+            f"access_count, superseded_by, deleted_at, hard_deleted_at, "
+            f"expires_at, "
             f"created_at, updated_at, confidence, source, agent_id, tags, "
             f"valid_from, valid_to, pinned{emb_col} "
             f"FROM {table} {where}",
@@ -424,6 +425,11 @@ def export_memories(
             record["deleted_at"] = (r["deleted_at"].isoformat()
                                     if isinstance(r["deleted_at"], datetime)
                                     else str(r["deleted_at"]))
+        if r.get("hard_deleted_at") is not None:
+            record["hard_deleted_at"] = (
+                r["hard_deleted_at"].isoformat()
+                if isinstance(r["hard_deleted_at"], datetime)
+                else str(r["hard_deleted_at"]))
         if include_embeddings and r.get("embedding") is not None:
             record["embedding"] = r["embedding"]
         records.append(record)
@@ -806,6 +812,14 @@ def import_memories(
                     f"deleted_at is not a valid ISO 8601 timestamp")
                 skipped += 1
                 continue
+            hard_deleted_at = _parse_dt(rec.get("hard_deleted_at"))
+            if (rec.get("hard_deleted_at") not in (None, "")
+                    and hard_deleted_at is None):
+                errors.append(
+                    f"record {rec.get('id') or imported + skipped}: "
+                    f"hard_deleted_at is not a valid ISO 8601 timestamp")
+                skipped += 1
+                continue
             valid_from = _parse_dt(rec.get("valid_from"))
             if rec.get("valid_from") not in (None, "") and valid_from is None:
                 # A broken valid_from would otherwise fall back to NOW() and
@@ -913,11 +927,12 @@ def import_memories(
                 cur.execute(
                     f"INSERT INTO {table} (id, content, content_hash, embedding, "
                     f"mem_type, scope, entity, importance, metadata, access_count, "
-                    f"superseded_by, deleted_at, expires_at, created_at, updated_at, "
+                    f"superseded_by, deleted_at, hard_deleted_at, expires_at, "
+                    f"created_at, updated_at, "
                     f"confidence, source, agent_id, tags, valid_from, valid_to, "
                     f"pinned) "
                     f"VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb, "
-                    f"%s, %s, %s, %s, COALESCE(%s, NOW()), "
+                    f"%s, %s, %s, %s, %s, COALESCE(%s, NOW()), "
                     f"COALESCE(%s, COALESCE(%s, NOW())), %s, %s, %s, "
                     f"%s::text[], COALESCE(%s, COALESCE(%s, NOW())), %s, %s)",
                     (mid, content, _content_hash(content), emb,
@@ -927,7 +942,7 @@ def import_memories(
                      (float(rec["importance"])
                       if rec.get("importance") is not None else 0.5),
                      json.dumps(meta), int(rec.get("access_count", 0) or 0),
-                     superseded_by, deleted_at,
+                     superseded_by, deleted_at, hard_deleted_at,
                      expires, _parse_dt(rec.get("created_at")),
                      _parse_dt(rec.get("updated_at")),
                      _parse_dt(rec.get("created_at")),

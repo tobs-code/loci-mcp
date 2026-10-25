@@ -127,8 +127,10 @@ def test_forget_entity_rows_dry_run_counts_only_active_rows():
     cur.rowcount = 2
     store_updates.forget_entity_rows(
         store, "memories", "API", soft=False, dry_run=False)
-    assert cur.executed[0] == ("DELETE FROM memories WHERE entity = %s",
-                               ("API",))
+    sql, params = cur.executed[0]
+    assert sql.startswith("UPDATE memories SET")
+    assert "hard_deleted_at = NOW()" in sql
+    assert params == ("__forgotten__", "API")
 
 
 def test_relation_context_forget_passes_the_entity_twice():
@@ -140,7 +142,7 @@ def test_relation_context_forget_passes_the_entity_twice():
 
     sql, params = cur.executed[0]
     assert "metadata->>'from' = %s OR metadata->>'to' = %s" in sql
-    assert params == ("API", "API")
+    assert params == ("__forgotten__", "API", "API")
 
 
 def test_count_entity_rows_incl_context_passes_the_entity_three_times():

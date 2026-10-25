@@ -54,6 +54,7 @@ def restore_rows(store, memory_id: str,
     for table in tables:
         restored = store.execute(
             f"UPDATE {table} SET deleted_at = NULL, "
+            f"hard_deleted_at = NULL, "
             f"superseded_by = NULLIF(superseded_by, %s), "
             f"updated_at = NOW() WHERE id = %s "
             f"AND deleted_at IS NOT NULL",
@@ -107,7 +108,8 @@ def forget_entity_rows(store, table: str, entity: str, *, soft: bool,
                        dry_run: bool) -> int:
     """Hide, delete or count every row of one entity in one table."""
     if dry_run:
-        where = " AND deleted_at IS NULL" if soft else ""
+        where = (" AND deleted_at IS NULL" if soft
+                 else " AND hard_deleted_at IS NULL")
         return store.scalar(
             f"SELECT COUNT(*) FROM {table} WHERE entity = %s{where}",
             (entity,)) or 0
@@ -118,14 +120,21 @@ def forget_entity_rows(store, table: str, entity: str, *, soft: bool,
             f"deleted_at = NOW() "
             f"WHERE entity = %s AND deleted_at IS NULL",
             (SENTINEL_FORGOTTEN, entity))
-    return store.execute(f"DELETE FROM {table} WHERE entity = %s", (entity,))
+    return store.execute(
+        f"UPDATE {table} SET "
+        f"superseded_by = COALESCE(superseded_by, %s), "
+        f"deleted_at = COALESCE(deleted_at, NOW()), "
+        f"hard_deleted_at = NOW(), updated_at = NOW() "
+        f"WHERE entity = %s AND hard_deleted_at IS NULL",
+        (SENTINEL_FORGOTTEN, entity))
 
 
 def forget_relation_context_rows(store, table: str, entity: str, *,
                                  soft: bool, dry_run: bool) -> int:
     """The same for the edge sentences that mention the entity."""
     if dry_run:
-        where = " AND deleted_at IS NULL" if soft else ""
+        where = (" AND deleted_at IS NULL" if soft
+                 else " AND hard_deleted_at IS NULL")
         return store.scalar(
             f"SELECT COUNT(*) FROM {table} "
             f"WHERE {_RELATION_CONTEXT_FILTER}{where}",
@@ -137,8 +146,11 @@ def forget_relation_context_rows(store, table: str, entity: str, *,
             f"WHERE deleted_at IS NULL AND {_RELATION_CONTEXT_FILTER}",
             (SENTINEL_FORGOTTEN, entity, entity))
     return store.execute(
-        f"DELETE FROM {table} WHERE {_RELATION_CONTEXT_FILTER}",
-        (entity, entity))
+        f"UPDATE {table} SET superseded_by = COALESCE(superseded_by, %s), "
+        f"deleted_at = COALESCE(deleted_at, NOW()), "
+        f"hard_deleted_at = NOW(), updated_at = NOW() "
+        f"WHERE hard_deleted_at IS NULL AND {_RELATION_CONTEXT_FILTER}",
+        (SENTINEL_FORGOTTEN, entity, entity))
 
 
 def count_entity_rows_incl_context(store, table: str, entity: str) -> int:

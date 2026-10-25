@@ -80,7 +80,7 @@ def test_soft_forget_is_one_statement_with_the_sentinel():
     assert tables == ["memories"]
 
 
-def test_hard_delete_has_no_sentinel_and_a_dry_run_writes_nothing():
+def test_hard_delete_marks_the_row_for_purge_and_a_dry_run_writes_nothing():
     store, conn = make_store()
 
     store.forget_rows("abc", tables=["memories"], soft=False, dry_run=True)
@@ -91,8 +91,9 @@ def test_hard_delete_has_no_sentinel_and_a_dry_run_writes_nothing():
     conn.cursor_instance.executed.clear()
     store.forget_rows("abc", tables=["memories"], soft=False)
     sql, params = conn.cursor_instance.executed[0]
-    assert sql == "DELETE FROM memories WHERE id = %s"
-    assert params == ("abc",)
+    assert sql.startswith("UPDATE memories SET")
+    assert "hard_deleted_at = NOW()" in sql
+    assert params == ("__forgotten__", "abc")
 
 
 def test_attempt_rolls_back_only_the_failed_entry():

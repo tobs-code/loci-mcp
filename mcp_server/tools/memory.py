@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
@@ -10,6 +10,7 @@ from mcp_server.config import (
     CONTRADICTION_AUTO_MAX_SUPERSEDES,
     CONTRADICTION_AUTO_MIN_CONFIDENCE,
     DEDUPE_MODES,
+    HARD_DELETE_GRACE_DAYS,
     MEMORY_TYPE_HELP,
     MEMORY_TYPES,
     SENTINEL_FORGOTTEN,
@@ -63,7 +64,7 @@ from mcp_server.scope_catalog import (
     _table_exists,
 )
 from mcp_server.scoring import _content_hash, _gen_id
-from mcp_server.search import _extra_conditions
+from mcp_server.search import SearchRequest, _extra_conditions, _search_memories
 from mcp_server.storage import (
     _deduplicate,
     _find_near_duplicate,
@@ -2470,6 +2471,16 @@ def update_batch(
 
 
 
+def _hard_delete_window() -> tuple[dict[str, str], str]:
+    """Timestamp a hard delete stays undoable and the matching warning."""
+    until = datetime.now(timezone.utc) + timedelta(days=HARD_DELETE_GRACE_DAYS)
+    iso = until.isoformat(timespec="seconds")
+    return (
+        {"undo_until": iso, "purge_after": iso},
+        f"recoverable until {iso}, purged afterwards",
+    )
+
+
 def _forget_by_selector(
     db: MemoryStore,
     cur,
@@ -2586,13 +2597,148 @@ def _forget_by_selector(
             clear_dangling_supersede(cur)
         db.commit()
     warnings: list[str] = []
+    extra: dict[str, Any] = {}
+    if not soft and not dry_run:
+        window, warning = _hard_delete_window()
+        extra.update(window)
+        warnings.append(warning)
     return ok(
         STATUS_OK if dry_run else live_status, id=None, project=scope_name,
         counts=counts, count=len(bulk_results),
         scopes_affected=[scope_hit], bulk_results=bulk_results,
-        dry_run=dry_run, warnings=warnings,
+        dry_run=dry_run, **extra, warnings=warnings,
         message=(f"{'Would remove' if dry_run else 'Removed'} "
                  f"{counts['memories']} memory/memories matching {reason} "
+                 f"in {scope_name}"),
+    )
+
+
+def _forget_by_query(
+    db: MemoryStore,
+    cur,
+    project: str | None,
+    scope_name: str,
+    explicit_scope: bool,
+    memory_id: str | None,
+    memory_ids: list[str] | None,
+    entity_name: str | None,
+    metadata_filter: Any,
+    contains: str | None,
+    query: str,
+    limit: int,
+    min_similarity: float | None,
+    *,
+    soft: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Remove the active memories that semantically match `query`."""
+    if not isinstance(query, str) or not query.strip():
+        db.rollback()
+        return fail(STATUS_ERROR, "query must be a non-empty string")
+    query = query.strip()
+    if metadata_filter is not None or contains is not None:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "query and metadata_filter/contains are mutually exclusive")
+    if memory_id or memory_ids or entity_name:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "query cannot be combined with memory_id, memory_ids or "
+                    "entity")
+    if not explicit_scope:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "query removes a selected set of memories: pass "
+                    "project=<name> to name the scope (the shared scope is "
+                    "addressed with project=\"global\")")
+    if not isinstance(limit, int) or limit < 1:
+        db.rollback()
+        return fail(STATUS_ERROR, "limit must be a positive integer")
+    if min_similarity is not None and not 0.0 <= min_similarity <= 1.0:
+        db.rollback()
+        return fail(STATUS_ERROR,
+                    "min_similarity must be between 0.0 and 1.0")
+
+    counts = {"memories": 0, "entities": 0, "relations": 0}
+    dry_status = "would_soft_forget" if soft else "would_delete"
+    live_status = STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED
+    table = _mem_table(project)
+    scope_hit = _scope_of_table(cur, table)
+    if not _table_exists(cur, table):
+        db.rollback()
+        return ok(
+            STATUS_OK, id=None, project=scope_name, counts=counts,
+            count=0, scopes_affected=[], bulk_results=[], dry_run=dry_run,
+            query=query,
+            warnings=["no memories matched the query"],
+            message=f"no memories matched the query in {scope_name}",
+        )
+
+    try:
+        query_embedding = embed([query], mode="query")[0]
+    except Exception as e:
+        db.rollback()
+        return fail(STATUS_ERROR, f"query embedding failed: {e}")
+
+    rows = _search_memories(cur, SearchRequest(
+        query_embedding=query_embedding,
+        query_text=query,
+        project=project,
+        tables=[table],
+        limit=limit,
+        min_similarity=min_similarity,
+        exclude_relation_context=True,
+    ))
+
+    bulk_results: list[dict] = []
+    for row in rows:
+        removed, _touched = db.forget_rows(
+            row["id"], tables=[table], soft=soft, dry_run=dry_run)
+        if not removed:
+            continue
+        counts["memories"] += removed
+        preview = " ".join(str(row.get("content") or "").split())
+        if len(preview) > 200:
+            preview = preview[:197] + "..."
+        similarity = row.get("_similarity")
+        bulk_results.append({
+            "id": row["id"],
+            "content_preview": preview,
+            "similarity": (round(float(similarity), 4)
+                           if similarity is not None else 0.0),
+            "status": dry_status if dry_run else live_status,
+            "count": removed,
+            "scopes": [scope_hit],
+            "reason": "query",
+        })
+
+    if not bulk_results:
+        db.rollback()
+        return ok(
+            STATUS_OK, id=None, project=scope_name, counts=counts,
+            count=0, scopes_affected=[], bulk_results=[], dry_run=dry_run,
+            query=query,
+            warnings=["no memories matched the query"],
+            message=f"no memories matched the query in {scope_name}",
+        )
+
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+    warnings: list[str] = []
+    extra: dict[str, Any] = {}
+    if not soft and not dry_run:
+        window, warning = _hard_delete_window()
+        extra.update(window)
+        warnings.append(warning)
+    return ok(
+        STATUS_OK if dry_run else live_status, id=None, project=scope_name,
+        counts=counts, count=len(bulk_results),
+        scopes_affected=[scope_hit], bulk_results=bulk_results,
+        dry_run=dry_run, query=query, **extra, warnings=warnings,
+        message=(f"{'Would remove' if dry_run else 'Removed'} "
+                 f"{counts['memories']} memory/memories matching the query "
                  f"in {scope_name}"),
     )
 
@@ -2637,13 +2783,29 @@ def forget(
                           "this literal text (case-insensitive). Needs an "
                           "explicit `project` and cannot be combined with ids "
                           "or `entity`.")] = None,
+    query: Annotated[
+        str | None,
+        Field(description="Remove the active memories that semantically match "
+                          "this query. Needs an explicit `project` and cannot "
+                          "be combined with ids, `entity`, `metadata_filter` "
+                          "or `contains`.")] = None,
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of query matches to remove "
+                          "(default 20).")] = 20,
+    min_similarity: Annotated[
+        float | None,
+        Field(description="Minimum cosine similarity for a query match "
+                          "(0.0-1.0, default 0.85).")] = 0.85,
 ) -> dict[str, Any]:
-    """Remove memories by id(s), entity, `metadata_filter` or `contains`.
+    """Remove memories by id(s), entity, `metadata_filter`, `contains` or `query`.
 
     `soft=True` (default) hides a row via `deleted_at` and a forgotten sentinel;
-    hard delete is permanent. Without `project` the id/entity is looked up in
-    every scope, and an entity delete also removes its graph node. `entity="*"`
-    empties one project (project required).
+    a hard delete marks the row and keeps it recoverable until `undo_until`
+    (`purge_after`), after which `prune_memories` removes it. Without `project`
+    the id/entity is looked up in every scope, and an entity delete also
+    removes its graph node. `entity="*"` empties one project (project
+    required).
 
     An id is unique per scope: an id found in several scopes is refused with the
     scopes named, and an explicit `project` (including "global") bounds the
@@ -2651,11 +2813,12 @@ def forget(
     `bulk_results` (status `soft_forgotten`/`deleted`, or `would_*` with
     `dry_run`). `memory_id` and `memory_ids` are mutually exclusive.
 
-    `metadata_filter` and `contains` remove a matched set and need an explicit
-    `project` ("global" for the shared table); they cannot be combined with
-    ids, `entity` or each other. `counts` splits memories/entities/relations,
-    an entity delete without a project reports `scopes_affected`, and a
-    selector that matches nothing answers `ok` with a warning.
+    `metadata_filter`, `contains` and `query` remove a matched set and need an
+    explicit `project` ("global" for the shared table); they cannot be combined
+    with ids, `entity` or each other. `counts` splits
+    memories/entities/relations, an entity delete without a project reports
+    `scopes_affected`, and a selector that matches nothing answers `ok` with a
+    warning.
     """
     entity_name = entity or entity_name
     logger.info("forget memory_id=%s memory_ids=%s entity_name=%s soft=%s dry_run=%s",
@@ -2667,10 +2830,11 @@ def forget(
         return fail(STATUS_ERROR, str(e))
     if memory_id and memory_ids:
         return fail(STATUS_ERROR, "memory_id and memory_ids are mutually exclusive")
-    selector_used = metadata_filter is not None or contains is not None
+    selector_used = (metadata_filter is not None or contains is not None
+                     or query is not None)
     if not memory_id and not memory_ids and not entity_name and not selector_used:
         return fail(STATUS_ERROR, "memory_id, memory_ids, entity, "
-                                  "metadata_filter or contains is required")
+                                  "metadata_filter, contains or query is required")
     scope_name = project if project else "global"
     purge_all = entity_name == "*"
     # An explicit `project` names the scope to purge — including the reserved
@@ -2684,12 +2848,24 @@ def forget(
                     "entity='*' removes a whole scope: pass project=<name> "
                     "(the shared scope is addressed with project=\"global\")")
     db = MemoryStore()
+    hard_extra: dict[str, Any] = {}
+    hard_warnings: list[str] = []
+    if not soft and not dry_run:
+        hard_extra, hard_warning = _hard_delete_window()
+        hard_warnings = [hard_warning]
     counts = {"memories": 0, "entities": 0, "relations": 0}
     scopes: list[str] = []
     affected_scopes: list[str] = []
     bulk_results: list[dict] = []
     try:
         cur = db.cur
+        if query is not None:
+            return _forget_by_query(
+                db, cur, project, scope_name, explicit_scope,
+                memory_id, memory_ids, entity_name,
+                metadata_filter, contains, query, limit, min_similarity,
+                soft=soft, dry_run=dry_run,
+            )
         if selector_used:
             return _forget_by_selector(
                 db, cur, project, scope_name, explicit_scope,
@@ -2742,7 +2918,8 @@ def forget(
             
             status = STATUS_OK if dry_run else (STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED)
             return ok(status, counts=counts, dry_run=dry_run, bulk_results=bulk_results,
-                      message=f"{'Would remove' if dry_run else ('Soft-forgotten' if soft else 'Deleted')} "
+                      **hard_extra, warnings=hard_warnings,
+                      message=f"{'Would remove' if dry_run else ('Soft-forgotten' if soft else 'Hard-deleted')} "
                               f"{counts['memories']} memory/memories from {len(memory_ids)} id(s)")
         if memory_id:
             tables = limited_tables or _all_mem_tables(cur)
@@ -2803,8 +2980,9 @@ def forget(
                     STATUS_SOFT_FORGOTTEN if soft else STATUS_DELETED)
                 return ok(status, id=None, entity="*", project=scope_name,
                           counts=counts, dry_run=dry_run,
+                          **hard_extra, warnings=hard_warnings,
                           message=(
-                              f"{'Would remove' if dry_run else 'Soft-forgotten' if soft else 'Deleted'} "
+                              f"{'Would remove' if dry_run else 'Soft-forgotten' if soft else 'Hard-deleted'} "
                               f"all memories of {scope_name}"
                               + (" (rows stay recoverable with "
                                  "update_memory(restore=true); use "
@@ -2897,8 +3075,9 @@ def forget(
                   message=f"Would remove {target} (nothing was changed)")
     return ok(status, id=memory_id, entity=entity_name, counts=counts,
               project=(scope_name if project else None),
-              dry_run=False, **extra, warnings=warnings,
-              message=f"{'Soft-forgotten' if soft else 'Deleted'} {target}")
+              dry_run=False, **extra, **hard_extra,
+              warnings=warnings + hard_warnings,
+              message=f"{'Soft-forgotten' if soft else 'Hard-deleted'} {target}")
 
 
 def merge_memories(
