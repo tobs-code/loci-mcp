@@ -213,6 +213,11 @@ class BatchFact(BaseModel):
     tags: Any = Field(default=None, json_schema_extra={
         "type": ["array", "null"], "items": {"type": "string"}},
         description="Free-form tags (trimmed, lower-cased, at most 32).")
+    pinned: Any = Field(default=None, json_schema_extra={"type": ["boolean", "null"]},
+                        description="Keep this fact in every `recall` answer of "
+                                    "its scope: a pinned fact is backfilled into "
+                                    "the page even when a relevance or decay "
+                                    "floor would drop it.")
     fuzzy_threshold: Any = Field(default=None, json_schema_extra={"type": ["number", "null"]},
                                  description="Similarity threshold 0.0-1.0 for semantic dedup.")
     dedupe: Any = Field(default=None, json_schema_extra={
@@ -392,6 +397,9 @@ class BatchUpdate(BaseModel):
     clear_tags: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Remove every tag from the memory.")
+    pinned: Any = Field(default=None, json_schema_extra={
+        "type": ["boolean", "null"]},
+        description="Set or clear the always-include flag.")
     touch: Any = Field(default=None, json_schema_extra={
         "type": ["boolean", "null"]},
         description="Refresh the memory without changing its content: sets "
@@ -566,6 +574,13 @@ def remember(
         Field(description="Free-form tags (trimmed, lower-cased, at most 32, "
                           "1-64 characters each). Filter with tags/tags_any "
                           "on the read tools.")] = None,
+    pinned: Annotated[
+        bool,
+        Field(description="Keep this fact in every `recall` answer of its "
+                          "scope: a pinned fact is backfilled into the page "
+                          "even when a relevance or decay floor would drop "
+                          "it. Structural filters (entity, tags, provenance, "
+                          "project) still apply.")] = False,
     links: Annotated[
         list[dict[str, Any]] | None,
         Field(description="Optional graph edges to create in the same call "
@@ -597,6 +612,9 @@ def remember(
     lose the fact. `metadata` must be an object; a JSON-encoded object is
     accepted. `idempotency_key` makes a retry safe: a replay stores nothing and
     answers `duplicate` with `idempotent_replay: true`.
+    `pinned=True` marks the fact for always-include: `recall(include_pinned=True)`
+    backfills it into the page even when a relevance or decay floor would drop
+    it (structural filters still apply).
 
     Returns the standard envelope: {"ok", "status", "id", "error", "warnings"}.
     """
@@ -726,6 +744,7 @@ def remember(
             agent_id=agent_id,
             confidence=confidence,
             tags=tags,
+            pinned=bool(pinned),
         ))
         if outcome.status == STATUS_DUPLICATE:
             if not outcome.persist:
@@ -1142,6 +1161,7 @@ def remember_batch(
                 "auto_supersede_near_duplicate")
             fact_supersede_last = _as_bool(
                 fact.get("supersede_last"), "supersede_last")
+            fact_pinned = _as_bool(fact.get("pinned"), "pinned")
         except ValueError as e:
             prepared.append((None, str(e)))
             continue
@@ -1242,6 +1262,7 @@ def remember_batch(
             "agent_id": fagent,
             "confidence": fconfidence,
             "tags": ftags,
+            "pinned": fact_pinned,
         }, None))
 
     valid = [(i, spec) for i, (spec, err) in enumerate(prepared)
@@ -1300,6 +1321,7 @@ def remember_batch(
                         agent_id=spec["agent_id"],
                         confidence=spec["confidence"],
                         tags=spec["tags"],
+                        pinned=spec["pinned"],
                     ))
                     if not outcome.persist:
                         raise _EntryRejected(outcome)
@@ -1639,6 +1661,12 @@ def update_memory(
     clear_tags: Annotated[
         bool,
         Field(description="Remove every tag from the memory.")] = False,
+    pinned: Annotated[
+        bool | None,
+        Field(description="Set or clear the always-include flag: a pinned "
+                          "fact is backfilled into a `recall(include_pinned="
+                          "True)` page even when a relevance or decay floor "
+                          "would drop it. Omit to leave it unchanged.")] = None,
     touch: Annotated[
         bool,
         Field(description="Refresh the memory without changing its content: "
@@ -1658,8 +1686,9 @@ def update_memory(
     `content` re-embeds and dedupe-checks the edit (`dedupe`/`fuzzy_threshold`).
     `expires_at` sets a TTL and `clear_expires_at=True` removes it.
     `valid_from`/`valid_to` move the validity window (`clear_valid_to=True`
-    reopens it); `source`/`agent_id`/`confidence` update provenance and
-    `tags`/`tags_mode`/`clear_tags` the tags.
+    reopens it); `source`/`agent_id`/`confidence` update provenance,
+    `tags`/`tags_mode`/`clear_tags` the tags and
+    `pinned=True`/`pinned=False` the always-include flag.
     `touch=True` only refreshes the decay age; `restore=True` undoes a soft
     delete and cannot be combined. A superseded or expired row answers
     `conflict`; revive an expired row with a future `expires_at` or
@@ -1730,7 +1759,7 @@ def update_memory(
                 or valid_from is not None or valid_to is not None
                 or clear_valid_to or source_provided or agent_provided
                 or confidence is not None or tags is not None
-                or clear_tags):
+                or clear_tags or pinned is not None):
             return fail(STATUS_ERROR,
                         "restore=true cannot be combined with other update "
                         "fields; it only clears the soft delete")
@@ -1797,6 +1826,9 @@ def update_memory(
     if confidence_value is not None:
         sets.append("confidence = %s")
         params.append(confidence_value)
+    if pinned is not None:
+        sets.append("pinned = %s")
+        params.append(bool(pinned))
 
     if sets:
         # Updated memories must also age like new ones for decay scoring.
@@ -1879,8 +1911,8 @@ def update_memory(
                         "clear_metadata_keys, entity, mem_type, "
                         "expires_at/clear_expires_at, valid_from, "
                         "valid_to/clear_valid_to, source, agent_id, "
-                        "confidence, tags/tags_mode/clear_tags, touch=true or "
-                        "restore=true")
+                        "confidence, tags/tags_mode/clear_tags, pinned, "
+                        "touch=true or restore=true")
         scope = _scope_of_table(cur, active_table)
         # `entity=None` means "keep the current entity", not "untagged": the
         # near-duplicate warning needs the entity the updated row will have.
@@ -2146,6 +2178,12 @@ def update_batch(
                 fields["confidence"] = validate_confidence(entry_confidence)
             except ValueError as exc:
                 error = str(exc)
+        entry_pinned = entry.get("pinned")
+        if error is None and entry_pinned is not None:
+            try:
+                fields["pinned"] = _as_bool(entry_pinned, "pinned")
+            except ValueError as exc:
+                error = str(exc)
         entry_tags = entry.get("tags")
         entry_tags_mode = entry.get("tags_mode") or "replace"
         if error is None and entry_tags_mode not in ("replace", "merge"):
@@ -2167,7 +2205,8 @@ def update_batch(
                      "clear_metadata_keys, entity, mem_type, "
                      "expires_at/clear_expires_at, valid_from, "
                      "valid_to/clear_valid_to, source, agent_id, confidence, "
-                     "tags/tags_mode/clear_tags, touch=true or restore=true")
+                     "tags/tags_mode/clear_tags, pinned, touch=true or "
+                     "restore=true")
         if error:
             prepared.append((None, error))
         else:

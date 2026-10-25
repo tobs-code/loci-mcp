@@ -29,6 +29,7 @@ PUBLIC_FIELDS = (
     "updated_at",
     "expires_at",
     "project",
+    "pinned",
 )
 
 # Scoring annotations added by the search layer.
@@ -50,6 +51,7 @@ SCORE_FIELDS = (
     "_graph_relation_context",
     "_exact_match",
     "_history_penalty",
+    "_pinned",
 )
 
 SELECTABLE_FIELDS = frozenset(PUBLIC_FIELDS + SCORE_FIELDS

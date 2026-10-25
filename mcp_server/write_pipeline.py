@@ -95,6 +95,10 @@ class WriteIntent:
     agent_id: str | None = None
     confidence: float | None = None
     tags: list[str] | None = None
+    # Always-include flag: a pinned fact is backfilled into a `recall` page
+    # even when its relevance is below a filter. It is a property of the fact
+    # (not carried over from a superseded row).
+    pinned: bool = False
     dedupe: Literal["exact", "semantic", "off"] = "exact"
     fuzzy_threshold: float | None = None
     supersede: str | None = None
@@ -389,6 +393,7 @@ def write_one(db: MemoryStore, intent: WriteIntent) -> WriteOutcome:
                          agent_id=intent.agent_id,
                          confidence=intent.confidence,
                          tags=intent.tags,
+                         pinned=intent.pinned,
                          **extra)
 
     if intent.idempotency_key:

@@ -303,6 +303,7 @@ The search tool. `query` is required and non-empty.
 | `min_decay_score` | number? | Keep only memories with at least this normalized decay score (0..1). |
 | `include_superseded` | bool | Also return superseded memories (history). |
 | `only_superseded` | bool | Return only invalidated memories. |
+| `include_pinned` | bool | Backfill the page with the scope's pinned facts (never dropped by a relevance/decay floor; they carry `_pinned` and are counted in `pinned_included`). |
 | `graph_boost` | bool | Add memories of entities connected in the graph. |
 | `graph_entity` | string? | Entity to expand from. With it the query search stays unfiltered. |
 | `entity` | string? | Only return memories of this entity. |
@@ -398,7 +399,8 @@ empty result answers `ok` with `count: 0`, an empty `context` and a warning.
 ### `list_memories`
 
 Browse without a search. `order_by` is `updated_at` (default), `created_at`,
-`access_count` or `importance`. `contains` filters on a case-insensitive
+`access_count`, `importance` or `pinned` (pins first, then newest).
+`contains` filters on a case-insensitive
 literal substring - the right tool for "which memory contains exactly X",
 where the semantic ranking of `recall` is not needed. `memory_id` is the
 direct id lookup: the answer carries the single `memory` (and a one-item

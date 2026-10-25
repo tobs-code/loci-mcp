@@ -110,7 +110,7 @@ def _export_memories_json(cur, project: str | None,
             f"SELECT id, content, mem_type, entity, importance, metadata, "
             f"access_count, superseded_by, deleted_at, expires_at, "
             f"created_at, updated_at, confidence, source, agent_id, tags, "
-            f"valid_from, valid_to{emb_col} "
+            f"valid_from, valid_to, pinned{emb_col} "
             f"FROM {table} {where}",
             params,
         )
@@ -416,6 +416,10 @@ def export_memories(
                          else (str(r["valid_to"])
                                if r.get("valid_to") is not None else None)),
         }
+        if r.get("pinned"):
+            # A pin is part of the fact's contract with the agent: a restore
+            # that dropped it would silently stop always-including the row.
+            record["pinned"] = True
         if r.get("deleted_at") is not None:
             record["deleted_at"] = (r["deleted_at"].isoformat()
                                     if isinstance(r["deleted_at"], datetime)
@@ -910,11 +914,12 @@ def import_memories(
                     f"INSERT INTO {table} (id, content, content_hash, embedding, "
                     f"mem_type, scope, entity, importance, metadata, access_count, "
                     f"superseded_by, deleted_at, expires_at, created_at, updated_at, "
-                    f"confidence, source, agent_id, tags, valid_from, valid_to) "
+                    f"confidence, source, agent_id, tags, valid_from, valid_to, "
+                    f"pinned) "
                     f"VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb, "
                     f"%s, %s, %s, %s, COALESCE(%s, NOW()), "
                     f"COALESCE(%s, COALESCE(%s, NOW())), %s, %s, %s, "
-                    f"%s::text[], COALESCE(%s, COALESCE(%s, NOW())), %s)",
+                    f"%s::text[], COALESCE(%s, COALESCE(%s, NOW())), %s, %s)",
                     (mid, content, _content_hash(content), emb,
                      rec.get("mem_type") or rec.get("type") or "fact",
                      "project" if target else "global",
@@ -928,7 +933,7 @@ def import_memories(
                      _parse_dt(rec.get("created_at")),
                      confidence, source, agent_id, tags,
                      valid_from, _parse_dt(rec.get("created_at")),
-                     valid_to),
+                     valid_to, bool(rec.get("pinned"))),
                 )
                 imported += 1
                 cur.execute("RELEASE SAVEPOINT import_record")

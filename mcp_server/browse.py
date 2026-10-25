@@ -39,6 +39,7 @@ ORDER_COLUMNS = {
     "created_at": "created_at",
     "access_count": "access_count",
     "importance": "importance",
+    "pinned": "pinned",
 }
 
 
@@ -254,35 +255,52 @@ def visible_where(request: BrowseRequest) -> tuple[str, list[Any], str]:
 
 
 def _index_rows(cur, tables: list[str], where: str, params: list[Any],
-                column: str) -> list[dict]:
+                column: str, extra_column: str | None = None) -> list[dict]:
     """Light rows of every match: dedupe and paging need the whole set."""
     index_rows: list[dict] = []
     project_names = _project_names(cur)
+    extra = f", {extra_column} AS _order2" if extra_column else ""
     for table in tables:
         scope_name = ("global" if table == "memories"
                       else project_names.get(table[4:], table[4:]))
         cur.execute(
             f"SELECT id, content_hash, superseded_by, deleted_at, "
-            f"expires_at, {column} AS _order FROM {table} WHERE {where}",
+            f"expires_at, {column} AS _order{extra} FROM {table} "
+            f"WHERE {where}",
             params,
         )
-        for (row_id, c_hash, superseded_by,
-             deleted_at, expires_at, order_value) in cur.fetchall():
+        columns = [d[0] for d in (cur.description or [])]
+        for raw in cur.fetchall():
+            row = dict(zip(columns, raw))
             index_rows.append({
-                "id": row_id,
-                "content_hash": c_hash,
-                "superseded_by": superseded_by,
-                "deleted_at": deleted_at,
-                "expires_at": expires_at,
-                "_order": order_value,
+                "id": row["id"],
+                "content_hash": row["content_hash"],
+                "superseded_by": row["superseded_by"],
+                "deleted_at": row["deleted_at"],
+                "expires_at": row["expires_at"],
+                "_order": row["_order"],
+                "_order2": row.get("_order2"),
                 "_project": scope_name,
                 "_table": table,
             })
     return index_rows
 
 
-def _sort_index(index_rows: list[dict]) -> None:
-    """Newest first, with a stable id tie-break for paging."""
+def _sort_index(index_rows: list[dict], order_by: str = "updated_at") -> None:
+    """Newest first, with a stable id tie-break for paging.
+
+    ``order_by='pinned'`` lists pinned rows first, then the rest newest
+    first, so a browse can surface the always-include facts without losing
+    the default recency order inside each group.
+    """
+    if order_by == "pinned":
+        def pinned_key(r: dict):
+            stamp = r.get("_order2")
+            value = stamp.timestamp() if hasattr(stamp, "timestamp") else 0.0
+            return (0 if r.get("_order") else 1, -value, str(r.get("id") or ""))
+
+        index_rows.sort(key=pinned_key)
+        return
     index_rows.sort(key=lambda r: (r.get("_order") is not None,
                                    r.get("_order"),
                                    str(r.get("id") or "")), reverse=True)
@@ -357,9 +375,11 @@ def browse(db, request: BrowseRequest) -> BrowsePage:
     if column is None:
         raise ValueError(
             "order_by must be one of updated_at, created_at, access_count, "
-            "importance")
+            "importance, pinned")
 
-    index_rows = _index_rows(cur, tables, where, params, column)
+    index_rows = _index_rows(
+        cur, tables, where, params, column,
+        extra_column="updated_at" if request.order_by == "pinned" else None)
     unique, duplicates_hidden = dedupe_rows(
         index_rows, request.include_duplicates)
     total_by_scope = _count_by_scope(index_rows)
@@ -369,7 +389,7 @@ def browse(db, request: BrowseRequest) -> BrowsePage:
             f"{duplicates_hidden} active memory/memories were hidden because "
             f"identical content exists in another scope; only one copy is "
             f"listed. Pass include_duplicates=true to list every copy")
-    _sort_index(unique)
+    _sort_index(unique, request.order_by)
     paging = paginate(unique, request.limit, request.offset)
     window = _load_page(cur, paging.window)
     if request.offset > 0 and paging.total > 0 and not window:

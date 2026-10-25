@@ -76,6 +76,8 @@ from mcp_server.search import (
     _extra_conditions,
     _search_memories,
     _search_memories_graph_boost,
+    fetch_embeddings,
+    fetch_pinned_rows,
 )
 from mcp_server.storage import (
     _log_access,
@@ -254,7 +256,7 @@ def recall(
                           "_scope_boost, _decay_score, _decay_norm, "
                           "_final_score, _graph_boost, _graph_source, "
                           "_graph_weight, _graph_relation_context, "
-                          "_exact_match.")] = None,
+                          "_exact_match, _pinned.")] = None,
     detail: Annotated[
         Literal["full", "slim"],
         Field(description="'full' (default) returns every public column and "
@@ -266,6 +268,16 @@ def recall(
     only_superseded: Annotated[
         bool,
         Field(description="Return only invalidated (superseded) memories.")] = False,
+    include_pinned: Annotated[
+        bool,
+        Field(description="Backfill the page with the scope's pinned memories. "
+                          "A pinned fact satisfies the structural filters "
+                          "(entity, tags, provenance, project, as_of, the "
+                          "visibility flags) but is never dropped by a "
+                          "relevance or decay floor; a missing pin displaces "
+                          "the lowest-ranked non-pinned hit. Appended pins "
+                          "carry `_pinned: true` and are listed after the "
+                          "ranked hits. The answer adds `pinned_included`.")] = False,
     include_global: Annotated[
         bool,
         Field(description="True (default) lets a project search also see global "
@@ -339,7 +351,10 @@ def recall(
 
     Flags: `only_superseded`, `include_superseded`, `include_deleted`,
     `include_expired`, `include_relation_context` (False hides edge sentences),
-    `fields`, `detail="slim"`. `offset` pages; the answer reports `has_more`,
+    `fields`, `detail="slim"`. `include_pinned=True` backfills the page with
+    the scope's pinned facts (structural filters still apply, relevance/decay
+    floors do not); they carry `_pinned` and the answer adds `pinned_included`.
+    `offset` pages; the answer reports `has_more`,
     `next_offset`, `confidence` (high >= 0.60, medium >= 0.45, low, none, graph)
     and `best_relevance`; a low-confidence answer warns. An unknown project is
     named in `warnings` and only the global scope is searched.
@@ -393,6 +408,7 @@ def recall(
                         "parameter to enable graph expansion.")
     if only_superseded:
         include_superseded = True
+    pinned_included = 0
     query_emb = embed([query], mode="query")[0]
     db = MemoryStore()
     try:
@@ -529,6 +545,72 @@ def recall(
 
         paging = paginate(results, limit, offset)
         results = paging.window
+
+        # A pinned row that ranked naturally is still a pin: mark it so the
+        # caller (and `compile_context`) can order and report it. Marking
+        # before the backfill also keeps the backfill from re-adding it.
+        if not only_superseded:
+            for r in results:
+                if isinstance(r, dict) and r.get("pinned"):
+                    r["_pinned"] = True
+
+        pinned_included = 0
+        if include_pinned and not only_superseded:
+            # A pin is an always-include fact: it is fetched with the
+            # structural filters only and merged into the page, so no
+            # relevance or decay floor can drop it.
+            existing = {
+                (r.get("_project") or "global", r.get("id"))
+                for r in results if isinstance(r, dict)
+            }
+            seen_hashes = {
+                r.get("content_hash") for r in results
+                if isinstance(r, dict) and r.get("content_hash")
+            }
+            candidates: list[dict] = []
+            for pin in fetch_pinned_rows(
+                    cur, tables,
+                    mem_type=mem_type, entity=entity,
+                    include_entity_relation_context=(
+                        bool(entity) and include_relation_context),
+                    exclude_relation_context=not include_relation_context,
+                    updated_after=updated_after,
+                    metadata_filter=metadata_filter, as_of=as_of,
+                    tags=tags, tags_any=tags_any, source=source,
+                    agent_id=agent_id, min_confidence=min_confidence,
+                    include_deleted=include_deleted,
+                    include_superseded=include_superseded,
+                    include_expired=include_expired, limit=limit):
+                key = (pin.get("_project") or "global", pin.get("id"))
+                if key in existing:
+                    continue
+                pin_hash = pin.get("content_hash")
+                if pin_hash and pin_hash in seen_hashes:
+                    continue
+                if pin_hash:
+                    seen_hashes.add(pin_hash)
+                existing.add(key)
+                candidates.append(pin)
+            if candidates:
+                page = list(results)
+                for pin in candidates:
+                    if len(page) < limit:
+                        page.append(pin)
+                        continue
+                    # The page is full: a missing pin displaces the
+                    # lowest-ranked non-pinned hit.
+                    evict = next(
+                        (i for i in range(len(page) - 1, -1, -1)
+                         if not page[i].get("_pinned")), None)
+                    if evict is None:
+                        break
+                    page[evict] = pin
+                # Appended pins sit after the ranked hits (stable order).
+                page.sort(key=lambda r: 1 if r.get("_pinned") else 0)
+                results = page
+                pinned_included = sum(
+                    1 for r in results
+                    if isinstance(r, dict) and r.get("_pinned"))
 
         # Update access counters (decay frequency) only for the rows this
         # page actually returns: skipped matches were not read.
@@ -672,7 +754,8 @@ def recall(
     else:
         confidence = "low"
     if confidence == "low" and not (include_superseded or include_deleted
-                                    or include_expired or only_superseded):
+                                    or include_expired or only_superseded
+                                    or include_pinned):
         warnings.append(
             f"low confidence: the best match has _relevance_score="
             f"{best_relevance} (below {CONFIDENCE_MEDIUM}); the results may "
@@ -692,6 +775,8 @@ def recall(
         "scopes_searched": scopes_searched,
         "detail": detail,
     }
+    if include_pinned:
+        payload["pinned_included"] = pinned_included
     # The strongest rejected vector hit: a count alone hides the natural
     # language question that barely missed the threshold. With a non-empty
     # result it is a data field; with none it is the reason list.
@@ -943,8 +1028,11 @@ def list_memories(
                           "(the string '8001' matches the number 8001); "
                           "objects and arrays use JSON containment.")] = None,
     order_by: Annotated[
-        Literal["updated_at", "created_at", "access_count", "importance"],
-        Field(description="Sort order (default: updated_at, newest first).")] = "updated_at",
+        Literal["updated_at", "created_at", "access_count", "importance",
+                "pinned"],
+        Field(description="Sort order (default: updated_at, newest first). "
+                          "'pinned' lists pinned memories first, then the rest "
+                          "newest first.")] = "updated_at",
     as_of: Annotated[
         str | None,
         Field(description="Only memories that were valid at this ISO 8601 "
@@ -1077,7 +1165,7 @@ def list_memories(
     if not order_value:
         return fail(STATUS_ERROR,
                     "order_by must be one of updated_at, created_at, "
-                    "access_count, importance")
+                    "access_count, importance, pinned")
     if memory_ids is not None:
         if memory_id:
             return fail(STATUS_ERROR,

@@ -438,6 +438,116 @@ def _entity_conditions(
     ], [entity, entity, entity])
 
 
+def fetch_pinned_rows(
+    cur,
+    tables: list[str],
+    *,
+    mem_type: str | None = None,
+    entity: str | None = None,
+    include_entity_relation_context: bool = False,
+    exclude_relation_context: bool = False,
+    updated_after: str | None = None,
+    metadata_filter: dict | None = None,
+    as_of: str | None = None,
+    tags: list[str] | None = None,
+    tags_any: list[str] | None = None,
+    source: str | None = None,
+    agent_id: str | None = None,
+    min_confidence: float | None = None,
+    include_deleted: bool = False,
+    include_superseded: bool = False,
+    include_expired: bool = False,
+    limit: int = 200,
+) -> list[dict]:
+    """The pinned, active rows of the searched scopes, newest first.
+
+    These rows are the always-include candidates of `recall`: they satisfy the
+    structural filters (scope, entity, type, tags, provenance, `as_of`, the
+    visibility flags) but are deliberately NOT judged by the relevance or decay
+    floors - a pin is meant to survive them. Callers merge the result into the
+    page and mark it with `_pinned`.
+    """
+    if not tables:
+        return []
+    extra_conditions, extra_params = _extra_conditions(
+        updated_after, metadata_filter, as_of=as_of, tags=tags,
+        tags_any=tags_any, source=source, agent_id=agent_id,
+        min_confidence=min_confidence)
+    if exclude_relation_context:
+        extra_conditions = extra_conditions + [
+            "COALESCE(metadata->>'relation_context', 'false') <> 'true'"]
+    entity_conditions, entity_params = _entity_conditions(
+        entity, include_entity_relation_context)
+    project_names = _project_names(cur)
+    fetched: list[tuple[dict, str]] = []
+    for table in tables:
+        conditions = [
+            "pinned",
+            visibility_condition(include_deleted=include_deleted,
+                                 include_superseded=include_superseded,
+                                 include_expired=include_expired),
+        ]
+        params: list[Any] = []
+        if mem_type:
+            conditions.append("mem_type = %s")
+            params.append(mem_type)
+        conditions.extend(entity_conditions)
+        params.extend(entity_params)
+        conditions.extend(extra_conditions)
+        params.extend(extra_params)
+        where = " AND ".join(conditions)
+        cur.execute(
+            f"SELECT * FROM {table} WHERE {where} "
+            f"ORDER BY updated_at DESC NULLS LAST, id ASC LIMIT %s",
+            params + [limit])
+        columns = [desc[0] for desc in cur.description]
+        for raw in cur.fetchall():
+            row = dict(zip(columns, raw))
+            row["_project"] = ("global" if table == "memories"
+                               else project_names.get(table[4:], table[4:]))
+            row["_pinned"] = True
+            # No query judged these rows: they carry no relevance. 0.0 keeps
+            # the confidence computation honest instead of pretending a match.
+            row["_relevance_score"] = 0.0
+            fetched.append((row, table))
+
+    def _pin_sort_key(item: dict) -> tuple:
+        stamp = item.get("updated_at")
+        value = stamp.timestamp() if hasattr(stamp, "timestamp") else 0.0
+        return (-value, str(item.get("id") or ""))
+
+    return [row for row, _ in sorted(fetched, key=lambda p: _pin_sort_key(p[0]))]
+
+
+def fetch_embeddings(cur, tables: list[str],
+                     ids: list[str]) -> dict[str, list[float]]:
+    """The stored vectors of the given ids, keyed by id.
+
+    `compile_context` needs the vectors to run MMR diversity selection; they
+    are used server-side only and never projected into an answer. A missing or
+    unparseable vector simply drops out of the map, so the caller falls back to
+    relevance-only ordering for that row.
+    """
+    wanted = [str(i) for i in ids if i]
+    if not wanted:
+        return {}
+    out: dict[str, list[float]] = {}
+    for table in tables:
+        try:
+            cur.execute(
+                f"SELECT id, embedding::text FROM {table} "
+                f"WHERE id = ANY(%s) AND embedding IS NOT NULL",
+                (wanted,))
+        except Exception:
+            continue
+        for row_id, raw in cur.fetchall():
+            try:
+                out[str(row_id)] = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 def _parse_timestamp(value: str):
     """Parse an ISO-8601 date/datetime, or None when it does not parse."""
     try:

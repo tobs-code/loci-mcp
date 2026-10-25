@@ -235,7 +235,8 @@ class MemoryStore:
                source: str | None = None,
                agent_id: str | None = None,
                confidence: float | None = None,
-               tags: list[str] | None = None) -> str:
+               tags: list[str] | None = None,
+               pinned: bool | None = None) -> str:
         """Insert one active memory and return its id."""
         mem_id = memory_id or _gen_id()
         now = _now()
@@ -280,6 +281,10 @@ class MemoryStore:
             extra_columns += ", tags"
             extra_values += ", %s::text[]"
             params.append(list(tags))
+        if pinned:
+            extra_columns += ", pinned"
+            extra_values += ", %s"
+            params.append(True)
         self.cur.execute(
             f"""INSERT INTO {table}
                 (id, content, content_hash, embedding, mem_type, scope, entity,

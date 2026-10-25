@@ -162,6 +162,7 @@ _FEATURE_COLUMN_DEFINITIONS = (
     ("agent_id", "TEXT"),
     ("confidence", "FLOAT"),
     ("tags", "TEXT[] NOT NULL DEFAULT '{}'"),
+    ("pinned", "BOOLEAN NOT NULL DEFAULT FALSE"),
 )
 
 _CONFIDENCE_CHECK = (
@@ -202,6 +203,11 @@ def _ensure_feature_columns(cur, table: str, idx_digest: str) -> None:
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{idx_digest}_tags "
         f"ON {table} USING GIN (tags)")
+    # Partial index: the always-include path only ever looks for the pinned
+    # rows of a scope, so the index stays tiny however large the scope grows.
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{idx_digest}_pinned "
+        f"ON {table}(id) WHERE pinned")
     constraint = f"chk_{idx_digest}_confidence"
     cur.execute(
         "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass",
@@ -282,6 +288,7 @@ def ensure_project_table(cur, project: str) -> None:
             agent_id TEXT,
             confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
             tags TEXT[] NOT NULL DEFAULT '{{}}',
+            pinned BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )

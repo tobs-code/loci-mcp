@@ -25,6 +25,7 @@ CREATE TABLE memories (
     agent_id TEXT,
     confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
     tags TEXT[] NOT NULL DEFAULT '{}',
+    pinned BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -53,6 +54,7 @@ CREATE INDEX idx_memories_hash ON memories(content_hash);
 CREATE INDEX idx_memories_active ON memories(superseded_by) WHERE superseded_by IS NULL;
 CREATE INDEX idx_memories_validity ON memories(valid_from, valid_to);
 CREATE INDEX idx_memories_tags ON memories USING GIN (tags);
+CREATE INDEX idx_memories_pinned ON memories(id) WHERE pinned;
 CREATE INDEX idx_entities_name ON entities(name);
 CREATE INDEX idx_entities_type ON entities(type);
 CREATE INDEX idx_relations_source ON relations(source_id);

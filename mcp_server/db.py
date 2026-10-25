@@ -109,6 +109,7 @@ def ensure_schema():
                 agent_id TEXT,
                 confidence FLOAT CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
                 tags TEXT[] NOT NULL DEFAULT '{}',
+                pinned BOOLEAN NOT NULL DEFAULT FALSE,
                 idempotency_key TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -194,8 +195,10 @@ def ensure_schema():
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS agent_id TEXT",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence FLOAT",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}'",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE",
             "CREATE INDEX IF NOT EXISTS idx_memories_validity ON memories(valid_from, valid_to)",
             "CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN (tags)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(id) WHERE pinned",
             # One active row per idempotency key. Expiry cannot be part of the
             # predicate (a partial index needs an IMMUTABLE expression), so an
             # expired row's key is cleared lazily before the next insert.
