@@ -131,3 +131,42 @@ def entity_row_count(store, target: str, tables: list[str],
             rows.append(item)
     unique, hidden = dedupe_rows(rows)
     return len(unique), hidden
+
+
+def entity_row_counts_by_scope(store, target: str, tables: list[str],
+                               scopes: list[str],
+                               include_superseded: bool,
+                               include_expired: bool = False,
+                               include_relation_context: bool = False,
+                               extra_conditions: list[str] | None = None,
+                               extra_params: list | None = None
+                               ) -> dict[str, int]:
+    """Exact row count of one entity per scope.
+
+    The page only fetches `offset + limit + 1` rows, so deriving this from
+    the returned list made the count depend on `limit`. A real COUNT(*) is
+    independent of paging.
+    """
+    counts: dict[str, int] = {}
+    conditions = list(extra_conditions or [])
+    params: list = [target] + list(extra_params or [])
+    where = ("entity = %s AND " + visibility_sql(
+        include_superseded=include_superseded,
+        include_expired=include_expired))
+    if conditions:
+        where += " AND " + " AND ".join(conditions)
+    for table, scope_name in zip(tables, scopes):
+        count = store.scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE {where}", tuple(params)) or 0
+        if include_relation_context:
+            context_where = (
+                "entity IS NOT NULL AND "
+                "metadata->>'relation_context' = 'true' AND "
+                "(metadata->>'from' = %s OR metadata->>'to' = %s) AND "
+            ) + visibility_sql(include_superseded=include_superseded,
+                               include_expired=include_expired)
+            count += store.scalar(
+                f"SELECT COUNT(*) FROM {table} WHERE {context_where}",
+                (target, target)) or 0
+        counts[scope_name] = count
+    return counts

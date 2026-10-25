@@ -90,6 +90,7 @@ from mcp_server.store_rows import (
     count_graph_where,
     entity_present,
     entity_row_count,
+    entity_row_counts_by_scope,
     graph_entities,
     graph_nodes as graph_node_rows,
     graph_projects,
@@ -1684,6 +1685,12 @@ def get_entity(name: Annotated[
         # the lookup silently falls back to the global table.
         unknown_scope = scope.unknown_warning(cur)
         used_tables = tables or ["memories"]
+        memories_by_scope = entity_row_counts_by_scope(
+            db, target, used_tables, scopes_searched,
+            include_superseded, include_expired,
+            include_relation_context=include_relation_context,
+            extra_conditions=entity_feature_conditions,
+            extra_params=entity_feature_params)
         # An entity name can exist in several scopes. The caller asked for one
         # lookup, so the answer has to say where else the name occurs instead
         # of silently merging a global memory-only entity with this project's
@@ -1813,10 +1820,6 @@ def get_entity(name: Annotated[
             f"({', '.join(sorted(scope_presence))}); `details` describes the "
             f"{detail_scope!r} occurrence and the memories come from "
             f"{', '.join(scopes_searched)}.{duplicate_note}")
-    for memory in memories:
-        scope_name = memory.get("_project") or "global"
-        memories_by_scope[scope_name] = (
-            memories_by_scope.get(scope_name, 0) + 1)
     # The rows come from several tables: newest update first makes the
     # detail view deterministic page-over-page.
     memories.sort(key=lambda m: m.get("updated_at") or "", reverse=True)
@@ -1853,13 +1856,15 @@ def get_entity(name: Annotated[
 
 def get_entities(
     entities: Annotated[
-        list[str],
-        Field(description="Entity names to look up (1-25, duplicates are "
-                          "removed). A blank name is an argument error.")],
+        list[str | dict[str, Any]],
+        Field(description="Entity lookups (1-25). A string uses the tool-level "
+                          "`project`; an object accepts `entity` (alias "
+                          "`name`) and `project`, so one call can span "
+                          "scopes. Duplicates are removed.")],
     project: Annotated[
         str | None,
-        Field(description="Project scope. Without it only the global scope is "
-                          "used.")] = None,
+        Field(description="Project scope for plain string entries. Without it "
+                          "only the global scope is used.")] = None,
     include_global: Annotated[
         bool,
         Field(description="True (default) includes global memories; False "
@@ -1910,16 +1915,20 @@ def get_entities(
         Field(description="Only memories with a confidence at or above this "
                           "value (0.0-1.0).")] = None,
 ) -> dict[str, Any]:
-    """Look up several entities in one call.
+    """Look up several entities in one call, optionally across scopes.
 
     Each entry answers exactly like `get_entity` (same details, memories,
     cross-scope dedupe and paging), so an agent that already knows the names
-    does not need one round trip per entity. An unknown name is a
-    `not_found` entry and never aborts the call; the envelope reports
-    `count`, `succeeded` and `failed`.
+    does not need one round trip per entity. A plain string uses the
+    tool-level `project`; an object can carry its own `project`
+    (`{"entity": "API", "project": "api"}`), so one call can cover several
+    scopes. An unknown name is a `not_found` entry and never aborts the call;
+    an object with an unknown key is an `error` entry that names the key. The
+    envelope reports `count`, `succeeded`, `failed` and the sorted `scopes`.
 
-    `project="*"` is rejected: every entry describes exactly one entity.
-    Duplicate names are removed, and names are trimmed like in `get_entity`.
+    `project="*"` is rejected (also per entry): every entry describes exactly
+    one entity. Duplicate (entity, project) pairs are removed, and names are
+    trimmed like in `get_entity`.
     """
     logger.info("get_entities count=%s project=%s", len(entities or []), project)
     if project == "*":
@@ -1943,23 +1952,79 @@ def get_entities(
         return fail(STATUS_ERROR, "limit_per_entity must be >= 1")
     if offset_per_entity < 0:
         return fail(STATUS_ERROR, "offset_per_entity must be >= 0")
-    names: list[str] = []
-    seen: set[str] = set()
-    for raw in entities:
-        if not isinstance(raw, str):
-            return fail(STATUS_ERROR, "entity names must be strings")
-        name = raw.strip()
-        if not name:
-            return fail(STATUS_ERROR, "entity names must not be blank")
-        if name in seen:
-            continue
-        seen.add(name)
-        names.append(name)
+
+    lookups: list[tuple[str, str | None]] = []
     results: list[dict[str, Any]] = []
-    for name in names:
+    seen: set[tuple[str, str | None]] = set()
+
+    def _entry_error(name: Any, entry_project: Any, error: str) -> None:
+        results.append({
+            "ok": False,
+            "status": STATUS_ERROR,
+            "entity": name,
+            "project": (_scope_key(entry_project)
+                        if entry_project is not None else "global"),
+            "error": error,
+            "warnings": [],
+        })
+
+    for raw in entities:
+        if isinstance(raw, str):
+            name = raw.strip()
+            if not name:
+                return fail(STATUS_ERROR, "entity names must not be blank")
+            key = (name, project)
+            if key in seen:
+                continue
+            seen.add(key)
+            lookups.append((name, project))
+            continue
+        if not isinstance(raw, dict):
+            return fail(STATUS_ERROR,
+                        "entities entries must be strings or objects")
+        unknown = sorted(set(raw) - {"entity", "name", "project"})
+        if unknown:
+            _entry_error(
+                raw.get("entity") or raw.get("name"),
+                raw.get("project", project),
+                f"unknown argument(s) {', '.join(unknown)}; accepted "
+                f"arguments are: entity, name, project")
+            continue
+        entity_value = raw.get("entity")
+        alias_value = raw.get("name")
+        if (entity_value is not None and alias_value is not None
+                and str(entity_value).strip() != str(alias_value).strip()):
+            _entry_error(
+                entity_value, raw.get("project", project),
+                f"entity and name were both given but differ "
+                f"({entity_value!r} vs {alias_value!r}); pass only one of "
+                f"the aliases")
+            continue
+        name_value = entity_value if entity_value is not None else alias_value
+        if not isinstance(name_value, str) or not name_value.strip():
+            _entry_error(
+                name_value, raw.get("project", project),
+                "entity is required (a non-empty string)")
+            continue
+        name = name_value.strip()
+        entry_project = raw.get("project", project)
+        if entry_project is not None and str(entry_project).strip() == "*":
+            _entry_error(
+                name, entry_project,
+                "project='*' is not supported by get_entities: each entry "
+                "describes exactly one entity; pass one project name or omit "
+                "project for the global scope")
+            continue
+        key = (name, entry_project)
+        if key in seen:
+            continue
+        seen.add(key)
+        lookups.append((name, entry_project))
+
+    for name, entry_project in lookups:
         payload = get_entity(
             name,
-            project=project,
+            project=entry_project,
             include_global=include_global,
             include_superseded=include_superseded,
             include_expired=include_expired,
@@ -1975,10 +2040,14 @@ def get_entities(
             min_confidence=min_confidence,
         )
         if payload.get("ok"):
+            details = payload.get("details") or {}
+            used_project = (details.get("project")
+                            or _scope_key(entry_project))
             entry: dict[str, Any] = {
                 "ok": True,
                 "status": payload.get("status"),
                 "entity": payload.get("entity", name),
+                "project": used_project,
                 "details": payload.get("details"),
                 "memories": payload.get("memories", []),
                 "total": payload.get("total", 0),
@@ -1991,7 +2060,6 @@ def get_entities(
             if payload.get("relation_context_count"):
                 entry["relation_context_count"] = payload[
                     "relation_context_count"]
-            details = payload.get("details") or {}
             if details.get("scopes_with_entity"):
                 entry["scopes_with_entity"] = details["scopes_with_entity"]
         else:
@@ -1999,6 +2067,7 @@ def get_entities(
                 "ok": False,
                 "status": payload.get("status"),
                 "entity": name,
+                "project": _scope_key(entry_project),
                 "error": payload.get("error"),
                 "warnings": list(payload.get("warnings") or []),
             }
@@ -2007,6 +2076,8 @@ def get_entities(
         results.append(entry)
     failed_entries = [entry for entry in results if not entry["ok"]]
     succeeded = len(results) - len(failed_entries)
+    scopes = sorted({entry["project"] for entry in results
+                     if entry.get("project")})
     if not succeeded:
         return fail(
             STATUS_NOT_FOUND,
@@ -2014,6 +2085,7 @@ def get_entities(
             count=len(results),
             succeeded=0,
             failed=len(failed_entries),
+            scopes=scopes,
             results=results,
         )
     warnings: list[str] = []
@@ -2024,7 +2096,8 @@ def get_entities(
             + "; the other entries are complete")
     status = STATUS_PARTIAL if failed_entries else STATUS_OK
     return ok(status, count=len(results), succeeded=succeeded,
-              failed=len(failed_entries), results=results, warnings=warnings)
+              failed=len(failed_entries), scopes=scopes,
+              results=results, warnings=warnings)
 
 
 def list_entities(
