@@ -287,7 +287,10 @@ counts and health.
   `recall` reports `dropped_by_similarity`, `dropped_by_coverage`,
   `dropped_by_decay`, `dropped_by_relevance`, `dropped_by_superseded`,
   `dropped_by_expired`, `dropped_by_validity` (with `as_of`),
-  `dropped_by_cross_scope_duplicate`; an empty result
+  `dropped_by_cross_scope_duplicate`; with `only_superseded` the dropped active
+  rows are counted in `dropped_by_not_superseded` while `dropped_by_superseded`
+  stays `0` (the filter keeps invalidated rows and drops the active ones); an
+  empty result
   names every filter that
   removed something. The strongest rejected vector hit is reported
   as `best_dropped_by_similarity` (id, similarity, scope, `content_preview`),

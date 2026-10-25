@@ -158,11 +158,14 @@ lowest-ranked non-pinned hit when the page is full, and the count lands in
 `dropped_by_validity` (rows matched by the other filters whose validity window
 does not contain `as_of`; reported only when `as_of` is passed) and
 `dropped_by_coverage` (the number of full-text hits the coverage filter
-removed). `dropped_by_relevance`, `dropped_by_decay` and
-`dropped_by_superseded` are reported whenever the `min_relevance` (including
-the implicit FTS-only floor) / `min_decay_score` / `only_superseded` filter
+removed). `dropped_by_relevance` and
+`dropped_by_decay` are reported whenever the `min_relevance` (including
+the implicit FTS-only floor) / `min_decay_score` filter
 removed hits — also
-when other hits survived, so a non-empty result is never quietly short. When
+when other hits survived, so a non-empty result is never quietly short. With
+`only_superseded` the filter keeps the invalidated rows and drops the active
+ones, counted honestly in `dropped_by_not_superseded` (`dropped_by_superseded`
+then stays `0`). When
 the result is empty, the warning names **every** filter that removed
 something, so the caller does not have to guess which one was responsible.
 In that warning the strongest rejected vector hit is named explicitly, and the

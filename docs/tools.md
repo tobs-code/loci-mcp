@@ -337,10 +337,11 @@ The answer reports `candidates` (the hits that made it into the ranking),
 not contain `as_of`; reported only when `as_of` is passed),
 `dropped_by_coverage` (the number of full-text hits that covered too little of
 the query), plus `fulltext_only` when a hit came only from the full-text leg.
-`dropped_by_relevance`, `dropped_by_decay` and `dropped_by_superseded` are
-reported whenever the `min_relevance` / `min_decay_score` / `only_superseded`
-filter removed hits — also when other
-hits survived, so a non-empty result is never quietly short.
+`dropped_by_relevance` and `dropped_by_decay` are reported whenever the
+`min_relevance` / `min_decay_score` filter removed hits — also when other
+hits survived, so a non-empty result is never quietly short. With
+`only_superseded` the filter drops the ACTIVE rows, so they are counted in
+`dropped_by_not_superseded` and `dropped_by_superseded` stays present as `0`.
 `scopes_searched` names the scopes the query actually covered. See
 [Retrieval](retrieval.md) for the score fields.
 

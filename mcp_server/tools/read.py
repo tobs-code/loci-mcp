@@ -535,14 +535,18 @@ def recall(
                 dropped_by_relevance += 1
         results = kept
 
+        # `only_superseded` keeps the invalidated rows and drops the ACTIVE
+        # ones, so the dropped count is "not superseded" - naming it
+        # `dropped_by_superseded` reported the opposite of what happened.
         dropped_by_superseded = 0
+        dropped_by_not_superseded = 0
         if only_superseded:
             kept = []
             for r in results:
                 if isinstance(r, dict) and r.get("superseded_by"):
                     kept.append(r)
                 else:
-                    dropped_by_superseded += 1
+                    dropped_by_not_superseded += 1
             results = kept
 
         paging = paginate(results, limit, offset)
@@ -690,9 +694,9 @@ def recall(
             reasons.append(
                 f"{dropped_by_relevance} hit(s) were below "
                 f"min_relevance={min_relevance}")
-        if dropped_by_superseded:
+        if dropped_by_not_superseded:
             reasons.append(
-                f"{dropped_by_superseded} hit(s) were not superseded "
+                f"{dropped_by_not_superseded} hit(s) were not superseded "
                 f"(only_superseded=true)")
         if dropped_by_cross_scope:
             reasons.append(
@@ -797,7 +801,15 @@ def recall(
         payload["dropped_by_decay"] = dropped_by_decay
     if dropped_by_relevance:
         payload["dropped_by_relevance"] = dropped_by_relevance
-    if dropped_by_superseded:
+    if only_superseded:
+        # `only_superseded` drops active rows, not superseded ones: the honest
+        # counter is `dropped_by_not_superseded`, and `dropped_by_superseded`
+        # stays present (0) so a caller reading the key is not misled by its
+        # absence.
+        payload["dropped_by_superseded"] = 0
+        if dropped_by_not_superseded:
+            payload["dropped_by_not_superseded"] = dropped_by_not_superseded
+    elif dropped_by_superseded:
         payload["dropped_by_superseded"] = dropped_by_superseded
     if stats.get("fulltext_only"):
         fulltext_only = stats["fulltext_only"]

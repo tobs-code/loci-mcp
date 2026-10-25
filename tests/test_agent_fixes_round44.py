@@ -161,6 +161,28 @@ def test_recall_only_superseded_ignores_pins():
     assert history.get("pinned_included", 0) == 0
 
 
+def test_only_superseded_reports_the_not_superseded_counter():
+    # Bug 6: `only_superseded` keeps the invalidated rows and drops the ACTIVE
+    # ones, so the dropped count is "not superseded". It used to be reported
+    # under `dropped_by_superseded`, the opposite of what happened.
+    forget(entity="*", project="round44-hist", soft=False, dry_run=False)
+    base = remember("Round44 hist probe: port is 4100", project="round44-hist")
+    remember("Round44 hist probe: port is 4200", project="round44-hist",
+             supersede=base["id"])
+    remember("Round44 hist probe: the active sibling", project="round44-hist")
+
+    history = recall("Round44 hist probe port", project="round44-hist",
+                     only_superseded=True)
+    assert history["ok"] is True
+    assert history["dropped_by_superseded"] == 0
+    assert history["dropped_by_not_superseded"] >= 1
+    assert all(r.get("superseded_by") for r in history["results"])
+
+
+# ---------------------------------------------------------------------------
+# list_memories: pinned order
+# ---------------------------------------------------------------------------
+
 def test_list_memories_order_by_pinned_lists_pins_first():
     forget(entity="*", project="round44-list", soft=False, dry_run=False)
     plain = remember("Round44 list plain", project="round44-list")
