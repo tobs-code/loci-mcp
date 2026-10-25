@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from mcp_server.config import (
+    HARD_DELETE_GRACE_DAYS,
     RERANK_ENABLED,
     RERANK_MODEL,
     SENTINEL_FORGOTTEN,
@@ -46,6 +47,7 @@ from mcp_server.scope_catalog import (
     _norm_project,
     _project_names,
     _project_suffix,
+    _scope_key,
     _scope_of_table,
     _table_exists,
 )
@@ -436,13 +438,23 @@ def verify_integrity(
 def prune_memories(
     project: Annotated[
         str | None,
-        Field(description="Scope to prune. Without it every scope is pruned; "
-                          "'global' prunes only the shared scope.")] = None,
+        Field(description="Scope to prune: a project name, or 'global' for "
+                          "the shared table. Pass exactly one of `project` "
+                          "and `all_scopes=true`.")] = None,
+    all_scopes: Annotated[
+        bool,
+        Field(description="Prune the shared table and every project table. "
+                          "Mutually exclusive with `project`.")] = False,
     older_than_days: Annotated[
         float,
         Field(description="Only remove inactive rows older than this many "
                           "days (default 30).",
               ge=0.0)] = 30.0,
+    hard_delete_grace_days: Annotated[
+        float,
+        Field(description="Physically remove hard-deleted rows whose grace "
+                          "period has passed (default 7 days).",
+              ge=0.0)] = HARD_DELETE_GRACE_DAYS,
     include_expired: Annotated[
         bool,
         Field(description="Remove rows whose TTL passed more than "
@@ -464,23 +476,33 @@ def prune_memories(
     """Permanently remove inactive memories (expired/forgotten/superseded).
 
     Active memories are never touched: only rows that every read already
-    hides are eligible. `dry_run=true` is the default, so an accidental call
-    reports instead of deleting. Supersede links that point at a removed row
-    are cleared, so surviving history stays readable.
+    hides are eligible. A hard-deleted row is removed once its
+    `hard_delete_grace_days` grace period has passed, so a hard delete stays
+    undoable. `dry_run=true` is the default, so an accidental call reports
+    instead of deleting. Supersede links that point at a removed row are
+    cleared, so surviving history stays readable.
+
+    A scope is never pruned implicitly: pass `project=<name>` (or
+    `project="global"`) or `all_scopes=true`.
     """
-    logger.info("prune_memories project=%s older_than_days=%s dry_run=%s",
-                project, older_than_days, dry_run)
-    if not (include_expired or include_forgotten or include_superseded):
+    logger.info("prune_memories project=%s all_scopes=%s older_than_days=%s "
+                "dry_run=%s", project, all_scopes, older_than_days, dry_run)
+    if project is not None and all_scopes:
         return fail(STATUS_ERROR,
-                    "nothing to prune: enable include_expired, "
-                    "include_forgotten or include_superseded")
+                    "project and all_scopes are mutually exclusive")
+    if project is None and not all_scopes:
+        return fail(STATUS_ERROR,
+                    "pass project=<name> or all_scopes=true")
+    requested_project = project
     try:
         project = _norm_project(project)
     except ValueError as e:
         return fail(STATUS_ERROR, str(e))
     cutoff_sql = "NOW() - (%s * INTERVAL '1 day')"
-    conditions: list[str] = []
-    params: list[Any] = []
+    conditions: list[str] = [
+        f"(hard_deleted_at IS NOT NULL AND hard_deleted_at <= {cutoff_sql})"
+    ]
+    params: list[Any] = [hard_delete_grace_days]
     if include_expired:
         conditions.append(
             f"(expires_at IS NOT NULL AND expires_at <= {cutoff_sql})")
@@ -501,17 +523,20 @@ def prune_memories(
     db = MemoryStore()
     counts: dict[str, int] = {}
     total = 0
+    pending_purge = 0
     warnings: list[str] = []
     try:
         cur = db.cur
-        if project:
+        if project is not None:
             tables = [_mem_table(project)]
             if not _table_exists(cur, tables[0]):
                 db.rollback()
                 return fail(STATUS_NOT_FOUND,
                             f"unknown project {project!r}: no memory table")
-        else:
+        elif all_scopes:
             tables = _all_mem_tables(cur)
+        else:
+            tables = [_mem_table(project)]
         for table in tables:
             if not _table_exists(cur, table):
                 continue
@@ -521,6 +546,11 @@ def prune_memories(
                 scope = _scope_of_table(cur, table)
                 counts[scope] = counts.get(scope, 0) + removed
                 total += removed
+            pending_purge += db.scalar(
+                f"SELECT COUNT(*) FROM {table} "
+                f"WHERE hard_deleted_at IS NOT NULL "
+                f"AND hard_deleted_at > NOW() - (%s * INTERVAL '1 day')",
+                (hard_delete_grace_days,)) or 0
         if dry_run:
             db.rollback()
         else:
@@ -532,17 +562,18 @@ def prune_memories(
     finally:
         db.close()
 
-    scopes = list(counts)
-    if len(scopes) > 1:
-        warnings.append(
-            f"prune covered several scopes ({', '.join(sorted(scopes))}); "
-            f"pass project=<name> to restrict it")
+    scopes_pruned = sorted(counts)
     return ok(
         STATUS_OK,
-        project=(project or None),
-        counts={"memories": total, "by_scope": counts},
+        project=(_scope_key(requested_project)
+                 if requested_project is not None else None),
+        all_scopes=all_scopes,
+        counts={"memories": total, "by_scope": counts,
+                "pending_purge": pending_purge},
+        scopes_pruned=scopes_pruned,
         dry_run=dry_run,
         older_than_days=older_than_days,
+        hard_delete_grace_days=hard_delete_grace_days,
         removed_expired=include_expired,
         removed_forgotten=include_forgotten,
         removed_superseded=include_superseded,
